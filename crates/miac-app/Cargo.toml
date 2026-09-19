@@ -1,0 +1,38 @@
+[package]
+name = "miac-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "米家空调控制器 —— Rust + Slint 原生界面"
+
+[[bin]]
+name = "miac-app"
+path = "src/main.rs"
+
+[dependencies]
+miac-core = { path = "../miac-core" }
+serde_json = "1"
+slint = { workspace = true, features = ["compat-1-2", "backend-winit", "renderer-software"] }
+# 扫码登录：把小米返回的二维码 PNG 解成 RGBA 交给 Slint 显示。
+# 只解析 PNG，不引入完整图像生态。
+# 版本锁到 0.18：本机代理挂了以后 cargo 无法联网，而本地缓存里正好是这个版本。
+png = "=0.18.1"
+# 只用来读进程内存（验收指标要量化）与时区偏移；体积小、无额外运行时
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Time",
+    "Win32_System_LibraryLoader",
+    # 托盘图标走 Win32 Shell_NotifyIcon：单进程、不额外起进程，
+    # 也不引入 tray-icon / muda 这类会拉进 GTK 生态的依赖
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
+
+[build-dependencies]
+slint-build = "1.13"
