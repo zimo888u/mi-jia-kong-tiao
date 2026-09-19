@@ -1,0 +1,186 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/pages/debug.slint —— 高级 / 属性页
+//
+// 对应 index.html 的 <section data-view="debug">：
+//   原始属性读写 / 全部状态属性 / 指示灯·提示音·效果
+//
+// 安全边界与原版一致：写入只允许已登记的属性名，不允许任意 siid.piid 下发。
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "../theme.slint";
+import { Card, SegButton, ToggleRow, FlatButton, KvRow } from "../common.slint";
+
+export component DebugPage inherits VerticalLayout {
+    in property <string> raw-addr: "—";
+    in property <string> raw-prop-names: "";
+    in-out property <string> raw-value: "";
+    in property <string> raw-out: "—";
+    in property <[string]> all-props: [];
+    in property <bool> light-on: true;
+    in property <bool> buzzer-on: true;
+    in property <int> bright: 0;
+    in property <int> effect-cool: 3;
+    in property <int> effect-heat: 3;
+    in property <int> selected-prop: 0;
+    // all-props 里每条是 "属性名 = 值"，这里放属性名列表供选择器用
+    in property <[string]> prop-name-list: [];
+
+    callback raw-read();
+    callback raw-write();
+    callback select-prop(int);
+    callback set-toggle(string, bool);
+    callback set-bright(int);
+    callback set-effect(string, int);
+
+    spacing: Theme.gap;
+
+    // ── 原始属性读写 ──────────────────────────────────────────
+    Card {
+        title: "原始属性读写";
+        hint: "按 siid.piid 直接读写本机型已登记的属性";
+
+        HorizontalLayout {
+            height: 32px;
+            spacing: 10px;
+            Text { text: "属性"; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+            // 属性选择：用横向滚动的分段按钮代替 HTML 的 <select>
+            Flickable {
+                width: 460px;
+                height: 32px;
+                content-width: names-row.preferred-width;
+                content-height: self.height;
+                interactive: true;
+                names-row := HorizontalLayout {
+                    spacing: 5px;
+                    for i in 40 : Rectangle {
+                        visible: i < root.prop-name-list.length;
+                        height: 30px;
+                        width: max(58px, pn-text.preferred-width + 20px);
+                        border-radius: Theme.radius-sm;
+                        background: root.selected-prop == i ? Theme.accent : Theme.bg-soft;
+                        border-width: 1px;
+                        border-color: root.selected-prop == i ? Theme.accent : Theme.line;
+                        pn-text := Text {
+                            text: i < root.prop-name-list.length ? root.prop-name-list[i] : "";
+                            color: root.selected-prop == i ? Theme.on-accent : Theme.text-dim;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.select-prop(i); } }
+                    }
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.raw-addr;
+                color: Theme.accent;
+                font-size: Theme.font-md;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            FlatButton { label: "读取"; clicked => { root.raw-read(); } }
+        }
+
+        HorizontalLayout {
+            height: 32px;
+            spacing: 10px;
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 32px;
+                border-radius: Theme.radius-sm;
+                background: Theme.bg-soft;
+                border-width: 1px;
+                border-color: raw-input.has-focus ? Theme.accent : Theme.line;
+                raw-input := TextInput {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    height: parent.height;
+                    // 双向绑定：Slint 的 edited 回调不带参数，输入内容本身就存回
+                    // 绑定的属性里，所以这里用 <=> 而不是 edited(t) => ...
+                    text <=> root.raw-value;
+                    color: Theme.text;
+                    font-size: Theme.font-md;
+                    vertical-alignment: center;
+                    single-line: true;
+                    accepted => { root.raw-write(); }
+                }
+            }
+            FlatButton { label: "写入"; danger: true; width: 84px; clicked => { root.raw-write(); } }
+        }
+
+        Rectangle {
+            height: max(72px, out-text.preferred-height + 20px);
+            border-radius: Theme.radius-sm;
+            background: Theme.bg;
+            border-width: 1px;
+            border-color: Theme.line-soft;
+            out-text := Text {
+                x: 10px;
+                y: 10px;
+                width: parent.width - 20px;
+                text: root.raw-out;
+                color: Theme.text-dim;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    // ── 全部状态属性 ──────────────────────────────────────────
+    Card {
+        title: "全部状态属性";
+        GridLayout {
+            spacing: 4px;
+            for i in 24 : KvRow {
+                visible: i < root.all-props.length;
+                col: Math.mod(i, 2);
+                row: floor(i / 2);
+                horizontal-stretch: 1;
+                // 形如 "on = true"
+                key: i < root.all-props.length ? root.all-props[i] : "";
+                value: "";
+            }
+        }
+    }
+
+    // ── 指示灯 / 提示音 / 效果 ────────────────────────────────
+    Card {
+        title: "指示灯 / 提示音 / 效果";
+        GridLayout {
+            spacing: 8px;
+            ToggleRow { col: 0; row: 0; horizontal-stretch: 1; label: "指示灯"; on: root.light-on; toggled(v) => { root.set-toggle("light", v); } }
+            ToggleRow { col: 1; row: 0; horizontal-stretch: 1; label: "提示音"; on: root.buzzer-on; toggled(v) => { root.set-toggle("buzzer", v); } }
+        }
+        Text { text: "指示灯亮度"; color: Theme.text-mute; font-size: Theme.font-xs; }
+        HorizontalLayout {
+            spacing: 6px;
+            SegButton { label: "自动"; min-w: 58px; active: root.bright == 0; clicked => { root.set-bright(0); } }
+            SegButton { label: "中亮"; min-w: 58px; active: root.bright == 1; clicked => { root.set-bright(1); } }
+            SegButton { label: "高亮"; min-w: 58px; active: root.bright == 2; clicked => { root.set-bright(2); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text { text: "制冷效果（1 弱 → 5 强）"; color: Theme.text-mute; font-size: Theme.font-xs; }
+        HorizontalLayout {
+            spacing: 6px;
+            for i in 5 : SegButton {
+                label: "" + (i + 1);
+                width: 48px;
+                active: root.effect-cool == i + 1;
+                clicked => { root.set-effect("cool", i + 1); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text { text: "制热效果（1 弱 → 5 强）"; color: Theme.text-mute; font-size: Theme.font-xs; }
+        HorizontalLayout {
+            spacing: 6px;
+            for i in 5 : SegButton {
+                label: "" + (i + 1);
+                width: 48px;
+                active: root.effect-heat == i + 1;
+                clicked => { root.set-effect("heat", i + 1); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+}

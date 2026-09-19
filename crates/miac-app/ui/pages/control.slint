@@ -1,0 +1,414 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/pages/control.slint —— 控制台页
+//
+// 对应 index.html 的 <section data-view="control">：
+//   温度旋钮 + 电源键 + 实时环境指标 / 运行模式 / 风速 / 摆风 + 风感 /
+//   上下定格 + 左右定格 / 舒适功能 / 温度预设
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "../theme.slint";
+import { Card, SegButton, ToggleRow, Metric } from "../common.slint";
+import { DialMath } from "../dial-math.slint";
+
+// ── 温度旋钮 ────────────────────────────────────────────────────
+// 用一圈刻度（LED 环）表现设定温度：已选中的刻度用强调色，其余用暗色。
+// 每根刻度是顶部中央的一小段竖线，绕表盘中心旋转。
+component TempDial inherits Rectangle {
+    in property <float> value: 26.0;
+    in property <float> min-value: 16.0;
+    in property <float> max-value: 31.0;
+    callback adjusted(float);
+
+    // 16~31 每 0.5 一档 → 31 格刻度
+    property <int> tick-count: 31;
+    property <float> filled: DialMath.ratio(root.value, root.min-value, root.max-value) * (root.tick-count - 1);
+    // 刻度环半径与圆点直径，都以纯数值（px 数）保存，避免 length/float 来回换算
+    property <float> dot-px: 6.0;
+    property <float> ring-r-px: (210.0 - 30.0 - root.dot-px) / 2.0;
+
+    width: 210px;
+    height: 210px;
+
+    // 底盘
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: parent.width / 2;
+        background: Theme.bg-soft;
+        border-width: 1px;
+        border-color: Theme.line-soft;
+    }
+
+    // 刻度环：31 个小圆点排成 270° 弧（正下方留 90° 缺口）。
+    //
+    // 位置用三角函数算出，不用旋转变换——Slint 1.18 的 Rectangle 没有旋转属性。
+    // 圆心固定在 (105, 105)：表盘是 210×210 的定尺组件，写死比用 parent 更省心，
+    // 也避免在 for 体内引用 root.width 时引入额外依赖。
+    // 注意：for 循环体内不能声明 property，所有表达式内联。
+    for i in 31 : Rectangle {
+        width: root.dot-px * 1px;
+        height: root.dot-px * 1px;
+        border-radius: root.dot-px / 2 * 1px;
+        x: 105px + DialMath.point-x(DialMath.tick-angle(i, root.tick-count), root.ring-r-px) * 1px
+            - root.dot-px / 2 * 1px;
+        y: 105px + DialMath.point-y(DialMath.tick-angle(i, root.tick-count), root.ring-r-px) * 1px
+            - root.dot-px / 2 * 1px;
+        background: i <= round(root.filled) ? Theme.accent : Theme.dial-track;
+    }
+
+    // 内圈：中央读数
+    Rectangle {
+        width: parent.width - 66px;
+        height: parent.height - 66px;
+        x: 33px;
+        y: 33px;
+        border-radius: parent.width / 2;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.line-soft;
+    }
+
+    VerticalLayout {
+        x: 33px;
+        y: 33px;
+        width: parent.width - 66px;
+        height: parent.height - 66px;
+        alignment: center;
+        spacing: 0px;
+        Text { text: "设定温度"; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.value;
+                color: Theme.accent;
+                font-size: Theme.font-3xl;
+                font-weight: 600;
+                vertical-alignment: bottom;
+            }
+            Text { text: "℃"; color: Theme.text-mute; font-size: Theme.font-lg; vertical-alignment: bottom; }
+        }
+        Text { text: "滚轮 / 拖动调节"; color: Theme.text-mute; font-size: 10px; horizontal-alignment: center; }
+    }
+
+    // 滚轮 + 鼠标拖动调温。
+    // 旧版只有 scroll-event，按住表盘拖动时不会产生任何回调，
+    // 因此界面看起来像“轮盘失效”。拖动时每 18px 约调整 1℃，
+    // 并始终吸附到 0.5℃，与设备允许的步进保持一致。
+    dial-touch := TouchArea {
+        property <float> pressed-value: root.value;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                self.pressed-value = root.value;
+            }
+        }
+        moved => {
+            root.adjusted(max(root.min-value,
+                min(root.max-value,
+                    round((self.pressed-value + (self.pressed-y - self.mouse-y) / 18px) * 2) / 2)));
+        }
+        scroll-event(e) => {
+            if (e.delta-y > 0) {
+                root.adjusted(min(root.max-value, root.value + 0.5));
+            } else {
+                if (e.delta-y < 0) {
+                    root.adjusted(max(root.min-value, root.value - 0.5));
+                }
+            }
+            accept
+        }
+    }
+}
+
+// ── 控制台页 ────────────────────────────────────────────────────
+export component ControlPage inherits VerticalLayout {
+    in property <float> target-temp: 26.0;
+    in property <bool> power-on: true;
+    in property <string> power-text: "运行中";
+    in property <string> room-temp: "--";
+    in property <string> sensor-temp: "--";
+    in property <string> sensor-hum: "--";
+    in property <string> energy-total: "--";
+    in property <string> battery-text: "";
+    in property <int> mode: 2;
+    in property <int> fan: 0;
+    in property <int> wind: 0;
+    in property <int> vpos: 0;
+    in property <int> hpos: 0;
+    in property <bool> vswing: false;
+    in property <bool> hswing: false;
+    in property <bool> eco: false;
+    in property <bool> sleep: false;
+    in property <bool> heater: false;
+    in property <bool> dryer: false;
+    in property <bool> favorite: false;
+    in property <bool> wind-on: false;
+    in property <float> preset-a: 27.5;
+    in property <float> preset-b: 27.0;
+    in property <float> preset-c: 26.5;
+
+    callback set-target-temp(float);
+    callback toggle-power();
+    callback set-mode(int);
+    callback set-fan(int);
+    callback set-wind(int);
+    callback set-vpos(int);
+    callback set-hpos(int);
+    callback set-toggle(string, bool);
+    callback set-preset(float);
+
+    spacing: Theme.gap;
+
+    // ── 首屏：旋钮 + 电源 + 指标 ──────────────────────────────
+    Rectangle {
+        height: 232px;
+        border-radius: Theme.radius;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.line-soft;
+
+        HorizontalLayout {
+            padding: 14px;
+            spacing: 16px;
+
+            // 旋钮 + 加减按钮（数值输入用滚轮；这里保留只读展示，避免误触发）
+            // 旋钮占位容器。
+            // 布局里的元素必须能算出首选尺寸，否则 height: 232px 的兄弟节点
+            // 与旋钮的 width: 210px 会互相牵制，形成 binding loop。
+            // 所以这里显式给出布局用的 preferred-*，固定尺寸交给它们表达。
+            Rectangle {
+                preferred-width: 210px;
+                preferred-height: 210px;
+                background: transparent;
+                TempDial {
+                    value: root.target-temp;
+                    adjusted(v) => { root.set-target-temp(v); }
+                }
+            }
+
+            // 电源 + 指标
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 10px;
+
+                Rectangle {
+                    height: 62px;
+                    border-radius: Theme.radius;
+                    background: root.power-on
+                        ? @linear-gradient(90deg, rgba(167,139,250,0.18) 0%, rgba(167,139,250,0.04) 100%)
+                        : Theme.bg-soft;
+                    border-width: 1px;
+                    border-color: root.power-on ? Theme.accent : Theme.line;
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        spacing: 12px;
+                        Text {
+                            text: "⏻";
+                            color: root.power-on ? Theme.accent : Theme.text-mute;
+                            font-size: 22px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.power-on ? "已开机" : "已关机";
+                            color: root.power-on ? Theme.text : Theme.text-dim;
+                            font-size: Theme.font-xl;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.power-text;
+                            color: Theme.text-mute;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                    power-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.toggle-power(); }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: Theme.radius;
+                    background: Theme.bg-soft;
+                    border-width: 1px;
+                    border-color: Theme.line-soft;
+                    HorizontalLayout {
+                        padding: 10px;
+                        spacing: 6px;
+                        Metric { horizontal-stretch: 1; label: "室温"; value: root.room-temp; unit: "℃"; }
+                        // 分隔线用固定高度：在布局里引用 parent.height 会形成
+                        // binding loop（布局高度 ↔ 子元素高度互相依赖）
+                        Rectangle { width: 1px; height: 40px; background: Theme.line-soft; }
+                        Metric {
+                            horizontal-stretch: 1;
+                            label: "温湿度计";
+                            value: root.sensor-temp;
+                            unit: "℃";
+                            sub: "湿度 " + root.sensor-hum + " %";
+                        }
+                        Rectangle { width: 1px; height: 40px; background: Theme.line-soft; }
+                        Metric {
+                            horizontal-stretch: 1;
+                            label: "累计电量";
+                            value: root.energy-total;
+                            unit: "kWh";
+                            sub: root.battery-text;
+                            value-color: Theme.green;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 运行模式 ──────────────────────────────────────────────
+    Card {
+        title: "运行模式";
+        HorizontalLayout {
+            spacing: 8px;
+            SegButton { label: "制冷"; min-w: 78px; active: root.mode == 2; clicked => { root.set-mode(2); } }
+            SegButton { label: "除湿"; min-w: 78px; active: root.mode == 3; clicked => { root.set-mode(3); } }
+            SegButton { label: "送风"; min-w: 78px; active: root.mode == 4; clicked => { root.set-mode(4); } }
+            SegButton { label: "制热"; min-w: 78px; active: root.mode == 5; clicked => { root.set-mode(5); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+
+    // ── 风速 ──────────────────────────────────────────────────
+    Card {
+        title: "风速";
+        HorizontalLayout {
+            spacing: 6px;
+            SegButton { label: "自动"; min-w: 56px; active: root.fan == 0; clicked => { root.set-fan(0); } }
+            SegButton { label: "1"; active: root.fan == 1; clicked => { root.set-fan(1); } }
+            SegButton { label: "2"; active: root.fan == 2; clicked => { root.set-fan(2); } }
+            SegButton { label: "3"; active: root.fan == 3; clicked => { root.set-fan(3); } }
+            SegButton { label: "4"; active: root.fan == 4; clicked => { root.set-fan(4); } }
+            SegButton { label: "5"; active: root.fan == 5; clicked => { root.set-fan(5); } }
+            SegButton { label: "6"; active: root.fan == 6; clicked => { root.set-fan(6); } }
+            SegButton { label: "7"; active: root.fan == 7; clicked => { root.set-fan(7); } }
+            SegButton { label: "Max"; active: root.fan == 8; accent: true; clicked => { root.set-fan(8); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+
+    // ── 摆风 / 风感 ───────────────────────────────────────────
+    HorizontalLayout {
+        spacing: Theme.gap;
+        Card {
+            title: "摆风";
+            horizontal-stretch: 1;
+            VerticalLayout {
+                spacing: 8px;
+                ToggleRow { label: "上下摆风"; on: root.vswing; toggled(v) => { root.set-toggle("verticalSwing", v); } }
+                ToggleRow { label: "左右扫风"; on: root.hswing; toggled(v) => { root.set-toggle("horizontalSwing", v); } }
+            }
+        }
+        Card {
+            title: "风感";
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 6px;
+                SegButton { label: "关"; active: root.wind == 0; clicked => { root.set-wind(0); } }
+                SegButton { label: "上吹"; active: root.wind == 1; clicked => { root.set-wind(1); } }
+                SegButton { label: "下吹"; active: root.wind == 2; clicked => { root.set-wind(2); } }
+                SegButton { label: "循环风"; min-w: 60px; active: root.wind == 3; clicked => { root.set-wind(3); } }
+                SegButton { label: "防直吹"; min-w: 60px; active: root.wind == 4; accent: true; clicked => { root.set-wind(4); } }
+            }
+        }
+    }
+
+    // ── 定格 ──────────────────────────────────────────────────
+    HorizontalLayout {
+        spacing: Theme.gap;
+        Card {
+            title: "上下定格";
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 5px;
+                SegButton { label: "关"; active: root.vpos == 0; clicked => { root.set-vpos(0); } }
+                SegButton { label: "上"; active: root.vpos == 1; clicked => { root.set-vpos(1); } }
+                SegButton { label: "偏上"; min-w: 50px; active: root.vpos == 2; clicked => { root.set-vpos(2); } }
+                SegButton { label: "中"; active: root.vpos == 3; clicked => { root.set-vpos(3); } }
+                SegButton { label: "偏下"; min-w: 50px; active: root.vpos == 4; clicked => { root.set-vpos(4); } }
+                SegButton { label: "下"; active: root.vpos == 5; clicked => { root.set-vpos(5); } }
+            }
+        }
+        Card {
+            title: "左右定格";
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: 5px;
+                SegButton { label: "关"; active: root.hpos == 0; clicked => { root.set-hpos(0); } }
+                SegButton { label: "左"; active: root.hpos == 1; clicked => { root.set-hpos(1); } }
+                SegButton { label: "偏左"; min-w: 50px; active: root.hpos == 2; clicked => { root.set-hpos(2); } }
+                SegButton { label: "中"; active: root.hpos == 3; clicked => { root.set-hpos(3); } }
+                SegButton { label: "偏右"; min-w: 50px; active: root.hpos == 4; clicked => { root.set-hpos(4); } }
+                SegButton { label: "右"; active: root.hpos == 5; clicked => { root.set-hpos(5); } }
+            }
+        }
+    }
+
+    // ── 舒适功能 ──────────────────────────────────────────────
+    Card {
+        title: "舒适功能";
+        GridLayout {
+            spacing: 8px;
+            ToggleRow { col: 0; row: 0; horizontal-stretch: 1; label: "ECO 节能"; on: root.eco; toggled(v) => { root.set-toggle("eco", v); } }
+            ToggleRow { col: 1; row: 0; horizontal-stretch: 1; label: "睡眠模式"; on: root.sleep; toggled(v) => { root.set-toggle("sleep", v); } }
+            ToggleRow { col: 2; row: 0; horizontal-stretch: 1; label: "辅热"; on: root.heater; toggled(v) => { root.set-toggle("heater", v); } }
+            ToggleRow { col: 0; row: 1; horizontal-stretch: 1; label: "干燥"; on: root.dryer; toggled(v) => { root.set-toggle("dryer", v); } }
+            ToggleRow { col: 1; row: 1; horizontal-stretch: 1; label: "喜好模式"; on: root.favorite; toggled(v) => { root.set-toggle("favoriteOn", v); } }
+            ToggleRow { col: 2; row: 1; horizontal-stretch: 1; label: "风感开关"; on: root.wind-on; toggled(v) => { root.set-toggle("windSensation", v); } }
+        }
+    }
+
+    // ── 温度预设 ──────────────────────────────────────────────
+    Card {
+        title: "温度预设";
+        hint: "关机时仅保存，开机后自动应用";
+        HorizontalLayout {
+            spacing: 10px;
+            Rectangle {
+                horizontal-stretch: 1; height: 54px;
+                border-radius: Theme.radius-sm;
+                background: preset1.has-hover ? Theme.panel-hi : Theme.bg-soft;
+                border-width: 1px; border-color: Theme.line;
+                HorizontalLayout {
+                    alignment: center; spacing: 2px;
+                    Text { text: "" + root.preset-a; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; vertical-alignment: center; }
+                    Text { text: "℃"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: center; }
+                }
+                preset1 := TouchArea { mouse-cursor: pointer; clicked => { root.set-preset(root.preset-a); } }
+            }
+            Rectangle {
+                horizontal-stretch: 1; height: 54px;
+                border-radius: Theme.radius-sm;
+                background: preset2.has-hover ? Theme.panel-hi : Theme.bg-soft;
+                border-width: 1px; border-color: Theme.line;
+                HorizontalLayout {
+                    alignment: center; spacing: 2px;
+                    Text { text: "" + root.preset-b; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; vertical-alignment: center; }
+                    Text { text: "℃"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: center; }
+                }
+                preset2 := TouchArea { mouse-cursor: pointer; clicked => { root.set-preset(root.preset-b); } }
+            }
+            Rectangle {
+                horizontal-stretch: 1; height: 54px;
+                border-radius: Theme.radius-sm;
+                background: preset3.has-hover ? Theme.panel-hi : Theme.bg-soft;
+                border-width: 1px; border-color: Theme.line;
+                HorizontalLayout {
+                    alignment: center; spacing: 2px;
+                    Text { text: "" + root.preset-c; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; vertical-alignment: center; }
+                    Text { text: "℃"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: center; }
+                }
+                preset3 := TouchArea { mouse-cursor: pointer; clicked => { root.set-preset(root.preset-c); } }
+            }
+        }
+    }
+}

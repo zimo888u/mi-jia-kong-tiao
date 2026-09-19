@@ -1,0 +1,176 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/pages/settings.slint —— 设置页
+//
+// 对应 index.html 的 <section data-view="settings">：
+//   通信通道切换 / 设备信息 / 运行日志 / 关于
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "../theme.slint";
+import { Card, SegButton, FlatButton } from "../common.slint";
+
+export component SettingsPage inherits VerticalLayout {
+    in property <int> transport-mode: 0;         // 0 自动 1 强制局域网 2 强制云端
+    in property <string> device-info-text: "读取中…";
+    in property <string> log-text: "—";
+    in property <string> about-text: "";
+    in property <bool> connected: false;
+    in property <string> not-ready-reason: "";
+    in property <string> migration-summary: "";
+    in property <string> credentials-dir: "";
+    in property <bool> credentials-encrypted: false;
+
+    callback set-transport(int);
+    callback clear-log();
+    callback encrypt-credentials();
+
+    spacing: Theme.gap;
+
+    // ── 连接状态 ──────────────────────────────────────────────
+    Card {
+        title: "连接状态";
+        HorizontalLayout {
+            height: 28px;
+            spacing: 10px;
+            Rectangle {
+                width: 10px; height: 10px; border-radius: 5px;
+                background: root.connected ? Theme.green : Theme.amber;
+            }
+            Text {
+                text: root.connected ? "已连接，可以读取与下发" : "未连接";
+                color: root.connected ? Theme.green : Theme.amber;
+                font-size: Theme.font-md;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.connected ? "" : root.not-ready-reason;
+                color: Theme.text-dim;
+                font-size: Theme.font-sm;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text {
+            text: "通信通道";
+            color: Theme.text-mute;
+            font-size: Theme.font-xs;
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            SegButton { label: "自动（局域网优先）"; min-w: 140px; active: root.transport-mode == 0; clicked => { root.set-transport(0); } }
+            SegButton { label: "强制局域网"; min-w: 104px; active: root.transport-mode == 1; clicked => { root.set-transport(1); } }
+            SegButton { label: "强制云端"; min-w: 92px; active: root.transport-mode == 2; clicked => { root.set-transport(2); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+
+    // ── 通信通道说明 ──────────────────────────────────────────
+    Card {
+        title: "通道说明";
+        Text {
+            text: "局域网直连约 0.4 秒，且实测米家 App 约 1 秒内同步显示（设备会主动向小米云上报）。云端 RPC 约 1–2 秒，仅在设备不在同一局域网时使用。";
+            color: Theme.text-mute;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+
+    // ── 设备信息 ──────────────────────────────────────────────
+    Card {
+        title: "设备信息";
+        Text {
+            text: root.device-info-text;
+            color: Theme.text-dim;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+
+    // ── 凭据 ──────────────────────────────────────────────────
+    Card {
+        title: "凭据";
+        hint: root.credentials-encrypted ? "已启用 DPAPI 加密" : "当前为明文存储";
+        Text {
+            text: "存储位置：" + (root.credentials-dir == "" ? "—" : root.credentials-dir);
+            color: Theme.text-dim;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.credentials-encrypted
+                ? "三个凭据文件已用 Windows DPAPI 加密，只能由当前 Windows 用户在本机解开；换用户或换电脑都无法读取。"
+                : "凭据目前是明文 JSON（与旧版 Electron 版格式一致，便于两版并存测试）。启用加密后只有当前 Windows 用户在本机能读，旧版将无法再读取这些文件。";
+            color: Theme.text-mute;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            height: 32px;
+            spacing: 10px;
+            FlatButton {
+                label: root.credentials-encrypted ? "已加密" : "启用 DPAPI 加密";
+                min-w: 150px;
+                danger: !root.credentials-encrypted;
+                clicked => { root.encrypt-credentials(); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+    }
+
+    // ── 迁移摘要 ──────────────────────────────────────────────
+    Card {
+        title: "旧版数据迁移";
+        hint: "首次启动自动执行";
+        Text {
+            text: root.migration-summary == "" ? "尚未执行迁移" : root.migration-summary;
+            color: Theme.text-dim;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+    }
+
+    // ── 运行日志 ──────────────────────────────────────────────
+    Card {
+        title: "运行日志";
+        HorizontalLayout {
+            height: 26px;
+            Rectangle { horizontal-stretch: 1; }
+            FlatButton { label: "清空"; ghost: true; min-w: 60px; clicked => { root.clear-log(); } }
+        }
+        Rectangle {
+            height: 168px;
+            border-radius: Theme.radius-sm;
+            background: Theme.bg;
+            border-width: 1px;
+            border-color: Theme.line-soft;
+            clip: true;
+            log-text := Text {
+                x: 10px;
+                y: 10px;
+                width: parent.width - 20px;
+                text: root.log-text;
+                color: Theme.text-dim;
+                font-size: Theme.font-xs;
+                wrap: word-wrap;
+                vertical-alignment: bottom;
+            }
+        }
+    }
+
+    // ── 关于 ──────────────────────────────────────────────────
+    Card {
+        title: "关于";
+        Text {
+            text: root.about-text;
+            color: Theme.text-dim;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
+        }
+        Text {
+            text: "凭据只保存在本机 device.json / cloud-session.json / thermometer.json，不随应用分发，请勿外传。";
+            color: Theme.text-mute;
+            font-size: Theme.font-xs;
+            wrap: word-wrap;
+        }
+    }
+}

@@ -1,0 +1,148 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/pages/diag.slint —— 运行诊断页
+//
+// 对应 index.html 的 <section data-view="diag">：
+//   机器诊断九宫格 / 温湿度计 / 自清洁·维护 / 故障标志 13.1
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "../theme.slint";
+import { Card, KvRow } from "../common.slint";
+
+// ── 诊断读数格 ──────────────────────────────────────────────────
+component DiagCell inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+
+    height: 58px;
+    border-radius: Theme.radius-sm;
+    background: Theme.bg-soft;
+    border-width: 1px;
+    border-color: Theme.line-soft;
+    VerticalLayout {
+        alignment: center;
+        spacing: 1px;
+        Text { text: root.label; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
+        Text {
+            text: root.value;
+            color: Theme.text;
+            font-size: Theme.font-lg;
+            font-weight: 600;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+export component DiagPage inherits VerticalLayout {
+    in property <[string]> diag-labels: [];
+    in property <[string]> diag-values: [];
+    in property <string> sensor-temp: "--";
+    in property <string> sensor-hum: "--";
+    in property <string> clean-text: "—";
+    in property <string> examine-text: "—";
+    in property <string> run-text: "—";
+    in property <string> fault-badge: "—";
+    in property <string> fault-text: "读取中…";
+    in property <bool> fault-clear: true;
+
+    spacing: Theme.gap;
+
+    // ── 机器诊断 ──────────────────────────────────────────────
+    Card {
+        title: "机器诊断";
+        hint: "实时读数";
+        GridLayout {
+            spacing: 8px;
+            for i in 9 : DiagCell {
+                col: Math.mod(i, 3);
+                row: floor(i / 3);
+                horizontal-stretch: 1;
+                label: i < root.diag-labels.length ? root.diag-labels[i] : "—";
+                value: i < root.diag-values.length ? root.diag-values[i] : "--";
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Theme.gap;
+
+        // ── 温湿度计 ──────────────────────────────────────────
+        Card {
+            title: "温湿度计";
+            horizontal-stretch: 1;
+            Rectangle {
+                height: 84px;
+                background: transparent;
+                HorizontalLayout {
+                    alignment: center;
+                    spacing: 24px;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 0px;
+                        HorizontalLayout {
+                            alignment: center; spacing: 2px;
+                            Text { text: root.sensor-temp; color: Theme.warm; font-size: Theme.font-2xl; font-weight: 600; vertical-alignment: bottom; }
+                            Text { text: "℃"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: bottom; }
+                        }
+                        Text { text: "温度"; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 0px;
+                        HorizontalLayout {
+                            alignment: center; spacing: 2px;
+                            Text { text: root.sensor-hum; color: Theme.accent; font-size: Theme.font-2xl; font-weight: 600; vertical-alignment: bottom; }
+                            Text { text: "%"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: bottom; }
+                        }
+                        Text { text: "湿度"; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
+                    }
+                }
+            }
+        }
+
+        // ── 自清洁 / 维护 ─────────────────────────────────────
+        Card {
+            title: "自清洁 / 维护";
+            horizontal-stretch: 1;
+            VerticalLayout {
+                spacing: 6px;
+                KvRow { key: "自清洁"; value: root.clean-text; }
+                KvRow { key: "机组体检"; value: root.examine-text; }
+                KvRow { key: "累计运行"; value: root.run-text; }
+            }
+        }
+    }
+
+    // ── 故障标志 ──────────────────────────────────────────────
+    Card {
+        title: "故障标志 13.1";
+        Rectangle {
+            height: 34px;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 12px;
+                Rectangle {
+                    width: max(64px, badge-text.preferred-width + 24px);
+                    height: 30px;
+                    border-radius: 15px;
+                    background: root.fault-clear ? Theme.green.with-alpha(0.16) : Theme.red.with-alpha(0.16);
+                    border-width: 1px;
+                    border-color: root.fault-clear ? Theme.green : Theme.red;
+                    badge-text := Text {
+                        text: root.fault-badge;
+                        color: root.fault-clear ? Theme.green : Theme.red;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: root.fault-text;
+                    color: Theme.text-dim;
+                    font-size: Theme.font-md;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

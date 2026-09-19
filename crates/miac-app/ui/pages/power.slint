@@ -1,0 +1,240 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/pages/power.slint —— 电量统计页
+//
+// 对应 index.html 的 <section data-view="power">：
+//   今日/本月/本年用电与用时 + 日/月切换 + 日历热力图 + 图例
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "../theme.slint";
+import { Card } from "../common.slint";
+
+// ── 统计数字块 ──────────────────────────────────────────────────
+component Stat inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> unit;
+
+    height: 62px;
+    border-radius: Theme.radius-sm;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: Theme.line-soft;
+    VerticalLayout {
+        alignment: center;
+        spacing: 1px;
+        Text { text: root.label; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
+        HorizontalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text { text: root.value; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; vertical-alignment: bottom; }
+            Text { text: root.unit; color: Theme.text-mute; font-size: Theme.font-xs; vertical-alignment: bottom; }
+        }
+    }
+}
+
+// ── 日历格子：色块深浅 = 当日用电量 ─────────────────────────────
+component CalCell inherits Rectangle {
+    in property <int> day: 0;
+    in property <int> energy-milli: 0;   // 电量 ×1000，避免用 float 模型
+    in property <int> max-milli: 1000;
+    in property <bool> is-today: false;
+
+    // 当日电量占当月峰值的比例（0.0~1.0）
+    property <float> t: energy-milli <= 0
+        ? 0.0
+        : Math.min(1.0, energy-milli / Math.max(max-milli, 1));
+    // 深色主题下强调色本身很亮，用高透明度会让所有格子都糊成一片纯青，
+    // 深浅就看不出来了。所以压到 0.10~0.55 这个区间，拉开层次。
+    property <float> alpha: 0.10 + 0.45 * self.t;
+    // 右半边（比例 > 0.5）底色偏亮，文字改用深色才看得清
+    property <bool> dark-text: self.t > 0.5;
+
+    height: 44px;
+    border-radius: 8px;
+    background: energy-milli <= 0
+        ? (Theme.dark ? Theme.bg-soft : Theme.bg-soft)
+        : Theme.accent.with-alpha(self.alpha);
+    border-width: is-today ? 2px : 1px;
+    border-color: is-today ? Theme.accent : Theme.line-soft;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 0px;
+        Text {
+            text: day <= 0 ? "" : day;
+            color: root.dark-text ? Theme.on-accent : Theme.text-dim;
+            font-size: Theme.font-sm;
+            font-weight: is-today ? 700 : 400;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: energy-milli <= 0 ? "" : (energy-milli / 1000.0);
+            color: root.dark-text ? Theme.on-accent : Theme.text-mute;
+            font-size: 9px;
+            horizontal-alignment: center;
+        }
+    }
+}
+
+// ── 日历的一行（7 格）───────────────────────────────────────────
+//
+// 单拎出来是因为 Slint 不支持链式 for 循环，无法在一处写 6×7。
+component CalRow inherits HorizontalLayout {
+    in property <int> row-index: 0;
+    in property <int> first-weekday: 0;
+    in property <int> days: 31;
+    in property <int> today: 1;
+    in property <int> max-milli: 1;
+    in property <[int]> energy-milli: [];
+
+    spacing: 6px;
+    for c in 7 : CalCell {
+        horizontal-stretch: 1;
+        // 第 n 格 = 行号*7 + 列号 - 首日星期偏移 + 1
+        // 注意：自引用必须写 self.day，Slint 不会自动解析裸名字
+        day: {
+            (row-index * 7 + c - first-weekday + 1) > 0
+            && (row-index * 7 + c - first-weekday + 1) <= days
+                ? (row-index * 7 + c - first-weekday + 1) : 0;
+        }
+        energy-milli: {
+            self.day > 0 && self.day - 1 < energy-milli.length
+                ? energy-milli[self.day - 1] : 0;
+        }
+        max-milli: root.max-milli;
+        is-today: self.day == root.today;
+    }
+}
+
+export component PowerPage inherits VerticalLayout {
+    in property <string> p-today: "--";
+    in property <string> p-month: "--";
+    in property <string> p-year: "--";
+    in property <string> p-today-h: "--";
+    in property <string> p-month-h: "--";
+    in property <int> pview: 0;                  // 0 日 1 月
+    in property <string> cal-title: "电量使用";
+    in property <[int]> cal-energy-milli: [];
+    in property <int> cal-max-milli: 1;
+    in property <int> cal-first-weekday: 0;
+    in property <int> cal-days: 31;
+    in property <int> cal-today: 1;
+    in property <[float]> day-energy: [];
+    in property <[float]> month-energy: [];
+    callback set-pview(int);
+
+    spacing: Theme.gap;
+
+    // 当月峰值，用于色块深浅归一化（由 Rust 侧算好传进来）
+    property <int> cal-max: cal-max-milli;
+
+    // ── 顶部统计 ──────────────────────────────────────────────
+    HorizontalLayout {
+        height: 62px;
+        spacing: 10px;
+        Stat { horizontal-stretch: 1; label: "今日用电"; value: root.p-today; unit: "度"; }
+        Stat { horizontal-stretch: 1; label: "本月用电"; value: root.p-month; unit: "度"; }
+        Stat { horizontal-stretch: 1; label: "本年用电"; value: root.p-year; unit: "度"; }
+        Stat { horizontal-stretch: 1; label: "今日用时"; value: root.p-today-h; unit: "小时"; }
+        Stat { horizontal-stretch: 1; label: "本月用时"; value: root.p-month-h; unit: "小时"; }
+    }
+
+    // ── 日历 ──────────────────────────────────────────────────
+    Card {
+        title: root.cal-title;
+        HorizontalLayout {
+            height: 28px;
+            spacing: 6px;
+            Rectangle { horizontal-stretch: 1; }
+            Rectangle {
+                width: 44px; height: 26px; border-radius: 8px;
+                background: root.pview == 0 ? Theme.accent : Theme.bg-soft;
+                border-width: 1px; border-color: root.pview == 0 ? Theme.accent : Theme.line;
+                Text { text: "日"; color: root.pview == 0 ? Theme.on-accent : Theme.text-dim; font-size: Theme.font-sm; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.set-pview(0); } }
+            }
+            Rectangle {
+                width: 44px; height: 26px; border-radius: 8px;
+                background: root.pview == 1 ? Theme.accent : Theme.bg-soft;
+                border-width: 1px; border-color: root.pview == 1 ? Theme.accent : Theme.line;
+                Text { text: "月"; color: root.pview == 1 ? Theme.on-accent : Theme.text-dim; font-size: Theme.font-sm; horizontal-alignment: center; vertical-alignment: center; }
+                TouchArea { mouse-cursor: pointer; clicked => { root.set-pview(1); } }
+            }
+        }
+
+        // 星期表头
+        HorizontalLayout {
+            height: 20px;
+            spacing: 6px;
+            for w in 7 : Text {
+                horizontal-stretch: 1;
+                text: w == 0 ? "日" : w == 1 ? "一" : w == 2 ? "二" : w == 3 ? "三" : w == 4 ? "四" : w == 5 ? "五" : "六";
+                color: Theme.text-mute;
+                font-size: Theme.font-xs;
+                horizontal-alignment: center;
+            }
+        }
+
+        // 日视图：6 行 × 7 列
+        //
+        // Slint 不支持 `for a in x : for b in y :` 这种链式循环，
+        // 所以把一行抽成 CalRow 组件，外层只循环行数。
+        if root.pview == 0 : VerticalLayout {
+            spacing: 6px;
+            for r in 6 : CalRow {
+                row-index: r;
+                first-weekday: root.cal-first-weekday;
+                days: root.cal-days;
+                today: root.cal-today;
+                max-milli: root.cal-max;
+                energy-milli: root.cal-energy-milli;
+            }
+        }
+
+        // 月视图：12 个横向条
+        if root.pview == 1 : VerticalLayout {
+            spacing: 5px;
+            for m in 12 : Rectangle {
+                height: 26px;
+                background: transparent;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        width: 42px;
+                        text: (m + 1) + " 月";
+                        color: Theme.text-dim;
+                        font-size: Theme.font-sm;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 14px;
+                        border-radius: 7px;
+                        background: Theme.bg-soft;
+                        Rectangle {
+                            width: parent.width * min(1.0, (m < root.month-energy.length ? root.month-energy[m] : 0) / 80.0);
+                            height: parent.height;
+                            border-radius: 7px;
+                            background: Theme.accent.with-alpha(0.75);
+                        }
+                    }
+                    Text {
+                        width: 62px;
+                        text: m < root.month-energy.length ? root.month-energy[m] + " 度" : "—";
+                        color: Theme.text-dim;
+                        font-size: Theme.font-xs;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: "色块深浅 = 当日用电量";
+            color: Theme.text-mute;
+            font-size: Theme.font-xs;
+            visible: root.pview == 0;
+        }
+    }
+}
