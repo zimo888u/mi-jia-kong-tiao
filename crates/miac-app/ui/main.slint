@@ -21,48 +21,20 @@ import { LoginModal, LoginDevice } from "login.slint";
 
 // ── 导航项 ──────────────────────────────────────────────────────
 component NavItem inherits Rectangle {
-    in property <string> icon;
     in property <string> label;
     in property <bool> active: false;
     callback clicked;
 
-    height: 36px;
+    height: 46px;
     border-radius: Theme.radius-sm;
     background: active ? Theme.nav-active : (touch.has-hover ? Theme.panel : transparent);
 
-    // 选中时左侧 2px 高亮条（CSS 的 inset box-shadow）
-    Rectangle {
-        visible: root.active;
-        width: 2px;
-        height: parent.height - 12px;
-        y: 6px;
-        border-radius: 1px;
-        background: Theme.accent;
-    }
-
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 10px;
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: root.icon;
-                color: root.active ? Theme.text : Theme.text-dim;
-                font-size: Theme.font-md;
-                width: 18px;
-                horizontal-alignment: center;
-            }
-        }
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: root.label;
-                color: root.active ? Theme.text : Theme.text-dim;
-                font-size: Theme.font-md;
-                vertical-alignment: center;
-            }
-        }
+    Text {
+        x: 20px; width: parent.width - 40px; height: parent.height;
+        text: root.label;
+        color: root.active ? Theme.nav-text : Theme.text-dim;
+        font-size: Theme.font-md;
+        vertical-alignment: center;
     }
 
     touch := TouchArea {
@@ -74,11 +46,11 @@ component NavItem inherits Rectangle {
 // ── 主窗口 ──────────────────────────────────────────────────────
 export component MainWindow inherits Window {
     title: "米家空调";
-    // 注意：Slint 不允许同时指定 width 和 min-width（会报
-    // "Cannot specify both 'width' and 'min-width'"）。这里只给初始尺寸，
-    // 最小尺寸由内容的首选尺寸自然兜底。
-    width: 1180px;
-    height: 780px;
+    // Preferred size keeps the native window resizable; narrow layouts stay readable.
+    preferred-width: 1440px;
+    preferred-height: 960px;
+    min-width: 1160px;
+    min-height: 720px;
     background: Theme.bg;
 
     // ── 界面 ↔ 后台的契约（第 2 阶段由真实控制核心填充，现在喂假数据）──
@@ -121,7 +93,7 @@ export component MainWindow inherits Window {
     in property <int> pview: 0;                      // 0 日 1 月
 
     // 明暗主题开关（Rust 侧唯一真相）
-    in property <bool> dark-theme: true;
+    in property <bool> dark-theme: false;
     // theme.slint 的 Theme 是纯 global（没有 Window 上下文），
     // Rust 侧拿不到 Theme::get(&ui)，所以在这里把两者绑起来：
     // Rust 只设 dark-theme，所有颜色由 theme.slint 自己选。
@@ -236,52 +208,24 @@ export component MainWindow inherits Window {
         }
 
         VerticalLayout {
-            padding: 16px;
-            spacing: 18px;
+            padding: 24px;
+            spacing: 32px;
 
-            // 品牌区
-            HorizontalLayout {
-                height: 32px;
-                spacing: 11px;
-                Rectangle {
-                    width: 32px; height: 32px;
-                    border-radius: 9px;
-                    background: Theme.brand-mark;
-                    // 雪花标记（对应 .brand-mark::before/after 的交叉细线）。
-                    // 原版用 CSS transform: rotate 画两条斜线；Slint 1.18 的 Rectangle
-                    // 没有任何旋转属性（transform-rotation-* / rotate-* 都不存在），
-                    // 实测 Path 元素可用，但两条直线用正/横矩形拼更省事，
-                    // 视觉上同样是「对称的十字雪花」。
-                    Rectangle {
-                        x: 8px; y: 16px; width: 18px; height: 2px; border-radius: 1px;
-                        background: rgba(255,255,255,0.92);
-                    }
-                    Rectangle {
-                        x: 16px; y: 8px; width: 2px; height: 18px; border-radius: 1px;
-                        background: rgba(255,255,255,0.7);
-                    }
-                }
-                VerticalLayout {
-                    alignment: center;
-                    spacing: 1px;
-                        Text { text: "米家空调"; color: Theme.text; font-size: 14px; font-weight: 600; }
-                    Text {
-                        text: root.device-name;
-                        color: Theme.text-mute;
-                        font-size: 11.5px;
-                        overflow: elide;
-                    }
-                }
+            VerticalLayout {
+                height: 64px;
+                spacing: 8px;
+                Text { text: "mi  /  米家空调"; color: Theme.text; font-size: 21px; font-weight: 700; }
+                Text { text: "让舒适，刚刚好。"; color: Theme.text-mute; font-size: Theme.font-sm; }
             }
 
             // 导航
             VerticalLayout {
                 spacing: 4px;
-                NavItem { icon: "✦"; label: "控制台";    active: root.view == 0; clicked => { root.nav-to(0); } }
-                NavItem { icon: "↯"; label: "电量统计";  active: root.view == 1; clicked => { root.nav-to(1); } }
-                NavItem { icon: "⌁"; label: "运行诊断";  active: root.view == 2; clicked => { root.nav-to(2); } }
-                NavItem { icon: "◇"; label: "高级 / 属性"; active: root.view == 3; clicked => { root.nav-to(3); } }
-                NavItem { icon: "⚙"; label: "设置";      active: root.view == 4; clicked => { root.nav-to(4); } }
+                NavItem { label: "空调控制";    active: root.view == 0; clicked => { root.nav-to(0); } }
+                NavItem { label: "电量统计";  active: root.view == 1; clicked => { root.nav-to(1); } }
+                NavItem { label: "运行诊断";  active: root.view == 2; clicked => { root.nav-to(2); } }
+                NavItem { label: "高级属性"; active: root.view == 3; clicked => { root.nav-to(3); } }
+                NavItem { label: "设置";      active: root.view == 4; clicked => { root.nav-to(4); } }
             }
 
             // 弹性空白，把页脚推到底部
@@ -343,21 +287,25 @@ export component MainWindow inherits Window {
             Rectangle {
                 height: Theme.topbar-h;
                 background: transparent;
-                Rectangle { width: parent.width; height: 1px; y: parent.height - 1px; background: Theme.line-soft; }
+
 
                 HorizontalLayout {
-                padding-left: 24px;
-                padding-right: 24px;
+                padding-left: Theme.pad;
+                padding-right: Theme.pad;
+                padding-top: 32px;
+                padding-bottom: 32px;
                 spacing: 12px;
-                Text {
-                        text: root.view == 0 ? "控制台"
-                            : root.view == 1 ? "电量统计"
-                            : root.view == 2 ? "运行诊断"
-                            : root.view == 3 ? "高级 / 属性" : "设置";
-                        color: Theme.text;
-                        font-size: 19px;
-                        font-weight: 600;
-                        vertical-alignment: center;
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 8px;
+                        Text {
+                            text: root.view == 0 ? "舒适，从这一刻开始"
+                                : root.view == 1 ? "每一度，都看得见"
+                                : root.view == 2 ? "设备状态，一目了然"
+                                : root.view == 3 ? "更多控制，尽在掌握" : "让设备，更懂你的习惯";
+                            color: Theme.text; font-size: 28px; font-weight: 700;
+                        }
+                        Text { text: "米家空调  /  " + root.device-name; color: Theme.text-mute; font-size: Theme.font-sm; }
                     }
                     Rectangle {
                         width: 58px; height: 24px;
@@ -375,7 +323,7 @@ export component MainWindow inherits Window {
 
                     // 自动更新
                     Rectangle {
-                        width: auto-touch.has-hover ? 108px : 100px;
+                        width: 108px;
                         height: 30px;
                         border-radius: Theme.radius-sm;
                         background: auto-touch.has-hover ? Theme.panel-hi : transparent;
@@ -456,8 +404,8 @@ export component MainWindow inherits Window {
                         y: 0;
                         width: flick.width;
                         padding: Theme.pad;
-                        padding-left: 24px;
-                        padding-right: 24px;
+                        padding-left: Theme.pad;
+                        padding-right: Theme.pad;
                         spacing: Theme.gap;
 
                         // 五个页面按需实例化：只有当前页在内存里
@@ -529,7 +477,7 @@ export component MainWindow inherits Window {
                             raw-addr: root.raw-addr;
                             raw-prop-names: root.raw-prop-names;
                             prop-name-list: root.prop-name-list;
-                            raw-value: root.raw-value;
+                            raw-value <=> root.raw-value;
                             raw-out: root.raw-out;
                             all-props: root.all-props;
                             light-on: root.light-on;

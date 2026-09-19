@@ -6,7 +6,7 @@
 //! 与 v1 的关系：v1 把主题存在渲染进程的 localStorage 里（在
 //! `%APPDATA%\米家空调\Local Storage\` 的 LevelDB 中），不是 JSON，
 //! 所以 v2 无法用解析 JSON 的方式读它。首启迁移时由 `migration.rs`
-//! 尽力从 LevelDB 里抠出主题键，抠不到就用默认值（深色）。
+//! 尽力从 LevelDB 里抠出主题键，抠不到就用默认值（浅色）。
 
 use std::path::PathBuf;
 
@@ -22,7 +22,7 @@ pub const PRESET_SLOTS: usize = 3;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     /// 明暗主题：true = 深色
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub dark: bool,
     /// 三个温度预设（℃）
     #[serde(default = "default_presets")]
@@ -65,7 +65,7 @@ fn default_presets() -> Vec<f64> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            dark: true,
+            dark: false,
             presets: default_presets(),
             pending_temp: None,
             transport: 0,
@@ -147,13 +147,29 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let s = Settings::default();
-        assert!(s.dark);
+        assert!(!s.dark, "new installations should use the sage light theme");
         assert_eq!(s.presets.len(), PRESET_SLOTS);
         assert_eq!(s.presets, vec![27.5, 27.0, 26.5]);
         assert_eq!(s.transport, 0);
         assert!(s.auto_refresh);
         assert_eq!(s.refresh_secs, 6);
         assert!(!s.migrated);
+    }
+
+    #[test]
+    fn missing_theme_uses_light_default() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.dark);
+    }
+
+    #[test]
+    fn saved_theme_preference_is_preserved() {
+        for dark in [false, true] {
+            let settings: Settings = serde_json::from_str(
+                &format!(r#"{{"dark":{dark}}}"#),
+            ).unwrap();
+            assert_eq!(settings.dark, dark);
+        }
     }
 
     #[test]

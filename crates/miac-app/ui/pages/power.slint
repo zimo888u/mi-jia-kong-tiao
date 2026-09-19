@@ -13,21 +13,22 @@ component Stat inherits Rectangle {
     in property <string> label;
     in property <string> value;
     in property <string> unit;
+    in property <bool> featured: false;
 
-    height: 62px;
-    border-radius: Theme.radius-sm;
-    background: Theme.panel;
-    border-width: 1px;
+    height: 140px;
+    border-radius: Theme.radius;
+    background: featured ? Theme.energy-bg : Theme.panel;
+    border-width: 0px;
     border-color: Theme.line-soft;
     VerticalLayout {
         alignment: center;
         spacing: 1px;
-        Text { text: root.label; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
+        Text { text: root.label; color: root.featured ? Theme.energy-muted : Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
         HorizontalLayout {
             alignment: center;
             spacing: 2px;
-            Text { text: root.value; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; vertical-alignment: bottom; }
-            Text { text: root.unit; color: Theme.text-mute; font-size: Theme.font-xs; vertical-alignment: bottom; }
+            Text { text: root.value; color: root.featured ? Theme.energy-text : Theme.text; font-size: 32px; font-weight: 600; vertical-alignment: bottom; }
+            Text { text: root.unit; color: root.featured ? Theme.energy-muted : Theme.text-mute; font-size: Theme.font-xs; vertical-alignment: bottom; }
         }
     }
 }
@@ -47,14 +48,14 @@ component CalCell inherits Rectangle {
     // 深浅就看不出来了。所以压到 0.10~0.55 这个区间，拉开层次。
     property <float> alpha: 0.10 + 0.45 * self.t;
     // 右半边（比例 > 0.5）底色偏亮，文字改用深色才看得清
-    property <bool> dark-text: self.t > 0.5;
+    property <bool> dark-text: !Theme.dark && self.t > 0.66;
 
-    height: 44px;
+    height: 64px;
     border-radius: 8px;
-    background: energy-milli <= 0
-        ? (Theme.dark ? Theme.bg-soft : Theme.bg-soft)
-        : Theme.accent.with-alpha(self.alpha);
-    border-width: is-today ? 2px : 1px;
+    background: day <= 0 ? transparent : energy-milli <= 0 ? Theme.bg-soft
+        : Theme.dark ? Theme.accent.with-alpha(self.alpha)
+        : self.t > 0.66 ? #65815a : self.t > 0.33 ? #a2b68d : #dce6d0;
+    border-width: is-today ? 2px : 0px;
     border-color: is-today ? Theme.accent : Theme.line-soft;
 
     VerticalLayout {
@@ -130,15 +131,19 @@ export component PowerPage inherits VerticalLayout {
 
     // ── 顶部统计 ──────────────────────────────────────────────
     HorizontalLayout {
-        height: 62px;
+        height: 140px;
         spacing: 10px;
-        Stat { horizontal-stretch: 1; label: "今日用电"; value: root.p-today; unit: "度"; }
-        Stat { horizontal-stretch: 1; label: "本月用电"; value: root.p-month; unit: "度"; }
-        Stat { horizontal-stretch: 1; label: "本年用电"; value: root.p-year; unit: "度"; }
-        Stat { horizontal-stretch: 1; label: "今日用时"; value: root.p-today-h; unit: "小时"; }
-        Stat { horizontal-stretch: 1; label: "本月用时"; value: root.p-month-h; unit: "小时"; }
+        Stat { width: (root.width - 30px) / 4; featured: true; label: "今日用电"; value: root.p-today; unit: "度"; }
+        Stat { width: (root.width - 30px) / 4; label: "本月用电"; value: root.p-month; unit: "度"; }
+        Stat { width: (root.width - 30px) / 4; label: "本年用电"; value: root.p-year; unit: "度"; }
+        Stat { width: (root.width - 30px) / 4; label: "今日用时"; value: root.p-today-h; unit: "小时"; }
+
     }
 
+    HorizontalLayout {
+        spacing: Theme.gap;
+        VerticalLayout {
+            width: (root.width - Theme.gap) * 0.66;
     // ── 日历 ──────────────────────────────────────────────────
     Card {
         title: root.cal-title;
@@ -181,7 +186,7 @@ export component PowerPage inherits VerticalLayout {
         // 所以把一行抽成 CalRow 组件，外层只循环行数。
         if root.pview == 0 : VerticalLayout {
             spacing: 6px;
-            for r in 6 : CalRow {
+            for r in ceil((root.cal-first-weekday + root.cal-days) / 7.0) : CalRow {
                 row-index: r;
                 first-weekday: root.cal-first-weekday;
                 days: root.cal-days;
@@ -235,6 +240,26 @@ export component PowerPage inherits VerticalLayout {
             color: Theme.text-mute;
             font-size: Theme.font-xs;
             visible: root.pview == 0;
+        }
+    }
+
+        }
+        VerticalLayout {
+            width: (root.width - Theme.gap) * 0.34;
+            Card {
+                title: "读懂你的用电习惯";
+                background: Theme.sage-panel;
+                Text { text: "每天的消耗，都有迹可循。"; color: Theme.text-dim; font-size: Theme.font-sm; }
+                Rectangle { height: 20px; }
+                Text { text: "本月用时"; color: Theme.text-mute; font-size: Theme.font-sm; }
+                Text { text: root.p-month-h + " 小时"; color: Theme.text; font-size: 30px; }
+                Rectangle { height: 24px; }
+                Text { text: "日历颜色越深，当日用电越多。"; wrap: word-wrap; color: Theme.text-dim; font-size: Theme.font-sm; }
+                Text { text: "切换月视图，查看全年用电分布。"; wrap: word-wrap; color: Theme.text-dim; font-size: Theme.font-sm; }
+                Rectangle { height: 180px; }
+                Text { text: "数据来自设备用电统计"; color: Theme.text-mute; font-size: Theme.font-xs; }
+            }
+            Rectangle { vertical-stretch: 1; }
         }
     }
 }

@@ -1,58 +1,54 @@
-// theme.slint —— Codex-like graphite workspace theme
-//
-// 视觉方向：低对比石墨底、克制的面板层级、单一紫色操作强调。
-// 所有页面的尺寸与颜色都从这里派生，避免局部组件各自“跑风格”。
-
+// Sage desktop theme — shared by all five native pages.
 export global Dark {
-    out property <color> bg:          #171717;
-    out property <color> bg-soft:     #1f1f1f;
-    out property <color> panel:       #242424;
-    out property <color> panel-hi:    #2c2c2c;
-    out property <color> line:        #3b3b3b;
-    out property <color> line-soft:   #303030;
-    out property <color> text:        #f4f4f5;
-    out property <color> text-dim:    #b5b5ba;
-    out property <color> text-mute:   #85858d;
-    out property <color> accent:      #a78bfa;
-    out property <color> accent-deep: #8b5cf6;
-    out property <color> warm:        #f59e0b;
-    out property <color> green:       #34d399;
-    out property <color> red:         #fb7185;
-    out property <color> amber:       #fbbf24;
-    out property <color> on-accent:   #ffffff;
-    out property <brush> sidebar:     #151515;
-    out property <brush> nav-active:  #2b2439;
-    out property <brush> brand-mark:  @linear-gradient(135deg, #8b5cf6 0%, #5b21b6 100%);
-    out property <brush> dial-track:  #3a3546;
+    out property <color> bg:          #17231e;
+    out property <color> bg-soft:     #203027;
+    out property <color> panel:       #25362d;
+    out property <color> panel-hi:    #304638;
+    out property <color> line:        #47604d;
+    out property <color> line-soft:   #34483a;
+    out property <color> text:        #eef4e9;
+    out property <color> text-dim:    #c0ccbb;
+    out property <color> text-mute:   #97aa94;
+    out property <color> accent:      #a9c68c;
+    out property <color> accent-deep: #87a86c;
+    out property <color> warm:        #dab780;
+    out property <color> green:       #b0ce99;
+    out property <color> red:         #f39791;
+    out property <color> amber:       #e0bf87;
+    out property <color> on-accent:   #213522;
+    out property <brush> sidebar:     #1b2a22;
+    out property <brush> nav-active:  #b0c99c;
+    out property <brush> brand-mark:  @linear-gradient(135deg, #87a86c 0%, #35513d 100%);
+    out property <brush> dial-track:  #3b5140;
     out property <color> overlay:     rgba(0, 0, 0, 0.68);
 }
 
 export global Light {
-    out property <color> bg:          #f5f5f6;
-    out property <color> bg-soft:     #ededf0;
+    out property <color> bg:          #f5f7f3;
+    out property <color> bg-soft:     #f0f4ec;
     out property <color> panel:       #ffffff;
-    out property <color> panel-hi:    #f8f8fa;
-    out property <color> line:        #d8d8de;
-    out property <color> line-soft:   #e6e6eb;
-    out property <color> text:        #202023;
-    out property <color> text-dim:    #5f5f68;
-    out property <color> text-mute:   #91919b;
-    out property <color> accent:      #7c3aed;
-    out property <color> accent-deep: #6d28d9;
-    out property <color> warm:        #d97706;
-    out property <color> green:       #16a34a;
-    out property <color> red:         #dc2626;
-    out property <color> amber:       #d97706;
+    out property <color> panel-hi:    #eaf0e3;
+    out property <color> line:        #d5dfce;
+    out property <color> line-soft:   #e5ebe0;
+    out property <color> text:        #263b35;
+    out property <color> text-dim:    #52684e;
+    out property <color> text-mute:   #71816c;
+    out property <color> accent:      #365f43;
+    out property <color> accent-deep: #284e3e;
+    out property <color> warm:        #8b6b43;
+    out property <color> green:       #527c45;
+    out property <color> red:         #b6433c;
+    out property <color> amber:       #8b6b43;
     out property <color> on-accent:   #ffffff;
-    out property <brush> sidebar:     #f0f0f2;
-    out property <brush> nav-active:  #ebe5f8;
-    out property <brush> brand-mark:  @linear-gradient(135deg, #a78bfa 0%, #6d28d9 100%);
-    out property <brush> dial-track:  #e4e0eb;
+    out property <brush> sidebar:     #eff3ec;
+    out property <brush> nav-active:  #284e3e;
+    out property <brush> brand-mark:  @linear-gradient(135deg, #a9c68c 0%, #284e3e 100%);
+    out property <brush> dial-track:  #e2e9da;
     out property <color> overlay:     rgba(20, 20, 24, 0.36);
 }
 
 export global Theme {
-    in-out property <bool> dark: true;
+    in-out property <bool> dark: false;
 
     out property <color> bg:          dark ? Dark.bg          : Light.bg;
     out property <color> bg-soft:     dark ? Dark.bg-soft     : Light.bg-soft;
@@ -76,19 +72,26 @@ export global Theme {
     out property <brush> dial-track:  dark ? Dark.dial-track  : Light.dial-track;
     out property <color> overlay:     dark ? Dark.overlay     : Light.overlay;
 
+    out property <color> sage-panel: dark ? #344732 : #e8eedf;
+    out property <color> dial-fill: dark ? #a9c68c : #84aa6d;
+    out property <color> nav-text: dark ? #213522 : #ffffff;
+    out property <color> energy-bg: #2e4a3c;
+    out property <color> energy-text: #f0f5e9;
+    out property <color> energy-muted: #bdcdb5;
+
     // 一套统一的间距和圆角，保证卡片、侧栏、选项的边缘能对齐。
-    out property <length> radius:     12px;
-    out property <length> radius-sm:  8px;
+    out property <length> radius:     24px;
+    out property <length> radius-sm:  18px;
     out property <length> sidebar-w:  220px;
-    out property <length> topbar-h:   58px;
-    out property <length> pad:        20px;
-    out property <length> gap:        12px;
+    out property <length> topbar-h:   116px;
+    out property <length> pad:        32px;
+    out property <length> gap:        20px;
 
     out property <length> font-xs:    11px;
     out property <length> font-sm:    12px;
     out property <length> font-md:    13px;
-    out property <length> font-lg:    15px;
+    out property <length> font-lg:    18px;
     out property <length> font-xl:    20px;
     out property <length> font-2xl:   28px;
-    out property <length> font-3xl:   46px;
+    out property <length> font-3xl:   64px;
 }

@@ -25,11 +25,13 @@ export component SettingsPage inherits VerticalLayout {
 
     spacing: Theme.gap;
 
-    // ── 连接状态 ──────────────────────────────────────────────
+    HorizontalLayout {
+        spacing: Theme.gap;
+        VerticalLayout { width: (root.width - Theme.gap) * 0.62; spacing: Theme.gap;
     Card {
         title: "连接状态";
         HorizontalLayout {
-            height: 28px;
+            height: 32px;
             spacing: 10px;
             Rectangle {
                 width: 10px; height: 10px; border-radius: 5px;
@@ -57,25 +59,12 @@ export component SettingsPage inherits VerticalLayout {
         }
         HorizontalLayout {
             spacing: 8px;
-            SegButton { label: "自动（局域网优先）"; min-w: 140px; active: root.transport-mode == 0; clicked => { root.set-transport(0); } }
+            SegButton { label: "自动（局域网优先）"; min-w: 164px; active: root.transport-mode == 0; clicked => { root.set-transport(0); } }
             SegButton { label: "强制局域网"; min-w: 104px; active: root.transport-mode == 1; clicked => { root.set-transport(1); } }
             SegButton { label: "强制云端"; min-w: 92px; active: root.transport-mode == 2; clicked => { root.set-transport(2); } }
             Rectangle { horizontal-stretch: 1; }
         }
     }
-
-    // ── 通信通道说明 ──────────────────────────────────────────
-    Card {
-        title: "通道说明";
-        Text {
-            text: "局域网直连约 0.4 秒，且实测米家 App 约 1 秒内同步显示（设备会主动向小米云上报）。云端 RPC 约 1–2 秒，仅在设备不在同一局域网时使用。";
-            color: Theme.text-mute;
-            font-size: Theme.font-sm;
-            wrap: word-wrap;
-        }
-    }
-
-    // ── 设备信息 ──────────────────────────────────────────────
     Card {
         title: "设备信息";
         Text {
@@ -85,11 +74,38 @@ export component SettingsPage inherits VerticalLayout {
             wrap: word-wrap;
         }
     }
-
-    // ── 凭据 ──────────────────────────────────────────────────
     Card {
-        title: "凭据";
-        hint: root.credentials-encrypted ? "已启用 DPAPI 加密" : "当前为明文存储";
+        title: "运行日志";
+        HorizontalLayout {
+            height: 38px;
+            Rectangle { horizontal-stretch: 1; }
+            FlatButton { label: "清空"; ghost: true; min-w: 60px; clicked => { root.clear-log(); } }
+        }
+        Rectangle {
+            height: 168px;
+            border-radius: Theme.radius-sm;
+            background: Theme.bg;
+            border-width: 1px;
+            border-color: Theme.line-soft;
+            clip: true;
+            log-text := Text {
+                x: 10px;
+                y: 10px;
+                width: parent.width - 20px;
+                text: root.log-text;
+                color: Theme.text-dim;
+                font-size: Theme.font-xs;
+                wrap: word-wrap;
+                vertical-alignment: bottom;
+            }
+        }
+    }
+            Rectangle { vertical-stretch: 1; }
+        }
+        VerticalLayout { width: (root.width - Theme.gap) * 0.38; spacing: Theme.gap;
+    Card {
+        title: "本机凭据"; background: Theme.sage-panel;
+        Text { text: root.credentials-encrypted ? "已启用 DPAPI 加密" : "当前为明文存储"; color: Theme.text-dim; font-size: Theme.font-sm; }
         Text {
             text: "存储位置：" + (root.credentials-dir == "" ? "—" : root.credentials-dir);
             color: Theme.text-dim;
@@ -116,8 +132,6 @@ export component SettingsPage inherits VerticalLayout {
             Rectangle { horizontal-stretch: 1; }
         }
     }
-
-    // ── 迁移摘要 ──────────────────────────────────────────────
     Card {
         title: "旧版数据迁移";
         hint: "首次启动自动执行";
@@ -128,36 +142,15 @@ export component SettingsPage inherits VerticalLayout {
             wrap: word-wrap;
         }
     }
-
-    // ── 运行日志 ──────────────────────────────────────────────
     Card {
-        title: "运行日志";
-        HorizontalLayout {
-            height: 26px;
-            Rectangle { horizontal-stretch: 1; }
-            FlatButton { label: "清空"; ghost: true; min-w: 60px; clicked => { root.clear-log(); } }
-        }
-        Rectangle {
-            height: 168px;
-            border-radius: Theme.radius-sm;
-            background: Theme.bg;
-            border-width: 1px;
-            border-color: Theme.line-soft;
-            clip: true;
-            log-text := Text {
-                x: 10px;
-                y: 10px;
-                width: parent.width - 20px;
-                text: root.log-text;
-                color: Theme.text-dim;
-                font-size: Theme.font-xs;
-                wrap: word-wrap;
-                vertical-alignment: bottom;
-            }
+        title: "通道说明";
+        Text {
+            text: "局域网直连约 0.4 秒，且实测米家 App 约 1 秒内同步显示（设备会主动向小米云上报）。云端 RPC 约 1–2 秒，仅在设备不在同一局域网时使用。";
+            color: Theme.text-mute;
+            font-size: Theme.font-sm;
+            wrap: word-wrap;
         }
     }
-
-    // ── 关于 ──────────────────────────────────────────────────
     Card {
         title: "关于";
         Text {
@@ -171,6 +164,9 @@ export component SettingsPage inherits VerticalLayout {
             color: Theme.text-mute;
             font-size: Theme.font-xs;
             wrap: word-wrap;
+        }
+    }
+            Rectangle { vertical-stretch: 1; }
         }
     }
 }
