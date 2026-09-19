@@ -3,6 +3,16 @@
 单进程、无 Electron / Chromium / Node.js 的米家空调控制器。
 界面用 Slint 编译期编译为原生组件，控制核心用 Rust 重写。
 
+## Windows 下载
+
+最新 Windows x86-64 便携版已经发布到 GitHub Releases：
+
+[下载 miac-app.exe（v2.0.0）](https://github.com/zimo888u/mi-jia-kong-tiao/releases/download/v2.0.0/miac-app.exe)
+
+下载后直接运行即可，无需安装 Node.js、Electron 或额外运行库。首次使用时，点击界面中的「扫码登录米家账号」，用米家 App 扫码并选择要控制的空调。
+
+本版本包含 Sage 桌面 UI、未连接设备提示框布局修复，以及扫码登录成功事件和 `userId` 字符串格式兼容。
+
 > 本文档记录**进度与实测数据**。总规划见仓库根目录的 `README.md`（v1 版）。
 
 ---
