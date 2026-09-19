@@ -1,0 +1,48 @@
+[package]
+name = "miac-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "米家空调控制核心（无界面）"
+
+[lib]
+name = "miac_core"
+path = "src/lib.rs"
+
+[dependencies]
+# ── 加密原语 ──────────────────────────────────────────────────
+# 全部用 RustCrypto 纯 Rust 实现，不依赖 OpenSSL / 系统 TLS
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+
+# ── JSON ─────────────────────────────────────────────────────
+# device.json / cloud-session.json / thermometer.json 必须与 v1 完全兼容
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hmac = "0.12"
+
+# ── 云端 HTTPS ────────────────────────────────────────────────
+# 关键：必须用 rustls + 内置根证书，不能用系统 TLS 栈。
+# 本机 Windows schannel 凭据存储不可用（SEC_E_NO_CREDENTIALS），
+# 任何走 schannel 的客户端都连不上（curl / winget 都栽在这上面）。
+ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI 加密凭据（绑定当前 Windows 用户与电脑）
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Time",
+] }
+
+[dev-dependencies]
