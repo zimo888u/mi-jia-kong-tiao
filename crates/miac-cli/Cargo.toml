@@ -1,0 +1,17 @@
+[package]
+name = "miac-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "米家空调控制核心的命令行诊断工具（复用 miac-core）"
+
+[[bin]]
+name = "miac-cli"
+path = "src/main.rs"
+
+[dependencies]
+miac-core = { path = "../miac-core" }
+# 登录流程要拼 device.json / thermometer.json
+serde_json = "1"
