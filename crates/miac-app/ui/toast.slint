@@ -1,0 +1,108 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/toast.slint —— 右下角提示条
+//
+// 对应 v1 的 .toasts / .toast：最多同时显示 3 条，从右下角往上堆，
+// 每条几秒后自动消失。
+//
+// 为什么限制 3 条：连续操作（比如快速点几下温度）时提示会刷屏，
+// 盖住界面内容。限 3 条是有意为之，不是偷懒。
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "theme.slint";
+
+/// 一条提示。
+export struct ToastItem {
+    /// 0 信息 / 1 成功 / 2 警告 / 3 错误
+    kind: int,
+    text: string,
+    /// 用序号做 key，便于动画时区分不同条目
+    seq: int,
+}
+
+/// 单条提示的外观。
+component ToastCard inherits Rectangle {
+    in property <ToastItem> item;
+
+    // 按类型取强调色
+    property <color> tone:
+        item.kind == 3 ? Theme.red
+        : item.kind == 2 ? Theme.amber
+        : item.kind == 1 ? Theme.green
+        : Theme.accent;
+
+    height: 44px;
+    // 宽度按内容自适应，但留出上下限，长文本换行会破坏堆叠观感
+    width: Math.min(420px, Math.max(220px, text.preferred-width + 46px));
+    border-radius: Theme.radius-sm;
+    background: Theme.panel;
+    border-width: 1px;
+    border-color: tone;
+    // 轻微投影感：靠左侧色条 + 稍暗底色模拟，软件渲染下比真阴影便宜
+    drop-shadow-blur: 12px;
+    drop-shadow-color: rgba(0, 0, 0, 0.35);
+    drop-shadow-offset-y: 3px;
+
+    // 左侧类型色条
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 3px;
+        height: parent.height - 0px;
+        border-radius: Theme.radius-sm;
+        background: root.tone;
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 10px;
+
+        // 类型图标
+        Text {
+            text: root.item.kind == 3 ? "✕"
+                : root.item.kind == 2 ? "!"
+                : root.item.kind == 1 ? "✓"
+                : "i";
+            color: root.tone;
+            font-size: 14px;
+            font-weight: 700;
+            width: 16px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        text := Text {
+            text: root.item.text;
+            color: Theme.text;
+            font-size: Theme.font-sm;
+            vertical-alignment: center;
+            // 长文本省略，避免提示被撑得很宽
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+
+    // 点一下就提前关掉
+    callback dismissed;
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.dismissed(); }
+    }
+}
+
+/// 右下角提示容器。
+export component ToastHost inherits VerticalLayout {
+    in property <[ToastItem]> items: [];
+    in property <int> next-seq: 0;
+    callback dismiss(int);
+
+    spacing: 8px;
+    alignment: end;
+
+    // 从下往上堆：最新的在最下面（贴近右下角），所以倒序渲染
+    for i in 3 : ToastCard {
+        visible: i < root.items.length;
+        item: i < root.items.length ? root.items[i] : { kind: 0, text: "", seq: 0 };
+        dismissed => { root.dismiss(i); }
+    }
+}

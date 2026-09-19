@@ -1,0 +1,668 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// main.slint —— 主窗口：侧边栏 + 顶栏 + 五个页面
+//
+// 对应 Electron 版 app/renderer/index.html 的结构：
+//   .sidebar（品牌 / 导航 / 主题切换 / 通道指示）
+//   .main（.topbar 标题+自动更新+刷新 / .scroll 各页面）
+//
+// 内存注意：五个页面用 if 按需实例化，同一时刻只构造一个页面的元素树，
+// 而不是五个都在内存里（旧版是 DOM 全量常驻）。第 1 阶段结束后用
+// 任务管理器核对 5 分钟驻留内存是否 < 45 MB。
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "theme.slint";
+import { ControlPage } from "pages/control.slint";
+import { PowerPage } from "pages/power.slint";
+import { DiagPage } from "pages/diag.slint";
+import { DebugPage } from "pages/debug.slint";
+import { SettingsPage } from "pages/settings.slint";
+import { ToastHost, ToastItem } from "toast.slint";
+import { LoginModal, LoginDevice } from "login.slint";
+
+// ── 导航项 ──────────────────────────────────────────────────────
+component NavItem inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked;
+
+    height: 36px;
+    border-radius: Theme.radius-sm;
+    background: active ? Theme.nav-active : (touch.has-hover ? Theme.panel : transparent);
+
+    // 选中时左侧 2px 高亮条（CSS 的 inset box-shadow）
+    Rectangle {
+        visible: root.active;
+        width: 2px;
+        height: parent.height - 12px;
+        y: 6px;
+        border-radius: 1px;
+        background: Theme.accent;
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.icon;
+                color: root.active ? Theme.text : Theme.text-dim;
+                font-size: Theme.font-md;
+                width: 18px;
+                horizontal-alignment: center;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.label;
+                color: root.active ? Theme.text : Theme.text-dim;
+                font-size: Theme.font-md;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 主窗口 ──────────────────────────────────────────────────────
+export component MainWindow inherits Window {
+    title: "米家空调";
+    // 注意：Slint 不允许同时指定 width 和 min-width（会报
+    // "Cannot specify both 'width' and 'min-width'"）。这里只给初始尺寸，
+    // 最小尺寸由内容的首选尺寸自然兜底。
+    width: 1180px;
+    height: 780px;
+    background: Theme.bg;
+
+    // ── 界面 ↔ 后台的契约（第 2 阶段由真实控制核心填充，现在喂假数据）──
+    in property <int> view: 0;                       // 0 控制台 1 电量 2 诊断 3 属性 4 设置
+    in property <string> device-name: "巨省电 大2匹";
+    in property <string> transport-text: "局域网直连";
+    in property <int> transport-state: 1;            // 0 未连接 1 正常 2 警告 3 错误
+    in property <string> updated-at: "刚刚更新";
+    in property <string> power-text: "运行中";
+    in property <bool> power-on: true;
+    in property <float> target-temp: 26.0;
+    in property <float> preset-a: 27.5;
+    in property <float> preset-b: 27.0;
+    in property <float> preset-c: 26.5;
+    in property <string> room-temp: "28.4";
+    in property <string> sensor-temp: "26.8";
+    in property <string> sensor-hum: "58";
+    in property <string> energy-total: "412.6";
+    in property <string> battery-text: "电量 92%";
+    in property <string> clock: "--:--";
+    in property <bool> auto-refresh: true;
+    in property <int> mode: 2;                       // 2 制冷 3 除湿 4 送风 5 制热
+    in property <int> fan: 0;                        // 0 自动 1-7 档 8 Max
+    in property <int> wind: 0;
+    in property <int> vpos: 0;
+    in property <int> hpos: 0;
+    in property <bool> vswing: false;
+    in property <bool> hswing: false;
+    in property <bool> eco: false;
+    in property <bool> sleep: false;
+    in property <bool> heater: false;
+    in property <bool> dryer: false;
+    in property <bool> favorite: false;
+    in property <bool> wind-on: false;
+    in property <bool> light-on: true;
+    in property <bool> buzzer-on: true;
+    in property <int> bright: 0;
+    in property <int> effect-cool: 3;
+    in property <int> effect-heat: 3;
+    in property <int> pview: 0;                      // 0 日 1 月
+
+    // 明暗主题开关（Rust 侧唯一真相）
+    in property <bool> dark-theme: true;
+    // theme.slint 的 Theme 是纯 global（没有 Window 上下文），
+    // Rust 侧拿不到 Theme::get(&ui)，所以在这里把两者绑起来：
+    // Rust 只设 dark-theme，所有颜色由 theme.slint 自己选。
+    init => { Theme.dark = root.dark-theme; }
+    changed dark-theme => { Theme.dark = root.dark-theme; }
+    // 属性选择器可选的属性名（由 Rust 侧从 miot 属性表灌入）
+    in property <[string]> prop-name-list: [];
+
+    // ── 连接与提示 ────────────────────────────────────────────
+    /// 是否已就绪（能读设备状态）。false 时界面显示「未连接」并禁用写操作。
+    in property <bool> connected: false;
+    /// 未就绪的原因（通常是「还没登录」）
+    in property <string> not-ready-reason: "";
+    /// 是否正在执行一次读取（用于刷新按钮显示忙碌）
+    in property <bool> busy: false;
+    /// 右下角提示（最多 3 条）
+    in property <[ToastItem]> toasts: [];
+    /// 迁移摘要（设置页展示「从旧版继承了什么」）
+    in property <string> migration-summary: "";
+    /// 凭据目录（设置页展示）
+    in property <string> credentials-dir: "";
+    /// 是否已启用 DPAPI 加密存储
+    in property <bool> credentials-encrypted: false;
+    /// 工具提示/悬停提示用的最后错误
+    in property <string> last-error: "";
+    callback dismiss-toast(int);
+    callback encrypt-credentials();
+
+    // ── 扫码登录（第 3 阶段）──────────────────────────────────
+    /// 0 未开始 / 1 申请中 / 2 二维码就绪 / 3 选设备 / 4 出错
+    in property <int> login-state: 0;
+    in property <bool> login-open: false;
+    in property <image> login-qr: @image-url("");
+    in property <string> login-status: "";
+    in property <string> login-error: "";
+    in property <int> login-seconds: 0;
+    in property <[LoginDevice]> login-devices: [];
+    in property <int> login-selected: 0;
+    callback login-start();
+    callback login-cancel();
+    callback login-pick(int);
+    callback login-confirm();
+
+    // 设置的通信通道：0 自动 1 局域网 2 云端
+    in property <int> transport-mode: 0;
+    in property <string> device-info-text: "读取中…";
+    in property <string> log-text: "—";
+    in property <string> about-text: "";
+    in property <string> raw-addr: "—";
+    in property <string> raw-prop-names: "";
+    in-out property <string> raw-value: "";
+    in property <string> raw-out: "—";
+    in property <int> selected-prop: 0;
+    in property <[string]> all-props: [];
+    in property <string> fault-badge: "—";
+    in property <string> fault-text: "读取中…";
+    in property <bool> fault-clear: true;
+    in property <[string]> diag-labels: [];
+    in property <[string]> diag-values: [];
+    in property <string> clean-text: "—";
+    in property <string> examine-text: "—";
+    in property <string> run-text: "—";
+    in property <[float]> day-energy: [];
+    in property <[float]> month-energy: [];
+    in property <string> p-today: "--";
+    in property <string> p-month: "--";
+    in property <string> p-year: "--";
+    in property <string> p-today-h: "--";
+    in property <string> p-month-h: "--";
+    in property <string> cal-title: "电量使用";
+    in property <[int]> cal-energy-milli: [];        // 日历每格电量（×1000，避免用 float 模型）
+    in property <int> cal-max-milli: 1;              // 当月峰值，用于色块深浅归一化
+    in property <int> cal-first-weekday: 0;
+    in property <int> cal-days: 31;
+    in property <int> cal-today: 1;
+
+    // ── 界面 → 后台 ──
+    callback nav-to(int);
+    callback set-target-temp(float);
+    callback toggle-power();
+    callback toggle-auto-refresh(bool);
+    callback refresh();
+    callback toggle-theme();
+    callback set-mode(int);
+    callback set-fan(int);
+    callback set-wind(int);
+    callback set-vpos(int);
+    callback set-hpos(int);
+    callback set-toggle(string, bool);
+    callback set-preset(float);
+    callback set-transport(int);
+    callback set-pview(int);
+    callback set-bright(int);
+    callback set-effect(string, int);
+    callback raw-read();
+    callback raw-write();
+    callback select-prop(int);
+    callback clear-log();
+
+    // ── 侧边栏 ──────────────────────────────────────────────
+    // 必须显式给 height：Window 的子元素默认按布局分配高度，只写 width 时
+    // 这个 Rectangle 的首选高度是 0，会被压成一条零高度的线（表现就是
+    // 「侧边栏完全没画出来」）。这里明确撑满窗口高度。
+    sidebar := Rectangle {
+        x: 0;
+        width: Theme.sidebar-w;
+        height: parent.height;
+        background: Theme.sidebar;
+        Rectangle {   // 右侧 1px 分隔线
+            width: 1px; x: parent.width - 1px; height: parent.height;
+            background: Theme.line-soft;
+        }
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 18px;
+
+            // 品牌区
+            HorizontalLayout {
+                height: 32px;
+                spacing: 11px;
+                Rectangle {
+                    width: 32px; height: 32px;
+                    border-radius: 9px;
+                    background: Theme.brand-mark;
+                    // 雪花标记（对应 .brand-mark::before/after 的交叉细线）。
+                    // 原版用 CSS transform: rotate 画两条斜线；Slint 1.18 的 Rectangle
+                    // 没有任何旋转属性（transform-rotation-* / rotate-* 都不存在），
+                    // 实测 Path 元素可用，但两条直线用正/横矩形拼更省事，
+                    // 视觉上同样是「对称的十字雪花」。
+                    Rectangle {
+                        x: 8px; y: 16px; width: 18px; height: 2px; border-radius: 1px;
+                        background: rgba(255,255,255,0.92);
+                    }
+                    Rectangle {
+                        x: 16px; y: 8px; width: 2px; height: 18px; border-radius: 1px;
+                        background: rgba(255,255,255,0.7);
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                        Text { text: "米家空调"; color: Theme.text; font-size: 14px; font-weight: 600; }
+                    Text {
+                        text: root.device-name;
+                        color: Theme.text-mute;
+                        font-size: 11.5px;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            // 导航
+            VerticalLayout {
+                spacing: 4px;
+                NavItem { icon: "✦"; label: "控制台";    active: root.view == 0; clicked => { root.nav-to(0); } }
+                NavItem { icon: "↯"; label: "电量统计";  active: root.view == 1; clicked => { root.nav-to(1); } }
+                NavItem { icon: "⌁"; label: "运行诊断";  active: root.view == 2; clicked => { root.nav-to(2); } }
+                NavItem { icon: "◇"; label: "高级 / 属性"; active: root.view == 3; clicked => { root.nav-to(3); } }
+                NavItem { icon: "⚙"; label: "设置";      active: root.view == 4; clicked => { root.nav-to(4); } }
+            }
+
+            // 弹性空白，把页脚推到底部
+            Rectangle { vertical-stretch: 1; }
+
+            // 页脚：主题切换 / 通道 / 更新时间
+            VerticalLayout {
+                spacing: 6px;
+                Rectangle {
+                    height: 32px;
+                    border-radius: Theme.radius-sm;
+                    background: theme-touch.has-hover ? Theme.panel : transparent;
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        spacing: 7px;
+                        Text { text: Theme.dark ? "☀" : "☾"; color: Theme.text-dim; font-size: Theme.font-md; }
+                        Text {
+                            text: Theme.dark ? "切换浅色" : "切换深色";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                    }
+                    theme-touch := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.toggle-theme(); }
+                    }
+                }
+                HorizontalLayout {
+                    height: 18px;
+                    spacing: 7px;
+                    Rectangle {
+                        width: 8px; height: 8px; border-radius: 4px;
+                        background: root.transport-state == 1 ? Theme.green
+                                  : root.transport-state == 2 ? Theme.amber
+                                  : root.transport-state == 3 ? Theme.red
+                                  : Theme.text-mute;
+                    }
+                    Text { text: root.transport-text; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+                }
+                Text {
+                    text: root.updated-at;
+                    color: Theme.text-mute;
+                    font-size: Theme.font-xs;
+                }
+            }
+        }
+    }
+
+    // ── 主区域 ──────────────────────────────────────────────
+    Rectangle {
+        x: Theme.sidebar-w;
+        width: parent.width - Theme.sidebar-w;
+        height: parent.height;
+        background: transparent;
+
+        VerticalLayout {
+            // 顶栏
+            Rectangle {
+                height: Theme.topbar-h;
+                background: transparent;
+                Rectangle { width: parent.width; height: 1px; y: parent.height - 1px; background: Theme.line-soft; }
+
+                HorizontalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                spacing: 12px;
+                Text {
+                        text: root.view == 0 ? "控制台"
+                            : root.view == 1 ? "电量统计"
+                            : root.view == 2 ? "运行诊断"
+                            : root.view == 3 ? "高级 / 属性" : "设置";
+                        color: Theme.text;
+                        font-size: 19px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        width: 58px; height: 24px;
+                        border-radius: 12px;
+                        background: transparent;
+                        Text {
+                            text: root.clock;
+                            color: Theme.text-dim;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+
+                    // 自动更新
+                    Rectangle {
+                        width: auto-touch.has-hover ? 108px : 100px;
+                        height: 30px;
+                        border-radius: Theme.radius-sm;
+                        background: auto-touch.has-hover ? Theme.panel-hi : transparent;
+                        Rectangle {
+                            x: 8px;
+                            y: (parent.height - 15px) / 2;
+                            width: 15px;
+                            height: 15px;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: root.auto-refresh ? Theme.accent : Theme.line;
+                            background: root.auto-refresh ? Theme.accent : transparent;
+                            Text {
+                                x: 0px;
+                                y: 0px;
+                                width: parent.width;
+                                height: parent.height;
+                                text: "✓";
+                                color: Theme.on-accent;
+                                font-size: 10px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                visible: root.auto-refresh;
+                            }
+                        }
+                        Text {
+                            x: 30px;
+                            y: 0px;
+                            width: parent.width - 34px;
+                            height: parent.height;
+                            text: "自动更新";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-sm;
+                            vertical-alignment: center;
+                        }
+                        auto-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.toggle-auto-refresh(!root.auto-refresh); }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 84px; height: 30px;
+                        border-radius: Theme.radius-sm;
+                        background: refresh-touch.has-hover ? Theme.panel-hi : Theme.panel;
+                        border-width: 1px;
+                        border-color: Theme.line;
+                        Text {
+                            text: "刷新状态";
+                            color: Theme.text-dim;
+                            font-size: Theme.font-sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        refresh-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.refresh(); }
+                        }
+                    }
+                }
+            }
+
+            // 内容区（滚动的页面容器）
+            Rectangle {
+                vertical-stretch: 1;
+                background: transparent;
+                clip: true;
+
+                flick := Flickable {
+                    width: parent.width;
+                    height: parent.height;
+                    content-width: self.width;
+                    content-height: max(self.height, content.preferred-height + 2 * Theme.pad);
+                    interactive: true;
+
+                    content := VerticalLayout {
+                        x: 0;
+                        y: 0;
+                        width: flick.width;
+                        padding: Theme.pad;
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        spacing: Theme.gap;
+
+                        // 五个页面按需实例化：只有当前页在内存里
+                        if root.view == 0 : ControlPage {
+                            target-temp: root.target-temp;
+                            power-on: root.power-on;
+                            power-text: root.power-text;
+                            room-temp: root.room-temp;
+                            sensor-temp: root.sensor-temp;
+                            sensor-hum: root.sensor-hum;
+                            energy-total: root.energy-total;
+                            battery-text: root.battery-text;
+                            mode: root.mode;
+                            fan: root.fan;
+                            wind: root.wind;
+                            vpos: root.vpos;
+                            hpos: root.hpos;
+                            vswing: root.vswing;
+                            hswing: root.hswing;
+                            eco: root.eco;
+                            sleep: root.sleep;
+                            heater: root.heater;
+                            dryer: root.dryer;
+                            favorite: root.favorite;
+                            wind-on: root.wind-on;
+                            preset-a: root.preset-a;
+                            preset-b: root.preset-b;
+                            preset-c: root.preset-c;
+                            set-target-temp(t) => { root.set-target-temp(t); }
+                            toggle-power() => { root.toggle-power(); }
+                            set-mode(m) => { root.set-mode(m); }
+                            set-fan(f) => { root.set-fan(f); }
+                            set-wind(w) => { root.set-wind(w); }
+                            set-vpos(p) => { root.set-vpos(p); }
+                            set-hpos(p) => { root.set-hpos(p); }
+                            set-toggle(k, v) => { root.set-toggle(k, v); }
+                            set-preset(t) => { root.set-preset(t); }
+                        }
+                        if root.view == 1 : PowerPage {
+                            p-today: root.p-today;
+                            p-month: root.p-month;
+                            p-year: root.p-year;
+                            p-today-h: root.p-today-h;
+                            p-month-h: root.p-month-h;
+                            pview: root.pview;
+                            cal-title: root.cal-title;
+                            cal-energy-milli: root.cal-energy-milli;
+                            cal-max-milli: root.cal-max-milli;
+                            cal-first-weekday: root.cal-first-weekday;
+                            cal-days: root.cal-days;
+                            cal-today: root.cal-today;
+                            day-energy: root.day-energy;
+                            month-energy: root.month-energy;
+                            set-pview(p) => { root.set-pview(p); }
+                        }
+                        if root.view == 2 : DiagPage {
+                            diag-labels: root.diag-labels;
+                            diag-values: root.diag-values;
+                            sensor-temp: root.sensor-temp;
+                            sensor-hum: root.sensor-hum;
+                            clean-text: root.clean-text;
+                            examine-text: root.examine-text;
+                            run-text: root.run-text;
+                            fault-badge: root.fault-badge;
+                            fault-text: root.fault-text;
+                            fault-clear: root.fault-clear;
+                        }
+                        if root.view == 3 : DebugPage {
+                            raw-addr: root.raw-addr;
+                            raw-prop-names: root.raw-prop-names;
+                            prop-name-list: root.prop-name-list;
+                            raw-value: root.raw-value;
+                            raw-out: root.raw-out;
+                            all-props: root.all-props;
+                            light-on: root.light-on;
+                            buzzer-on: root.buzzer-on;
+                            bright: root.bright;
+                            effect-cool: root.effect-cool;
+                            effect-heat: root.effect-heat;
+                            selected-prop: root.selected-prop;
+                            raw-read() => { root.raw-read(); }
+                            raw-write() => { root.raw-write(); }
+                            select-prop(i) => { root.select-prop(i); }
+                            set-toggle(k, v) => { root.set-toggle(k, v); }
+                            set-bright(b) => { root.set-bright(b); }
+                            set-effect(w, l) => { root.set-effect(w, l); }
+                        }
+                        if root.view == 4 : SettingsPage {
+                            transport-mode: root.transport-mode;
+                            device-info-text: root.device-info-text;
+                            log-text: root.log-text;
+                            about-text: root.about-text;
+                            connected: root.connected;
+                            not-ready-reason: root.not-ready-reason;
+                            migration-summary: root.migration-summary;
+                            credentials-dir: root.credentials-dir;
+                            credentials-encrypted: root.credentials-encrypted;
+                            set-transport(t) => { root.set-transport(t); }
+                            clear-log() => { root.clear-log(); }
+                            encrypt-credentials() => { root.encrypt-credentials(); }
+                        }
+                    }
+                }
+            }
+
+            // ── 未连接遮罩 ────────────────────────────────────
+            // 没有凭据（首次使用 / 换账号）时压在内容区上方，提示去登录。
+            // 不用单独窗口，保持单进程与单窗口。
+            if !root.connected && root.not-ready-reason != "" : Rectangle {
+                background: Theme.overlay;
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 14px;
+                    Rectangle {
+                        width: 380px;
+                        height: content-box.preferred-height + 44px;
+                        border-radius: Theme.radius;
+                        background: Theme.panel;
+                        border-width: 1px;
+                        border-color: Theme.line;
+
+                        content-box := VerticalLayout {
+                            padding: 22px;
+                            spacing: 12px;
+                            alignment: center;
+                            Text {
+                                text: "需要先连接空调设备";
+                                color: Theme.text;
+                                font-size: Theme.font-xl;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: root.not-ready-reason;
+                                color: Theme.text-dim;
+                                font-size: Theme.font-sm;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "点下面的按钮用米家 App 扫码登录；也可以复用旧版（Electron 版）已登录的凭据文件。";
+                                color: Theme.text-mute;
+                                font-size: Theme.font-xs;
+                                horizontal-alignment: center;
+                                wrap: word-wrap;
+                                width: 320px;
+                            }
+                            Rectangle {
+                                height: 38px;
+                                width: 180px;
+                                border-radius: Theme.radius-sm;
+                                background: login-btn.has-hover ? Theme.accent-deep : Theme.accent;
+                                Text {
+                                    text: "扫码登录米家账号";
+                                    color: Theme.on-accent;
+                                    font-size: Theme.font-sm;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                login-btn := TouchArea { mouse-cursor: pointer; clicked => { root.login-start(); } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 扫码登录弹层 ────────────────────────────────────────────
+    // 放在最外层、右下角提示之前：它要盖住整窗，但提示条仍需可见。
+    if root.login-open : LoginModal {
+        state: root.login-state;
+        qr: root.login-qr;
+        status: root.login-status;
+        error: root.login-error;
+        seconds-left: root.login-seconds;
+        devices: root.login-devices;
+        selected: root.login-selected;
+        start() => { root.login-start(); }
+        cancel() => { root.login-cancel(); }
+        retry() => { root.login-start(); }
+        pick(i) => { root.login-pick(i); }
+        confirm() => { root.login-confirm(); }
+    }
+
+    // ── 右下角提示（最多 3 条）──────────────────────────────────
+    // 放在 Window 最外层、所有内容之后，保证覆盖在界面之上。
+    // ToastHost 是布局组件（不能直接给 x/y），所以外面套一个定尺容器，
+    // 让布局在容器内从右下角向上堆叠。
+    Rectangle {
+        x: parent.width - 442px;
+        y: parent.height - 20px - self.height;
+        width: 420px;
+        // 3 条 × 44px + 2 个 8px 间距 = 148px；按实际条数收缩
+        height: root.toasts.length == 0 ? 0px
+              : (root.toasts.length * 44px + (root.toasts.length - 1) * 8px);
+        background: transparent;
+        clip: false;
+
+        ToastHost {
+            width: parent.width;
+            height: parent.height;
+            items: root.toasts;
+            dismiss(i) => { root.dismiss-toast(i); }
+        }
+    }
+}

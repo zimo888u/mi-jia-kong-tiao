@@ -1,0 +1,244 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/common.slint —— 页面共用的小组件
+//
+// 对应 style.css 里的 .card / .seg / .toggle / .btn / .kv / .hint 等类，
+// 抽出来避免五个页面各写一遍。
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "theme.slint";
+
+// ── 卡片 ────────────────────────────────────────────────────────
+export component Card inherits Rectangle {
+    in property <string> title: "";
+    in property <string> hint: "";
+    // 卡片头部右侧的自定义内容放这里（比如「清空」按钮、日/月切换）
+
+    background: Theme.panel;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.line-soft;
+    // 标题行和内容行使用明确的内边距，避免卡片高度变化时选项整体漂移。
+    height: content.preferred-height + 2 * 16px + (title == "" ? 0px : 30px);
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        if root.title != "" : HorizontalLayout {
+            height: 22px;
+            spacing: 8px;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Theme.font-lg;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.hint;
+                color: Theme.text-mute;
+                font-size: Theme.font-xs;
+                vertical-alignment: center;
+                visible: root.hint != "";
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        content := VerticalLayout {
+            spacing: 8px;
+            @children
+        }
+    }
+}
+
+// ── 分段选择按钮 ─────────────────────────────────────────────────
+export component SegButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> accent: false;      // 「Max」「防直吹」这类强调项
+    in property <length> min-w: 46px;
+    callback clicked;
+
+    height: 34px;
+    // 选项宽度由调用方显式决定，保证同一组按钮边缘严格对齐。
+    // 文本本身铺满按钮盒子，不再用 preferred-width 反推外框。
+    width: min-w;
+    border-radius: Theme.radius-sm;
+    background: active ? (accent ? Theme.accent : Theme.accent)
+                       : (seg-touch.has-hover ? Theme.panel-hi : Theme.bg-soft);
+    border-width: 1px;
+    border-color: active ? Theme.accent : (accent ? Theme.accent-deep : Theme.line);
+    opacity: !active && accent ? 0.92 : 1.0;
+
+    // 显式铺满按钮盒子；只设置 horizontal-alignment 会让不同字宽的中文
+    // 文本按自己的 preferred-width 绘制，正是之前“选项偏移”的来源。
+    label-text := Text {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: root.active ? Theme.on-accent : (root.accent ? Theme.accent : Theme.text-dim);
+        font-size: Theme.font-sm;
+        font-weight: root.active ? 600 : 400;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    seg-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 开关行（.toggle）─────────────────────────────────────────────
+export component ToggleRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> on: false;
+    callback toggled(bool);
+
+    height: 38px;
+    border-radius: Theme.radius-sm;
+    background: row-touch.has-hover ? Theme.panel-hi : Theme.bg-soft;
+    border-width: 1px;
+    border-color: Theme.line-soft;
+
+    HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        padding-left: 11px;
+        padding-right: 11px;
+        spacing: 8px;
+        Text {
+            horizontal-stretch: 1;
+            height: root.height;
+            text: root.label;
+            color: root.on ? Theme.text : Theme.text-dim;
+            font-size: Theme.font-md;
+            vertical-alignment: center;
+        }
+        // 仿 iOS 的滑动开关
+        VerticalLayout {
+            width: 38px;
+            height: root.height;
+            alignment: center;
+            Rectangle {
+                width: 38px;
+                height: 21px;
+                border-radius: 11px;
+                background: root.on ? Theme.accent : Theme.line;
+                animate background { duration: 140ms; }
+                Rectangle {
+                    width: 15px; height: 15px;
+                    y: 3px;
+                    x: root.on ? parent.width - 18px : 3px;
+                    border-radius: 8px;
+                    background: root.on ? Theme.on-accent : Theme.text-mute;
+                    animate x { duration: 140ms; easing: ease-in-out; }
+                }
+            }
+        }
+    }
+
+    row-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.toggled(!root.on); }
+    }
+}
+
+// ── 键值行（.kv-row）────────────────────────────────────────────
+export component KvRow inherits Rectangle {
+    in property <string> key: "";
+    in property <string> value: "--";
+    in property <color> value-color: Theme.text;
+
+    height: 26px;
+    background: transparent;
+    HorizontalLayout {
+        spacing: 8px;
+        Text { text: root.key; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+        Rectangle { horizontal-stretch: 1; }
+        Text {
+            text: root.value;
+            color: root.value-color;
+            font-size: Theme.font-sm;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── 小按钮（.btn）──────────────────────────────────────────────
+export component FlatButton inherits Rectangle {
+    in property <string> label;
+    in property <length> min-w: 72px;
+    in property <bool> danger: false;
+    in property <bool> ghost: false;
+    callback clicked;
+
+    height: 30px;
+    // 和 SegButton 一样，按钮外框不再由文本 preferred-width 反推，
+    // 避免文本铺满按钮后形成布局回路。
+    width: min-w;
+    border-radius: Theme.radius-sm;
+    background: danger
+        ? (btn-touch.has-hover ? Theme.red : transparent)
+        : (btn-touch.has-hover ? Theme.panel-hi : (ghost ? transparent : Theme.panel));
+    border-width: ghost ? 0px : 1px;
+    border-color: danger ? Theme.red : Theme.line;
+
+    btn-text := Text {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: root.danger ? (btn-touch.has-hover ? Theme.bg : Theme.red) : Theme.text-dim;
+        font-size: Theme.font-sm;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    btn-touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 指标块（.metric / .stat）───────────────────────────────────
+export component Metric inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <string> unit;
+    in property <string> sub: "";
+    in property <color> value-color: Theme.text;
+
+    background: transparent;
+    height: 62px;
+    VerticalLayout {
+        spacing: 2px;
+        alignment: center;
+        Text { text: root.label; color: Theme.text-mute; font-size: Theme.font-xs; }
+        HorizontalLayout {
+            spacing: 2px;
+            alignment: center;
+            Text {
+                text: root.value;
+                color: root.value-color;
+                font-size: Theme.font-xl;
+                font-weight: 600;
+                vertical-alignment: bottom;
+            }
+            Text {
+                text: root.unit;
+                color: Theme.text-mute;
+                font-size: Theme.font-sm;
+                vertical-alignment: bottom;
+                visible: root.unit != "";
+            }
+        }
+        Text { text: root.sub; color: Theme.text-mute; font-size: Theme.font-xs; visible: root.sub != ""; }
+    }
+}

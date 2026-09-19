@@ -1,0 +1,57 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/dial-math.slint —— 表盘几何计算（纯函数，便于复核与测试）
+//
+// 抽出来的原因：Slint 的类型系统区分 length / angle / 纯数值，混用会编译报错
+// （Cannot convert length to float / float to angle …）。把单位换算集中在这里，
+// 避免在每个使用点重复「除以 1px」「乘以 1deg」这种噪音。
+//
+// 表盘布局：温度区间 16~31 ℃ 映射到 270° 圆弧。
+// 角度约定与屏幕坐标一致（y 轴向下），0° 指向右侧：
+//   -135° → 左下（最小值 16 ℃）
+//      0° → 正右（区间中点）
+//   +135° → 右下（最大值 31 ℃）
+// 正下方留 90° 缺口，与空调遥控器「留白放档位」的惯例一致。
+// ─────────────────────────────────────────────────────────────────────────────
+
+export global DialMath {
+    /// 把温度换算成 0.0~1.0 的比例（纯数值，不带单位）。
+    public pure function ratio(value: float, min-value: float, max-value: float) -> float {
+        if max-value <= min-value {
+            return 0.0;
+        }
+        return Math.max(0.0, Math.min(1.0, (value - min-value) / (max-value - min-value)));
+    }
+
+    /// 第 index 格刻度对应的角度（度）。count 为总格数。
+    public pure function tick-angle(index: int, count: int) -> float {
+        if count <= 1 {
+            return -135.0;
+        }
+        return -135.0 + index * (270.0 / (count - 1));
+    }
+
+    /// 角度（度）→ 弧度（纯数值，仅用于需要弧度的场合）。
+    public pure function to-radians(degrees: float) -> float {
+        return degrees * 3.14159265358979 / 180.0;
+    }
+
+    /// 圆周上一点相对圆心的横坐标（纯数值，单位由调用方决定）。
+    ///
+    /// ⚠ 关键点：Slint 的 `Math.cos` / `Math.sin` 接受的是**角度类型**，
+    /// 也就是「度数 × 1deg」。实测（见 v2-rust/probe）：
+    ///   - `Math.cos(60 * 1deg)` = 0.5         ✅ 正确
+    ///   - `Math.cos(1.0472)`                  ❌ 编译报
+    ///                                            Cannot convert float to angle
+    ///   - `Math.cos(60 * 0.017453 * 1deg)`    ❌ 半径塌缩（把度又当弧度缩了一次，
+    ///                                            角度变成原来的 1/57，cos≈1）
+    /// 早先按「Math.cos 吃弧度」写，导致表盘刻度全部挤在右侧一点上，
+    /// 所以这里只做「度 × 1deg」，不再自己换算弧度。
+    public pure function point-x(degrees: float, radius-px: float) -> float {
+        return radius-px * Math.cos(degrees * 1deg);
+    }
+
+    /// 圆周上一点相对圆心的纵坐标（纯数值）。
+    public pure function point-y(degrees: float, radius-px: float) -> float {
+        return radius-px * Math.sin(degrees * 1deg);
+    }
+}

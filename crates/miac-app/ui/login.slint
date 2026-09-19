@@ -1,0 +1,250 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// ui/login.slint —— 小米账号扫码登录弹层
+//
+// 对应 v1 的 #login 覆盖层：用米家 App 扫码 → 手机确认 → 选设备 → 写凭据。
+//
+// 五个状态由 `state` 驱动：
+//   0 idle     还没开始（显示「开始扫码登录」按钮）
+//   1 loading  正在向小米申请二维码
+//   2 qr       二维码已就绪，等手机确认（显示二维码图片与倒计时）
+//   3 devices  已确认，列出账号下的设备让用户选
+//   4 error    出错了，显示原因并可重试
+// ─────────────────────────────────────────────────────────────────────────────
+
+import { Theme } from "theme.slint";
+
+/// 设备列表里的一项。
+export struct LoginDevice {
+    name: string,
+    model: string,
+    did: string,
+    detail: string,
+}
+
+export component LoginModal inherits Rectangle {
+    in property <int> state: 0;
+    in property <image> qr: @image-url("");
+    in property <string> status: "";
+    in property <string> error: "";
+    in property <int> seconds-left: 0;
+    in property <[LoginDevice]> devices: [];
+    in property <int> selected: 0;
+
+    callback start();
+    callback cancel();
+    callback retry();
+    callback pick(int);
+    callback confirm();
+
+    background: Theme.overlay;
+
+    // 居中卡片
+    Rectangle {
+        width: 420px;
+        height: min(parent.height - 60px, card.preferred-height + 48px);
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.radius;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.line;
+
+        card := VerticalLayout {
+            padding: 24px;
+            spacing: 14px;
+
+            Text {
+                text: "登录米家账号";
+                color: Theme.text;
+                font-size: Theme.font-xl;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+
+            // ── 状态 0：还没开始 ──
+            if root.state == 0 : VerticalLayout {
+                spacing: 12px;
+                Text {
+                    text: "用已登录这台空调的米家 App 扫码，在手机上确认即可，无需输入密码。";
+                    color: Theme.text-dim;
+                    font-size: Theme.font-sm;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 40px;
+                    border-radius: Theme.radius-sm;
+                    background: start-touch.has-hover ? Theme.accent-deep : Theme.accent;
+                    Text {
+                        text: "开始扫码登录";
+                        color: Theme.on-accent;
+                        font-size: Theme.font-md;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    start-touch := TouchArea { mouse-cursor: pointer; clicked => { root.start(); } }
+                }
+            }
+
+            // ── 状态 1：申请中 ──
+            if root.state == 1 : VerticalLayout {
+                spacing: 10px;
+                height: 120px;
+                alignment: center;
+                Text {
+                    text: "正在向小米申请二维码…";
+                    color: Theme.text-dim;
+                    font-size: Theme.font-md;
+                    horizontal-alignment: center;
+                }
+            }
+
+            // ── 状态 2：二维码 ──
+            if root.state == 2 : VerticalLayout {
+                spacing: 10px;
+                Rectangle {
+                    // 二维码是深色图案，底色必须给白色，否则深色主题下扫不出来
+                    background: #ffffff;
+                    border-radius: 12px;
+                    width: 260px;
+                    height: 260px;
+                    Image {
+                        source: root.qr;
+                        width: parent.width - 20px;
+                        height: parent.height - 20px;
+                        x: 10px;
+                        y: 10px;
+                        image-fit: contain;
+                    }
+                }
+                Text {
+                    text: "打开米家 App 的「扫一扫」，扫描上方二维码";
+                    color: Theme.text-dim;
+                    font-size: Theme.font-sm;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.seconds-left > 0
+                        ? "二维码 " + root.seconds-left + " 秒后过期"
+                        : "二维码已过期";
+                    color: root.seconds-left > 30 ? Theme.text-mute : Theme.amber;
+                    font-size: Theme.font-xs;
+                    horizontal-alignment: center;
+                }
+            }
+
+            // ── 状态 3：选设备 ──
+            if root.state == 3 : VerticalLayout {
+                spacing: 8px;
+                Text {
+                    text: "扫码成功，请选择要控制的空调：";
+                    color: Theme.text-dim;
+                    font-size: Theme.font-sm;
+                }
+                for i in 8 : Rectangle {
+                    visible: i < root.devices.length;
+                    height: 44px;
+                    border-radius: Theme.radius-sm;
+                    background: root.selected == i ? Theme.nav-active : Theme.bg-soft;
+                    border-width: 1px;
+                    border-color: root.selected == i ? Theme.accent : Theme.line-soft;
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: i < root.devices.length ? root.devices[i].name : "";
+                            color: Theme.text;
+                            font-size: Theme.font-md;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: i < root.devices.length ? root.devices[i].detail : "";
+                            color: Theme.text-mute;
+                            font-size: Theme.font-xs;
+                            vertical-alignment: center;
+                        }
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.pick(i); } }
+                }
+            }
+
+            // ── 状态 4：错误 ──
+            if root.state == 4 : VerticalLayout {
+                spacing: 10px;
+                Text {
+                    text: root.error;
+                    color: Theme.red;
+                    font-size: Theme.font-sm;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+
+            // 状态提示（非错误）
+            if root.status != "" : Text {
+                text: root.status;
+                color: Theme.text-mute;
+                font-size: Theme.font-xs;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            // ── 底部按钮 ──
+            HorizontalLayout {
+                spacing: 10px;
+                Rectangle { horizontal-stretch: 1; }
+                if root.state != 3 : Rectangle {
+                    width: 96px;
+                    height: 34px;
+                    border-radius: Theme.radius-sm;
+                    background: cancel-touch.has-hover ? Theme.panel-hi : transparent;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    Text {
+                        text: "稍后再说";
+                        color: Theme.text-dim;
+                        font-size: Theme.font-sm;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    cancel-touch := TouchArea { mouse-cursor: pointer; clicked => { root.cancel(); } }
+                }
+                if root.state == 2 || root.state == 4 : Rectangle {
+                    width: 110px;
+                    height: 34px;
+                    border-radius: Theme.radius-sm;
+                    background: retry-touch.has-hover ? Theme.panel-hi : Theme.panel;
+                    border-width: 1px;
+                    border-color: Theme.line;
+                    Text {
+                        text: "重新生成二维码";
+                        color: Theme.text-dim;
+                        font-size: Theme.font-sm;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    retry-touch := TouchArea { mouse-cursor: pointer; clicked => { root.retry(); } }
+                }
+                if root.state == 3 : Rectangle {
+                    width: 110px;
+                    height: 34px;
+                    border-radius: Theme.radius-sm;
+                    background: confirm-touch.has-hover ? Theme.accent-deep : Theme.accent;
+                    Text {
+                        text: "用这个设备";
+                        color: Theme.on-accent;
+                        font-size: Theme.font-sm;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    confirm-touch := TouchArea { mouse-cursor: pointer; clicked => { root.confirm(); } }
+                }
+            }
+        }
+    }
+}
