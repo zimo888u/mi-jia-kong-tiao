@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 米家空调 v2 —— Rust + Slint 原生版
+#
+# 工作区成员：
+#   crates/miac-core   控制核心（纯逻辑，无界面）：miIO 局域网、云端 RPC、属性映射
+#   crates/miac-app    图形界面（Slint，单进程，无 Electron/Chromium/Node）
+#
+# 内存目标是硬指标（稳定 25–45 MB，上限 50 MB），因此：
+#   - 只启用 Slint 的 software 渲染后端（不含 skia / femtovg / wgpu），
+#     避免把 GPU 驱动和交换链算进工作集
+#   - release 打开 LTO + 体积优化，减少常驻代码页
+#   - 页面按需实例化（见 ui/main.slint 的 Content 分派），不同时构造五个页面
+# ─────────────────────────────────────────────────────────────────────────────
+
+[workspace]
+resolver = "2"
+members = ["crates/miac-core", "crates/miac-app", "crates/miac-cli"]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2021"
+rust-version = "1.92"
+authors = ["米家空调项目"]
+license = "MIT"
+
+[workspace.dependencies]
+# default-features = false：默认会带上 winit + femtovg + wgpu + skia 全套后端，
+# 工作集里会多出 GL/D3D 驱动与交换链内存。这里只按需挑后端（见 miac-app）。
+slint = { version = "1.13", default-features = false }
+
+[profile.release]
+opt-level = "z"        # 体积优先，降低常驻代码页
+lto = true             # 跨 crate 内联 + 剔除死代码
+codegen-units = 1
+# 工作线程和登录线程使用 catch_unwind 将异常转成可见错误；发布版必须保留 unwind，
+# 否则 panic=abort 会直接结束整个程序。
+panic = "unwind"
+incremental = false
+
+[profile.dev]
+opt-level = 1          # 调试构建也保证界面不卡
