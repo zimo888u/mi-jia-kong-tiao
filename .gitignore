@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Packaged binaries are generated locally, not source
+/dist/*.exe
+/dist/*.pdb
+/dist/*.ico
+
+# Local Xiaomi credentials and device data
+device.json
+cloud-session.json
+thermometer.json
+credentials.json
+*.token
+*.secret
+
+# Local logs, caches, and editor files
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
