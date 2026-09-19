@@ -510,65 +510,66 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+        }
 
-            // ── 未连接遮罩 ────────────────────────────────────
-            // 没有凭据（首次使用 / 换账号）时压在内容区上方，提示去登录。
-            // 不用单独窗口，保持单进程与单窗口。
-            if !root.connected && root.not-ready-reason != "" : Rectangle {
-                background: Theme.overlay;
-                VerticalLayout {
+        // ── 未连接遮罩 ────────────────────────────────────
+        // 没有凭据（首次使用 / 换账号）时压在内容区上方，提示去登录。
+        // 遮罩必须脱离主 VerticalLayout，否则会被排到页面最下面。
+        if !root.connected && root.not-ready-reason != "" : Rectangle {
+            y: Theme.topbar-h;
+            width: parent.width;
+            height: parent.height - Theme.topbar-h;
+            background: Theme.overlay;
+            Rectangle {
+                width: min(380px, parent.width - 48px);
+                height: min(parent.height - 48px, content-box.preferred-height + 44px);
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                border-radius: Theme.radius;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: Theme.line;
+
+                content-box := VerticalLayout {
+                    padding: 22px;
+                    spacing: 12px;
                     alignment: center;
-                    spacing: 14px;
+                    Text {
+                        text: "需要先连接空调设备";
+                        color: Theme.text;
+                        font-size: Theme.font-xl;
+                        font-weight: 600;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        text: root.not-ready-reason;
+                        color: Theme.text-dim;
+                        font-size: Theme.font-sm;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: "点下面的按钮用米家 App 扫码登录；也可以复用旧版（Electron 版）已登录的凭据文件。";
+                        color: Theme.text-mute;
+                        font-size: Theme.font-xs;
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                        width: min(320px, parent.width);
+                    }
                     Rectangle {
-                        width: 380px;
-                        height: content-box.preferred-height + 44px;
-                        border-radius: Theme.radius;
-                        background: Theme.panel;
-                        border-width: 1px;
-                        border-color: Theme.line;
-
-                        content-box := VerticalLayout {
-                            padding: 22px;
-                            spacing: 12px;
-                            alignment: center;
-                            Text {
-                                text: "需要先连接空调设备";
-                                color: Theme.text;
-                                font-size: Theme.font-xl;
-                                font-weight: 600;
-                                horizontal-alignment: center;
-                            }
-                            Text {
-                                text: root.not-ready-reason;
-                                color: Theme.text-dim;
-                                font-size: Theme.font-sm;
-                                horizontal-alignment: center;
-                                wrap: word-wrap;
-                            }
-                            Text {
-                                text: "点下面的按钮用米家 App 扫码登录；也可以复用旧版（Electron 版）已登录的凭据文件。";
-                                color: Theme.text-mute;
-                                font-size: Theme.font-xs;
-                                horizontal-alignment: center;
-                                wrap: word-wrap;
-                                width: 320px;
-                            }
-                            Rectangle {
-                                height: 38px;
-                                width: 180px;
-                                border-radius: Theme.radius-sm;
-                                background: login-btn.has-hover ? Theme.accent-deep : Theme.accent;
-                                Text {
-                                    text: "扫码登录米家账号";
-                                    color: Theme.on-accent;
-                                    font-size: Theme.font-sm;
-                                    font-weight: 600;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
-                                }
-                                login-btn := TouchArea { mouse-cursor: pointer; clicked => { root.login-start(); } }
-                            }
+                        height: 38px;
+                        width: 180px;
+                        border-radius: Theme.radius-sm;
+                        background: login-btn.has-hover ? Theme.accent-deep : Theme.accent;
+                        Text {
+                            text: "扫码登录米家账号";
+                            color: Theme.on-accent;
+                            font-size: Theme.font-sm;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
                         }
+                        login-btn := TouchArea { mouse-cursor: pointer; clicked => { root.login-start(); } }
                     }
                 }
             }

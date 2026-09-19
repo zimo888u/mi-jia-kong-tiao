@@ -221,6 +221,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .write_header()?
             .write_image_data(pixels.as_bytes())?;
     }
+
+    // Keep the disconnected-device prompt fully visible at the shortest supported height.
+    // This guards against layout containers stretching the card through the bottom edge.
+    ui.set_connected(false);
+    ui.set_not_ready_reason("还没有设备信息，请先登录米家账号完成设备设置。".into());
+    slint::platform::update_timers_and_animations();
+    window.request_redraw();
+    let mut disconnected = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(1160, 720);
+    assert!(window.draw_if_needed(|renderer| {
+        renderer.render(disconnected.make_mut_slice(), 1160);
+    }));
+    let file = std::fs::File::create(output.join("disconnected.png"))?;
+    let mut encoder = png::Encoder::new(file, 1160, 720);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder
+        .write_header()?
+        .write_image_data(disconnected.as_bytes())?;
+
+    let panel_bottom = disconnected
+        .as_bytes()
+        .chunks_exact(3)
+        .enumerate()
+        .filter_map(|(index, rgb)| {
+            let x = index % 1160;
+            let y = index / 1160;
+            (x >= 220 && rgb == [255, 255, 255]).then_some(y)
+        })
+        .max()
+        .expect("disconnected prompt panel must be rendered");
+    assert!(
+        panel_bottom <= 696,
+        "disconnected prompt must leave a 24px bottom margin, got bottom y={panel_bottom}"
+    );
+    ui.set_connected(true);
+    ui.set_not_ready_reason("".into());
     window.set_size(slint::PhysicalSize::new(1440, 1100));
 
     // Exercise real pointer/key dispatch through the generated Slint tree.

@@ -625,6 +625,7 @@ impl App {
                         Some(img) => {
                             self.login_qr = Some(img);
                             self.login_state = 2;
+                            self.login_status = "等待在米家 App 中确认…".into();
                             self.login_seconds = seconds;
                             self.login_expires =
                                 Some(Instant::now() + Duration::from_secs(seconds));
@@ -1378,6 +1379,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // 那条「通道已就绪」永远到不了界面，界面就一直停在「连接中…」。
     // 这个 bug 的表现是「能连上却不刷新」，极易误判成网络问题。
     let mut pending: Vec<Event> = Vec::new();
+    // 登录事件也必须保留到 App 可变借用成功；扫码成功事件只发送一次，不能丢。
+    let mut pending_login: Vec<login_ui::LoginEvent> = Vec::new();
     let probe_enabled = probe;
     let base_ws = Rc::new(std::cell::Cell::new(
         memory_bytes().map(|(w, _)| w).unwrap_or(0),
@@ -1477,14 +1480,19 @@ fn main() -> Result<(), slint::PlatformError> {
 
         // 5.6) 登录线程事件 + 二维码倒计时
         {
-            let mut levents = Vec::new();
+            let mut levents = std::mem::take(&mut pending_login);
             if let Ok(a) = tick_app.try_borrow() {
                 a.login.drain(&mut levents);
             }
             if !levents.is_empty() {
-                if let Ok(mut a) = tick_app.try_borrow_mut() {
-                    a.handle_login_events(levents, &tick_worker);
-                    a.refresh_view();
+                match tick_app.try_borrow_mut() {
+                    Ok(mut a) => {
+                        a.handle_login_events(levents, &tick_worker);
+                        a.refresh_view();
+                    }
+                    Err(_) => {
+                        pending_login = levents;
+                    }
                 }
             }
             // 每拍更新剩余秒数（弹层里要显示倒计时）

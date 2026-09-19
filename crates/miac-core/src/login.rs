@@ -433,13 +433,10 @@ impl LoginSession {
             };
             let data: Value = parse_xiaomi_json(&text)?;
 
-            let user_id = data.get("userId").and_then(Value::as_i64);
-            let ssecurity = data.get("ssecurity").and_then(Value::as_str);
             let location = data.get("location").and_then(Value::as_str);
 
-            // 三项齐全才算用户确认了
-            let (Some(user_id), Some(ssecurity), Some(location)) = (user_id, ssecurity, location)
-            else {
+            // userId 可能是 JSON 字符串或数字；location 齐全才算用户确认了。
+            let Some(location) = location else {
                 return Err(LoginError::Other(format!(
                     "扫码未完成或已失效（code={}），请重新生成二维码",
                     data.get("code").and_then(Value::as_i64).unwrap_or(0)
@@ -456,14 +453,36 @@ impl LoginSession {
                     LoginError::Other("扫码已确认，但小米未返回米家云令牌".into())
                 })?;
 
-            return Ok(LoginResult {
-                user_id: user_id.to_string(),
-                ssecurity: ssecurity.to_string(),
-                service_token: token,
-            });
+            return login_result_from_payload(&data, &token);
         }
         Err(LoginError::Expired)
     }
+}
+
+fn login_result_from_payload(data: &Value, service_token: &str) -> Result<LoginResult, LoginError> {
+    let user_id = data
+        .get("userId")
+        .and_then(|value| match value {
+            Value::String(value) if !value.is_empty() => Some(value.clone()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        });
+    let ssecurity = data
+        .get("ssecurity")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let (Some(user_id), Some(ssecurity)) = (user_id, ssecurity) else {
+        return Err(LoginError::Parse("扫码结果缺少账号凭据".into()));
+    };
+    if service_token.is_empty() {
+        return Err(LoginError::Parse("扫码结果缺少米家云令牌".into()));
+    }
+
+    Ok(LoginResult {
+        user_id,
+        ssecurity: ssecurity.to_string(),
+        service_token: service_token.to_string(),
+    })
 }
 
 /// 解析小米的 JSON 响应（可能带 `&&&START&&&` 前缀）。
@@ -573,6 +592,33 @@ mod tests {
         assert_eq!(v2.get("code").and_then(Value::as_i64), Some(0));
         // 非 JSON 报错
         assert!(parse_xiaomi_json("<html>nope</html>").is_err());
+    }
+
+    #[test]
+    fn qr_approval_accepts_string_user_id() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "userId": "987654321",
+            "ssecurity": "SSEC==",
+            "location": "https://sts.api.io.mi.com/sts"
+        });
+        let result = login_result_from_payload(&payload, "TOKEN").unwrap();
+        assert_eq!(result.user_id, "987654321");
+        assert_eq!(result.ssecurity, "SSEC==");
+        assert_eq!(result.service_token, "TOKEN");
+
+        let numeric = serde_json::json!({
+            "code": 0,
+            "userId": 987654321,
+            "ssecurity": "SSEC==",
+            "location": "https://sts.api.io.mi.com/sts"
+        });
+        assert_eq!(
+            login_result_from_payload(&numeric, "TOKEN")
+                .unwrap()
+                .user_id,
+            "987654321"
+        );
     }
 
     #[test]
