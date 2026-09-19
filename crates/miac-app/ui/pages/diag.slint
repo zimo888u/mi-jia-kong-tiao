@@ -13,19 +13,19 @@ component DiagCell inherits Rectangle {
     in property <string> label;
     in property <string> value;
 
-    height: 58px;
+    height: 92px;
     border-radius: Theme.radius-sm;
     background: Theme.bg-soft;
-    border-width: 1px;
+    border-width: 0px;
     border-color: Theme.line-soft;
     VerticalLayout {
         alignment: center;
-        spacing: 1px;
+        spacing: 8px;
         Text { text: root.label; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
         Text {
             text: root.value;
             color: Theme.text;
-            font-size: Theme.font-lg;
+            font-size: 25px;
             font-weight: 600;
             horizontal-alignment: center;
         }
@@ -68,6 +68,7 @@ export component DiagPage inherits VerticalLayout {
         // ── 温湿度计 ──────────────────────────────────────────
         Card {
             title: "温湿度计";
+            background: Theme.sage-panel;
             horizontal-stretch: 1;
             Rectangle {
                 height: 84px;
@@ -80,7 +81,7 @@ export component DiagPage inherits VerticalLayout {
                         spacing: 0px;
                         HorizontalLayout {
                             alignment: center; spacing: 2px;
-                            Text { text: root.sensor-temp; color: Theme.warm; font-size: Theme.font-2xl; font-weight: 600; vertical-alignment: bottom; }
+                            Text { text: root.sensor-temp; color: Theme.accent; font-size: Theme.font-2xl; font-weight: 600; vertical-alignment: bottom; }
                             Text { text: "℃"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: bottom; }
                         }
                         Text { text: "温度"; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
@@ -125,7 +126,7 @@ export component DiagPage inherits VerticalLayout {
                     height: 30px;
                     border-radius: 15px;
                     background: root.fault-clear ? Theme.green.with-alpha(0.16) : Theme.red.with-alpha(0.16);
-                    border-width: 1px;
+                    border-width: 0px;
                     border-color: root.fault-clear ? Theme.green : Theme.red;
                     badge-text := Text {
                         text: root.fault-badge;

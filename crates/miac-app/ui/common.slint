@@ -15,18 +15,18 @@ export component Card inherits Rectangle {
 
     background: Theme.panel;
     border-radius: Theme.radius;
-    border-width: 1px;
+    border-width: 0px;
     border-color: Theme.line-soft;
     // 标题行和内容行使用明确的内边距，避免卡片高度变化时选项整体漂移。
-    height: content.preferred-height + 2 * 16px + (title == "" ? 0px : 30px);
+    height: content.preferred-height + 2 * 24px + (title == "" ? 0px : 40px);
 
     VerticalLayout {
-        padding: 16px;
-        spacing: 8px;
+        padding: 24px;
+        spacing: 12px;
 
         if root.title != "" : HorizontalLayout {
-            height: 22px;
-            spacing: 8px;
+            height: 28px;
+            spacing: 12px;
             Text {
                 text: root.title;
                 color: Theme.text;
@@ -45,7 +45,7 @@ export component Card inherits Rectangle {
         }
 
         content := VerticalLayout {
-            spacing: 8px;
+            spacing: 12px;
             @children
         }
     }
@@ -59,14 +59,15 @@ export component SegButton inherits Rectangle {
     in property <length> min-w: 46px;
     callback clicked;
 
-    height: 34px;
+    height: 40px;
     // 选项宽度由调用方显式决定，保证同一组按钮边缘严格对齐。
     // 文本本身铺满按钮盒子，不再用 preferred-width 反推外框。
-    width: min-w;
+    min-width: min-w;
+    preferred-width: min-w;
     border-radius: Theme.radius-sm;
     background: active ? (accent ? Theme.accent : Theme.accent)
                        : (seg-touch.has-hover ? Theme.panel-hi : Theme.bg-soft);
-    border-width: 1px;
+    border-width: 0px;
     border-color: active ? Theme.accent : (accent ? Theme.accent-deep : Theme.line);
     opacity: !active && accent ? 0.92 : 1.0;
 
@@ -97,10 +98,10 @@ export component ToggleRow inherits Rectangle {
     in property <bool> on: false;
     callback toggled(bool);
 
-    height: 38px;
+    height: 46px;
     border-radius: Theme.radius-sm;
-    background: row-touch.has-hover ? Theme.panel-hi : Theme.bg-soft;
-    border-width: 1px;
+    background: row-touch.has-hover ? Theme.panel-hi : transparent;
+    border-width: 0px;
     border-color: Theme.line-soft;
 
     HorizontalLayout {
@@ -110,7 +111,7 @@ export component ToggleRow inherits Rectangle {
         height: root.height;
         padding-left: 11px;
         padding-right: 11px;
-        spacing: 8px;
+        spacing: 12px;
         Text {
             horizontal-stretch: 1;
             height: root.height;
@@ -135,7 +136,7 @@ export component ToggleRow inherits Rectangle {
                     y: 3px;
                     x: root.on ? parent.width - 18px : 3px;
                     border-radius: 8px;
-                    background: root.on ? Theme.on-accent : Theme.text-mute;
+                    background: #ffffff;
                     animate x { duration: 140ms; easing: ease-in-out; }
                 }
             }
@@ -154,10 +155,10 @@ export component KvRow inherits Rectangle {
     in property <string> value: "--";
     in property <color> value-color: Theme.text;
 
-    height: 26px;
+    height: 34px;
     background: transparent;
     HorizontalLayout {
-        spacing: 8px;
+        spacing: 12px;
         Text { text: root.key; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
         Rectangle { horizontal-stretch: 1; }
         Text {
@@ -178,10 +179,11 @@ export component FlatButton inherits Rectangle {
     in property <bool> ghost: false;
     callback clicked;
 
-    height: 30px;
+    height: 38px;
     // 和 SegButton 一样，按钮外框不再由文本 preferred-width 反推，
     // 避免文本铺满按钮后形成布局回路。
-    width: min-w;
+    min-width: min-w;
+    preferred-width: min-w;
     border-radius: Theme.radius-sm;
     background: danger
         ? (btn-touch.has-hover ? Theme.red : transparent)
@@ -227,7 +229,7 @@ export component Metric inherits Rectangle {
             Text {
                 text: root.value;
                 color: root.value-color;
-                font-size: Theme.font-xl;
+                font-size: 30px;
                 font-weight: 600;
                 vertical-alignment: bottom;
             }

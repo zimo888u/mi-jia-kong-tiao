@@ -625,6 +625,7 @@ impl App {
                         Some(img) => {
                             self.login_qr = Some(img);
                             self.login_state = 2;
+                            self.login_status = "等待在米家 App 中确认…".into();
                             self.login_seconds = seconds;
                             self.login_expires =
                                 Some(Instant::now() + Duration::from_secs(seconds));
@@ -1378,6 +1379,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // 那条「通道已就绪」永远到不了界面，界面就一直停在「连接中…」。
     // 这个 bug 的表现是「能连上却不刷新」，极易误判成网络问题。
     let mut pending: Vec<Event> = Vec::new();
+    // 登录事件也必须保留到 App 可变借用成功；扫码成功事件只发送一次，不能丢。
+    let mut pending_login: Vec<login_ui::LoginEvent> = Vec::new();
     let probe_enabled = probe;
     let base_ws = Rc::new(std::cell::Cell::new(
         memory_bytes().map(|(w, _)| w).unwrap_or(0),
@@ -1477,14 +1480,19 @@ fn main() -> Result<(), slint::PlatformError> {
 
         // 5.6) 登录线程事件 + 二维码倒计时
         {
-            let mut levents = Vec::new();
+            let mut levents = std::mem::take(&mut pending_login);
             if let Ok(a) = tick_app.try_borrow() {
                 a.login.drain(&mut levents);
             }
             if !levents.is_empty() {
-                if let Ok(mut a) = tick_app.try_borrow_mut() {
-                    a.handle_login_events(levents, &tick_worker);
-                    a.refresh_view();
+                match tick_app.try_borrow_mut() {
+                    Ok(mut a) => {
+                        a.handle_login_events(levents, &tick_worker);
+                        a.refresh_view();
+                    }
+                    Err(_) => {
+                        pending_login = levents;
+                    }
                 }
             }
             // 每拍更新剩余秒数（弹层里要显示倒计时）
@@ -1507,6 +1515,7 @@ fn main() -> Result<(), slint::PlatformError> {
         }
 
         // 6) 处理托盘命令（左键显示 / 右键菜单：显示 / 开关机 / 退出）
+        #[cfg(windows)]
         for cmd in tray::drain_commands() {
             match cmd {
                 tray::TrayCommand::Show => {
@@ -1639,6 +1648,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // 必须在 UI 线程创建（消息专用窗口要在同一线程，它的消息才会被
     // Slint/winit 的消息泵派发），所以放在 `ui.run()` 之前。
     // 创建失败不影响主功能：只是没有托盘图标，界面照常可用。
+    #[cfg(windows)]
     let tray_handle = match tray::Tray::new("米家空调") {
         Ok(t) => Some(t),
         Err(e) => {
@@ -1649,31 +1659,34 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // 窗口句柄要等 winit 真正建好窗口才拿得到，所以延后一点再绑定托盘。
     // 绑定之后：左键点托盘能切回窗口，关闭按钮能正确地收进托盘。
-    let attach_app = app.clone();
-    let attach_timer = Rc::new(Timer::default());
-    let attach_timer_cb = attach_timer.clone();
-    let mut attach_tries = 0u32;
-    attach_timer.start(TimerMode::Repeated, Duration::from_millis(300), move || {
-        attach_tries += 1;
-        let enable_tray = attach_app
-            .try_borrow()
-            .map(|a| a.settings.close_to_tray)
-            .unwrap_or(true);
-        let hwnd = find_main_hwnd("米家空调");
-        if !hwnd.is_null() {
-            // 绑定 + 挂钩「关闭时收进托盘」
-            tray::attach_main_window(hwnd, enable_tray);
-            if let Ok(mut a) = attach_app.try_borrow_mut() {
-                a.add_log("[托盘] 已就绪（右键菜单：显示 / 开机 / 关机 / 退出）");
-                a.refresh_view();
+    #[cfg(windows)]
+    let _attach_timer = {
+        let attach_app = app.clone();
+        let attach_timer = Rc::new(Timer::default());
+        let attach_timer_cb = attach_timer.clone();
+        let mut attach_tries = 0u32;
+        attach_timer.start(TimerMode::Repeated, Duration::from_millis(300), move || {
+            attach_tries += 1;
+            let enable_tray = attach_app
+                .try_borrow()
+                .map(|a| a.settings.close_to_tray)
+                .unwrap_or(true);
+            let hwnd = find_main_hwnd("米家空调");
+            if !hwnd.is_null() {
+                // 绑定 + 挂钩「关闭时收进托盘」
+                tray::attach_main_window(hwnd, enable_tray);
+                if let Ok(mut a) = attach_app.try_borrow_mut() {
+                    a.add_log("[托盘] 已就绪（右键菜单：显示 / 开机 / 关机 / 退出）");
+                    a.refresh_view();
+                }
+                attach_timer_cb.stop(); // 绑好就不用再轮询了
+            } else if attach_tries > 40 {
+                eprintln!("[托盘] 未找到主窗口句柄，托盘交互不可用");
+                attach_timer_cb.stop();
             }
-            attach_timer_cb.stop(); // 绑好就不用再轮询了
-        } else if attach_tries > 40 {
-            eprintln!("[托盘] 未找到主窗口句柄，托盘交互不可用");
-            attach_timer_cb.stop();
-        }
-    });
-    let _attach_timer = attach_timer;
+        });
+        attach_timer
+    };
 
     // ⚠ 关键：`ui.run()` 必须在**不持有 App 借用**的情况下调用。
     //
@@ -1689,6 +1702,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // 退出前让工作线程收尾（Wire 的 Drop 里也会做，这里显式一点）
     worker.shutdown();
     drop(tick);
+    #[cfg(windows)]
     drop(tray_handle);
     let _ = app;
     code
