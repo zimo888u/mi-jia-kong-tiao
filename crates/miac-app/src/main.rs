@@ -31,6 +31,8 @@ slint::include_modules!();
 /// 系统托盘（Win32 Shell_NotifyIcon，单进程）。
 mod tray;
 
+mod target_temp;
+
 /// 扫码登录的界面粘合层（第 3 阶段）。
 mod login_ui;
 
@@ -47,6 +49,7 @@ use miac_core::migration;
 use miac_core::settings::Settings;
 use miac_core::worker::{Command, DeviceSummary, Event, Worker};
 use miac_core::{demo, Transport};
+use target_temp::{Command as TargetTempCommand, Completion as TargetTempCompletion, State as TargetTempState};
 
 /// 界面上最多同时显示的提示条数（需求：最多三个）。
 const MAX_TOASTS: usize = 3;
@@ -85,13 +88,8 @@ struct App {
     last_update: Option<Instant>,
     /// 同一时刻最多保留一个状态读取，避免云端慢时自动刷新无限积压命令。
     snapshot_in_flight: bool,
-    /// 温度轮盘的本地乐观值。滚轮/拖动期间只更新画面，避免每个输入事件
-    /// 都触发磁盘写入、日志重绘和网络请求。
-    target_temp_override: Option<f64>,
-    /// 最近一次温度输入，停止操作后再合并成一次保存/下发。
-    pending_target_temp: Option<f64>,
-    pending_target_changed_at: Option<Instant>,
-    target_temp_write_in_flight: bool,
+    /// 温度轮盘的本地乐观值、去抖输入和写入在途状态。
+    target_temp: TargetTempState,
     /// 诊断数据
     diag: Vec<(&'static str, PropValue)>,
     /// 温湿度计
@@ -167,10 +165,7 @@ impl App {
             link_label: "连接中…".into(),
             last_update: None,
             snapshot_in_flight: false,
-            target_temp_override: None,
-            pending_target_temp: None,
-            pending_target_changed_at: None,
-            target_temp_write_in_flight: false,
+            target_temp: TargetTempState::default(),
             diag: Vec::new(),
             thermometer: None,
             maintenance: None,
@@ -268,7 +263,7 @@ impl App {
 
         // ── 控制台：从快照取真实值 ─────────────────────────────
         let on = self.prop_bool("on").unwrap_or(false);
-        let target = self.target_temp_override.unwrap_or_else(|| {
+        let target = self.target_temp.override_temp().unwrap_or_else(|| {
             if on {
                 self.prop_f64("targetTemp").unwrap_or(26.0)
             } else {
@@ -459,6 +454,26 @@ impl App {
         }
     }
 
+    fn dispatch_target_temp(&mut self, command: TargetTempCommand, worker: &Rc<Worker>) {
+        match command {
+            TargetTempCommand::WriteProp(temp) => {
+                self.add_log(format!("[操作] 设定温度 → {temp:.1} ℃"));
+                worker.send(Command::WriteProp {
+                    name: "targetTemp".into(),
+                    value: serde_json::json!(temp),
+                });
+            }
+            TargetTempCommand::ApplyPreset(temp) => {
+                self.add_log(format!("[操作] 温度预设 {temp:.1} ℃（立即下发）"));
+                worker.send(Command::ApplyPreset(temp));
+            }
+            TargetTempCommand::SavePending(temp) => {
+                self.save_pending_temp(temp);
+                self.add_log(format!("[操作] 空调关机，已暂存 {temp:.1} ℃，开机后自动应用"));
+            }
+        }
+    }
+
     fn add_log(&mut self, line: impl Into<String>) {
         let line: String = line.into();
         let stamp = self.started.elapsed().as_secs();
@@ -524,18 +539,9 @@ impl App {
                     }
                     self.props = s.status.clone();
                     self.fault_from_snapshot(&s);
-                    // 只有设备回读值已经追上本地乐观值时，才解除覆盖；
-                    // 如果用户在网络写入期间又调了温度，则继续保持最新值。
-                    if self.pending_target_temp.is_none() {
-                        if let (Some(local), Some(actual)) =
-                            (self.target_temp_override, self.prop_f64("targetTemp"))
-                        {
-                            if (local - actual).abs() <= 0.25 {
-                                self.target_temp_override = None;
-                                self.target_temp_write_in_flight = false;
-                            }
-                        }
-                    }
+                    // 旧快照不能解除仍在途的写入；只有设备回读值追上本地
+                    // 乐观值后，状态机才会撤掉覆盖。
+                    self.target_temp.snapshot(self.prop_f64("targetTemp"));
                 }
                 Event::Diag(v) => {
                     self.diag = v;
@@ -566,25 +572,60 @@ impl App {
                             if turned_on {
                                 if let Some(temp) = self.settings.pending_temp {
                                     self.add_log(format!("[预设] 开机成功，应用待处理温度 {temp:.1} ℃"));
-                                    worker.send(Command::ApplyPreset(temp));
+                                    if let Some(command) =
+                                        self.target_temp.start_preset(temp, Instant::now())
+                                    {
+                                        self.dispatch_target_temp(command, worker);
+                                    }
                                     continue;
                                 }
                             }
                         }
                         if name == "targetTemp" {
-                            self.target_temp_write_in_flight = false;
-                        }
-                        if name == "targetTemp" && self.settings.pending_temp.take().is_some() {
-                            let _ = self.settings.save(&self.creds);
+                            let completed_preset = self.target_temp.in_flight_is_preset();
+                            let powered_on = self.state_on();
+                            let (next, completion) = self.target_temp.finish_write(
+                                true,
+                                Instant::now(),
+                                self.connected,
+                                powered_on,
+                            );
+                            if completed_preset && self.settings.pending_temp.take().is_some() {
+                                let _ = self.settings.save(&self.creds);
+                            }
+                            if let Some(command) = next {
+                                // A newer temperature must enter the worker queue
+                                // before the follow-up snapshot.
+                                self.dispatch_target_temp(command, worker);
+                                continue;
+                            }
+                            if completion == TargetTempCompletion::RequestSnapshot {
+                                self.request_snapshot(worker);
+                            }
+                            continue;
                         }
                         // 写完立刻重读，让界面显示设备真实状态而不是本地乐观值
                         self.request_snapshot(worker);
                     } else {
+                        let mut recover_snapshot = false;
                         if name == "targetTemp" {
-                            self.target_temp_write_in_flight = false;
+                            let powered_on = self.state_on();
+                            let (next, completion) = self.target_temp.finish_write(
+                                false,
+                                Instant::now(),
+                                self.connected,
+                                powered_on,
+                            );
+                            if let Some(command) = next {
+                                self.dispatch_target_temp(command, worker);
+                            }
+                            recover_snapshot = completion == TargetTempCompletion::RequestSnapshot;
                         }
                         let msg = error.unwrap_or_else(|| "未知错误".into());
                         self.toast(3, format!("下发 {name} 失败：{msg}"));
+                        if recover_snapshot {
+                            self.request_snapshot(worker);
+                        }
                     }
                 }
                 Event::Failed { op, error } => {
@@ -845,7 +886,7 @@ impl App {
                 if !a.connected {
                     // 拖动/滚轮会连续触发事件，未连接时只提示一次，
                     // 避免提示条和日志也被输入事件刷屏。
-                    if a.pending_target_temp.is_none() {
+                    if !a.target_temp.has_pending_input() {
                         a.toast(2, "尚未连接设备，无法调温");
                     }
                     return;
@@ -854,9 +895,7 @@ impl App {
                 // 先只改 UI，保证轮盘 60fps 跟手；实际保存/下发交给
                 // 200ms 定时器在停止输入 300ms 后合并处理。
                 a.ui.set_target_temp(v as f32);
-                a.target_temp_override = Some(v);
-                a.pending_target_temp = Some(v);
-                a.pending_target_changed_at = Some(Instant::now());
+                a.target_temp.input(v, Instant::now());
             });
         }
 
@@ -920,12 +959,12 @@ impl App {
             let wk = worker.clone();
             ui.on_set_preset(move |t: f32| {
                 let a = &mut *app.borrow_mut();
-                if !a.state_on() {
-                    a.save_pending_temp(t as f64);
-                    a.add_log(format!("[操作] 温度预设 {t:.1} ℃已暂存，开机后自动应用"));
-                } else {
-                    a.add_log(format!("[操作] 温度预设 {t:.1} ℃（立即下发）"));
-                    wk.send(Command::ApplyPreset(t as f64));
+                let temp = t as f64;
+                a.target_temp.preset(temp, Instant::now());
+                let powered_on = a.state_on();
+                let connected = a.connected;
+                if let Some(command) = a.target_temp.poll(Instant::now(), connected, powered_on) {
+                    a.dispatch_target_temp(command, &wk);
                 }
                 a.refresh_view();
             });
@@ -1414,29 +1453,12 @@ fn main() -> Result<(), slint::PlatformError> {
         // 轮盘事件只负责更新本地画面；停止输入 300ms 后才做一次磁盘写入
         // 或设备写入，避免快速滚轮把 UI 线程和工作线程都塞满。
         if let Ok(mut a) = tick_app.try_borrow_mut() {
-            let settled_temp = a
-                .pending_target_temp
-                .zip(a.pending_target_changed_at)
-                .filter(|(_, changed_at)| changed_at.elapsed() >= Duration::from_millis(300))
-                .map(|(temp, _)| temp);
-
-            if let Some(temp) = settled_temp {
-                a.pending_target_temp = None;
-                a.pending_target_changed_at = None;
-
-                if !a.state_on() {
-                    a.save_pending_temp(temp);
-                    a.add_log(format!("[操作] 空调关机，已暂存 {temp:.1} ℃，开机后自动应用"));
-                    a.refresh_view();
-                } else if a.connected && !a.target_temp_write_in_flight {
-                    a.target_temp_write_in_flight = true;
-                    a.add_log(format!("[操作] 设定温度 → {temp:.1} ℃"));
-                    tick_worker.send(Command::WriteProp {
-                        name: "targetTemp".into(),
-                        value: serde_json::json!(temp),
-                    });
-                    a.refresh_view();
-                }
+            let now = Instant::now();
+            let connected = a.connected;
+            let powered_on = a.state_on();
+            if let Some(command) = a.target_temp.poll(now, connected, powered_on) {
+                a.dispatch_target_temp(command, &tick_worker);
+                a.refresh_view();
             }
         }
 
@@ -1463,6 +1485,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 let secs = a.settings.refresh_secs.max(2);
                 if a.settings.auto_refresh
                     && a.connected
+                    // A temperature command is either waiting for the 300 ms
+                    // settle window or already being written.  Do not enqueue
+                    // a snapshot in front of the newest value; the worker is
+                    // serial, so that stale read would otherwise add one full
+                    // network round trip before the next temperature write.
+                    && !a.target_temp.blocks_snapshot()
                     && tick_count % (5 * secs) == 0
                 {
                     a.request_snapshot(&tick_worker);

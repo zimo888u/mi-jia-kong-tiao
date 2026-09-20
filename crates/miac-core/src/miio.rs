@@ -254,6 +254,15 @@ impl MiioDevice {
                 buf.len()
             )));
         }
+
+        // 握手重试可能让一个重复的 32 字节 hello 响应留在接收队列里。
+        // 它没有加密载荷，不能按普通 RPC 包校验或解密；交给 rpc 的 id 过滤
+        // 逻辑跳过，正常加密包仍必须走完整校验流程。陈旧 hello 头未经校验，
+        // 不用它回写设备状态，避免旧响应覆盖较新的时间基准。
+        if buf.len() == 32 {
+            return Ok(Value::Null);
+        }
+
         if (buf.len() - 32) % 16 != 0 {
             return Err(MiioError::Protocol("密文长度不是 AES 块大小的整数倍".into()));
         }
@@ -268,15 +277,7 @@ impl MiioDevice {
         }
 
         // 头里的设备 ID / 时间戳：以设备为准（握手后已经取过一次，这里兜底）
-        let header_device_id = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let header_stamp = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        if header_device_id != 0 && header_device_id != SENTINEL {
-            self.device_id = header_device_id;
-        }
-        if header_stamp != 0 && header_stamp != SENTINEL && self.server_stamp.is_none() {
-            self.server_stamp = Some(header_stamp);
-            self.server_stamp_at = Some(std::time::Instant::now());
-        }
+        self.update_header_fields(&buf);
 
         let (key, iv) = self.key_iv();
         let plain = crypto::aes_cbc_decrypt(&key, &iv, &buf[32..]);
@@ -323,8 +324,8 @@ impl MiioDevice {
         let hello = handshake_packet();
         let mut last_err = None;
 
-        for attempt in 1..=2 {
-            // 第一次发完立刻再发一次（参考实现就是这个节奏，能显著提高成功率）
+        for _ in 1..=2 {
+            // 首次未收到响应时再发一次，避免短暂丢包导致握手失败。
             self.socket.send_to(&hello, self.addr)?;
 
             match self.recv_header_only() {
@@ -334,10 +335,6 @@ impl MiioDevice {
                 }
                 Err(e) => {
                     last_err = Some(e);
-                    if attempt == 1 {
-                        // 再补一发 hello，然后进入第二轮等待
-                        let _ = self.socket.send_to(&hello, self.addr);
-                    }
                 }
             }
         }
@@ -371,6 +368,18 @@ impl MiioDevice {
         Ok(())
     }
 
+    fn update_header_fields(&mut self, buf: &[u8]) {
+        let header_device_id = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let header_stamp = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        if header_device_id != 0 && header_device_id != SENTINEL {
+            self.device_id = header_device_id;
+        }
+        if header_stamp != 0 && header_stamp != SENTINEL {
+            self.server_stamp = Some(header_stamp);
+            self.server_stamp_at = Some(std::time::Instant::now());
+        }
+    }
+
     /// 发一次 RPC 并等响应。
     ///
     /// `method` 形如 `get_properties` / `set_properties`，
@@ -382,7 +391,8 @@ impl MiioDevice {
         let payload = json!({ "id": id, "method": method, "params": params });
         self.send_packet(payload.to_string().as_bytes())?;
 
-        // 设备可能先回无关的包（重复握手响应等），按 id 匹配，最多试 6 个
+        // 设备可能先回无关的包（重复握手响应等），按 id 匹配，最多读取 6 个，
+        // 保证陈旧包不会让等待无界增长。
         for _ in 0..6 {
             let resp = self.recv_packet()?;
             let Some(rid) = resp.get("id").and_then(Value::as_i64) else {
@@ -479,6 +489,169 @@ pub fn parse_device_id(did: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::net::UdpSocket;
+    use std::thread;
+    use std::time::Duration;
+
+    const TEST_TOKEN: &str = "00112233445566778899aabbccddeeff";
+
+    fn hello_response(device_id: u32, stamp: u32) -> [u8; 32] {
+        let mut packet = [0u8; 32];
+        packet[0..2].copy_from_slice(&0x2131u16.to_be_bytes());
+        packet[2..4].copy_from_slice(&0x0020u16.to_be_bytes());
+        packet[8..12].copy_from_slice(&device_id.to_be_bytes());
+        packet[12..16].copy_from_slice(&stamp.to_be_bytes());
+        packet
+    }
+
+    fn encrypted_response(device_id: u32, stamp: u32, body: &[u8]) -> Vec<u8> {
+        let token = parse_token(TEST_TOKEN).unwrap();
+        let key = crypto::md5(&token);
+        let mut iv_input = key.to_vec();
+        iv_input.extend_from_slice(&token);
+        let iv = crypto::md5(&iv_input);
+        let encrypted = crypto::aes_cbc_encrypt(&key, &iv, body);
+
+        let total_len = (32 + encrypted.len()) as u16;
+        let mut header = Vec::with_capacity(16);
+        header.extend_from_slice(&0x2131u16.to_be_bytes());
+        header.extend_from_slice(&total_len.to_be_bytes());
+        header.extend_from_slice(&0u32.to_be_bytes());
+        header.extend_from_slice(&device_id.to_be_bytes());
+        header.extend_from_slice(&stamp.to_be_bytes());
+
+        let mut checksum_input = header.clone();
+        checksum_input.extend_from_slice(&token);
+        checksum_input.extend_from_slice(&encrypted);
+        let checksum = crypto::md5(&checksum_input);
+
+        let mut packet = header;
+        packet.extend_from_slice(&checksum);
+        packet.extend_from_slice(&encrypted);
+        packet
+    }
+
+    #[test]
+    fn rpc_recalibrates_server_stamp_from_each_valid_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &handshake_packet());
+            server
+                .send_to(&hello_response(0x1122_3344, 1_000), peer)
+                .unwrap();
+
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert!(n > 32, "RPC request must be encrypted");
+            server
+                .send_to(
+                    &encrypted_response(
+                        0x1122_3344,
+                        2_000,
+                        br#"{"id":2,"result":[]}"#,
+                    ),
+                    peer,
+                )
+                .unwrap();
+        });
+
+        let mut device = MiioDevice::connect(&addr.to_string(), "42", TEST_TOKEN).unwrap();
+        assert_eq!(device.rpc("get_properties", json!([])).unwrap(), json!([]));
+        assert_eq!(device.server_stamp, Some(2_000));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn rpc_skips_duplicate_hello_response_left_by_handshake_retry() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &handshake_packet());
+            // Make the first handshake attempt fail without waiting for TIMEOUT.
+            server.send_to(&[0u8], peer).unwrap();
+
+            // One retry header is consumed by handshake; a second response can
+            // remain queued and must be ignored by rpc before its encrypted response.
+            let (_, peer) = server.recv_from(&mut buf).unwrap();
+            let header = hello_response(0x5566_7788, 3_000);
+            server.send_to(&header, peer).unwrap();
+            server.send_to(&header, peer).unwrap();
+
+            let mut extra_hellos = 0;
+            loop {
+                let (n, peer) = server.recv_from(&mut buf).unwrap();
+                if n <= 32 {
+                    extra_hellos += 1;
+                    continue;
+                }
+                assert_eq!(extra_hellos, 0, "handshake retry must not send a third hello");
+                server
+                    .send_to(
+                        &encrypted_response(
+                            0x5566_7788,
+                            3_001,
+                            br#"{"id":2,"result":[{"code":0}]}"#,
+                        ),
+                        peer,
+                    )
+                    .unwrap();
+                break;
+            }
+        });
+
+        let mut device = MiioDevice::connect(&addr.to_string(), "42", TEST_TOKEN).unwrap();
+        assert_eq!(
+            device.rpc("get_properties", json!([])).unwrap(),
+            json!([{"code": 0}])
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn rpc_rejects_bad_checksum_on_encrypted_response() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &handshake_packet());
+            server
+                .send_to(&hello_response(0x1122_3344, 1_000), peer)
+                .unwrap();
+
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            assert!(n > 32, "RPC request must be encrypted");
+            let mut response = encrypted_response(
+                0x1122_3344,
+                1_001,
+                br#"{"id":2,"result":[]}"#,
+            );
+            response[16] ^= 0x01;
+            server.send_to(&response, peer).unwrap();
+        });
+
+        let mut device = MiioDevice::connect(&addr.to_string(), "42", TEST_TOKEN).unwrap();
+        let err = device.rpc("get_properties", json!([])).unwrap_err();
+        match err {
+            MiioError::Protocol(message) => assert_eq!(message, "响应校验和不匹配"),
+            other => panic!("expected checksum error, got {other:?}"),
+        }
+        worker.join().unwrap();
+    }
 
     #[test]
     fn token_parsing() {
