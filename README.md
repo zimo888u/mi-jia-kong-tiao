@@ -6,7 +6,7 @@ Rust + Slint 原生桌面客户端，用于控制米家空调并查看电量、�
 
 Windows x86-64 便携版：
 
-[下载 miac-app.exe（v2.0.0）](https://github.com/zimo888u/mi-jia-kong-tiao/releases/download/v2.0.0/miac-app.exe)
+[下载 miac-app.exe（v2.0.1）](https://github.com/zimo888u/mi-jia-kong-tiao/releases/download/v2.0.1/miac-app.exe)
 
 下载后直接运行，无需安装 Node.js、Electron 或其他运行库。
 
