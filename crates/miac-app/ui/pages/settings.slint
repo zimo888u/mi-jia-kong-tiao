@@ -18,12 +18,36 @@ export component SettingsPage inherits VerticalLayout {
     in property <string> migration-summary: "";
     in property <string> credentials-dir: "";
     in property <bool> credentials-encrypted: false;
+    in property <bool> dark-theme: false;
+    in property <int> close-behavior: 0;
+    callback toggle-theme();
+    callback set-close-behavior(int);
 
     callback set-transport(int);
     callback clear-log();
     callback encrypt-credentials();
 
     spacing: Theme.gap;
+
+    Card {
+        title: "软件设置";
+        HorizontalLayout {
+            spacing: 12px;
+            Text { text: "外观主题"; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+            SegButton { label: "浅色"; min-w: 88px; active: !root.dark-theme; clicked => { if root.dark-theme { root.toggle-theme(); } } }
+            SegButton { label: "深色"; min-w: 88px; active: root.dark-theme; clicked => { if !root.dark-theme { root.toggle-theme(); } } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        HorizontalLayout {
+            spacing: 12px;
+            Text { text: "关闭窗口"; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+            SegButton { label: "每次询问"; min-w: 104px; active: root.close-behavior == 0; clicked => { root.set-close-behavior(0); } }
+            SegButton { label: "收到托盘"; min-w: 104px; active: root.close-behavior == 1; clicked => { root.set-close-behavior(1); } }
+            SegButton { label: "直接退出"; min-w: 104px; active: root.close-behavior == 2; clicked => { root.set-close-behavior(2); } }
+            Rectangle { horizontal-stretch: 1; }
+        }
+        Text { text: "退出程序不会关闭空调。选择「每次询问」可重新显示关闭提示。"; color: Theme.text-mute; font-size: Theme.font-xs; wrap: word-wrap; }
+    }
 
     HorizontalLayout {
         spacing: Theme.gap;

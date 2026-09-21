@@ -42,6 +42,9 @@ pub struct Settings {
     /// 关闭窗口时收进托盘（而不是退出）
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    /// 用户明确记住关闭方式后才跳过询问；旧配置也默认先询问。
+    #[serde(default)]
+    pub remember_close_action: bool,
     /// 是否已经完成过首次迁移（避免每次启动都跑一遍）
     #[serde(default)]
     pub migrated: bool,
@@ -72,6 +75,7 @@ impl Default for Settings {
             auto_refresh: true,
             refresh_secs: 6,
             close_to_tray: true,
+            remember_close_action: false,
             migrated: false,
             encrypt_credentials: false,
         }
@@ -79,6 +83,22 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// 0 每次询问，1 收到托盘，2 直接退出。
+    pub fn close_behavior(&self) -> i32 {
+        if !self.remember_close_action { 0 } else if self.close_to_tray { 1 } else { 2 }
+    }
+
+    pub fn set_close_behavior(&mut self, behavior: i32) {
+        match behavior {
+            0 => self.remember_close_action = false,
+            1 | 2 => {
+                self.remember_close_action = true;
+                self.close_to_tray = behavior == 1;
+            }
+            _ => {}
+        }
+    }
+
     /// 读设置；文件不存在或坏掉时返回默认值（不报错，界面照常起）。
     pub fn load(creds: &Credentials) -> Self {
         let mut s: Settings = creds.read_json(FILE_SETTINGS).unwrap_or_default();
@@ -143,6 +163,28 @@ pub fn settings_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_behavior_asks_until_user_explicitly_remembers_a_choice() {
+        assert_eq!(Settings::default().close_behavior(), 0);
+        for legacy in [r#"{"close_to_tray":true}"#, r#"{"close_to_tray":false}"#] {
+            let settings: Settings = serde_json::from_str(legacy).unwrap();
+            assert_eq!(settings.close_behavior(), 0);
+        }
+    }
+
+    #[test]
+    fn remembered_close_choices_survive_restart_and_can_be_reset() {
+        let mut settings = Settings::default();
+        for choice in [1, 2, 0] {
+            settings.set_close_behavior(choice);
+            let saved = serde_json::to_string(&settings).unwrap();
+            settings = serde_json::from_str(&saved).unwrap();
+            assert_eq!(settings.close_behavior(), choice);
+        }
+        settings.set_close_behavior(99);
+        assert_eq!(settings.close_behavior(), 0);
+    }
 
     #[test]
     fn defaults_are_sane() {

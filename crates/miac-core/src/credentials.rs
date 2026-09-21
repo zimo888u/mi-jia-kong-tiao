@@ -317,7 +317,9 @@ pub fn user_data_dir() -> Option<PathBuf> {
 /// 与 v1 `credentials.js` 的做法一致：失败直接报错，绝不留下权限过宽的凭据文件。
 #[cfg(windows)]
 pub(crate) fn harden_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
     let user = std::env::var("USERNAME").map_err(|_| {
         std::io::Error::new(
@@ -327,6 +329,9 @@ pub(crate) fn harden_permissions(path: &Path) -> std::io::Result<()> {
     })?;
 
     let out = Command::new("icacls")
+        // A GUI parent does not hide console children automatically. Settings
+        // saves also use this path, so never create a console for the ACL tool.
+        .creation_flags(CREATE_NO_WINDOW)
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")

@@ -91,18 +91,18 @@ component ToastCard inherits Rectangle {
 }
 
 /// 右下角提示容器。
-export component ToastHost inherits VerticalLayout {
+export component ToastHost inherits Rectangle {
     in property <[ToastItem]> items: [];
     in property <int> next-seq: 0;
     callback dismiss(int);
 
-    spacing: 8px;
-    alignment: end;
+    background: transparent;
 
-    // 从下往上堆：最新的在最下面（贴近右下角），所以倒序渲染
-    for i in 3 : ToastCard {
-        visible: i < root.items.length;
-        item: i < root.items.length ? root.items[i] : { kind: 0, text: "", seq: 0 };
+    // 新提示位于最下面；每张卡片独立右对齐，不留隐形占位卡。
+    for entry[i] in root.items : ToastCard {
+        x: parent.width - self.width;
+        y: i * 52px;
+        item: entry;
         dismissed => { root.dismiss(i); }
     }
 }

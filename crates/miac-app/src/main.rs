@@ -32,6 +32,10 @@ slint::include_modules!();
 mod tray;
 
 mod target_temp;
+mod settings_writer;
+mod window_config;
+#[cfg(windows)]
+mod single_instance;
 
 /// 扫码登录的界面粘合层（第 3 阶段）。
 mod login_ui;
@@ -74,6 +78,7 @@ struct App {
     // 「取事件」完全不碰 App 的借用，这类重入问题从根上消失。
     creds: Credentials,
     settings: Settings,
+    settings_writer: settings_writer::SettingsWriter,
     started: Instant,
     log: Vec<String>,
     toasts: Vec<Toast>,
@@ -154,6 +159,7 @@ impl App {
 
         let app = Rc::new(RefCell::new(App {
             ui,
+            settings_writer: settings_writer::SettingsWriter::spawn(creds.clone()),
             creds,
             settings,
             started: Instant::now(),
@@ -234,6 +240,7 @@ impl App {
         let ui = &self.ui;
 
         ui.set_dark_theme(self.settings.dark);
+        ui.set_close_behavior(self.settings.close_behavior());
         ui.set_connected(self.connected);
         ui.set_not_ready_reason(self.not_ready_reason.clone().into());
         ui.set_transport_text(self.link_label.clone().into());
@@ -441,7 +448,7 @@ impl App {
     fn save_pending_temp(&mut self, temp: f64) {
         let value = ((temp * 2.0).round() / 2.0).clamp(16.0, 31.0);
         self.settings.pending_temp = Some(value);
-        if let Err(e) = self.settings.save(&self.creds) {
+        if let Err(e) = self.settings_writer.save(&self.settings) {
             self.toast(3, format!("保存待应用温度失败：{e}"));
         }
         self.ui.set_target_temp(value as f32);
@@ -591,7 +598,7 @@ impl App {
                                 powered_on,
                             );
                             if completed_preset && self.settings.pending_temp.take().is_some() {
-                                let _ = self.settings.save(&self.creds);
+                                let _ = self.settings_writer.save(&self.settings);
                             }
                             if let Some(command) = next {
                                 // A newer temperature must enter the worker queue
@@ -638,7 +645,7 @@ impl App {
                     if ok {
                         self.settings.encrypt_credentials = true;
                         self.ui.set_credentials_encrypted(true);
-                        if let Err(e) = self.settings.save(&self.creds) {
+                        if let Err(e) = self.settings_writer.save(&self.settings) {
                             self.toast(3, format!("保存加密设置失败：{e}"));
                         } else {
                             self.toast(1, "凭据已改为 DPAPI 加密存储");
@@ -806,6 +813,46 @@ impl App {
         ui.set_month_energy(ModelRc::new(VecModel::from(months)));
     }
 
+    fn request_close(&mut self) {
+        match self.settings.close_behavior() {
+            1 => self.complete_close(true, false),
+            2 => self.complete_close(false, false),
+            _ => self.ui.set_close_dialog_open(true),
+        }
+    }
+
+    fn complete_close(&mut self, to_tray: bool, remember: bool) {
+        if to_tray {
+            #[cfg(windows)]
+            let hidden = {
+                let hidden = tray::is_ready() && self.ui.window().hide().is_ok();
+                if hidden {
+                    tray::attach_main_window(std::ptr::null_mut());
+                }
+                hidden
+            };
+            #[cfg(not(windows))]
+            let hidden = false;
+            if !hidden {
+                self.ui.set_close_dialog_open(false);
+                self.toast(2, "托盘尚未就绪，窗口已保留，请稍后重试或选择直接退出");
+                self.refresh_view();
+                return;
+            }
+        }
+        if remember {
+            self.settings.set_close_behavior(if to_tray { 1 } else { 2 });
+            if let Err(error) = self.settings_writer.save(&self.settings) {
+                eprintln!("[设置] 保存关闭方式失败：{error}");
+            }
+            self.ui.set_close_behavior(self.settings.close_behavior());
+        }
+        self.ui.set_close_dialog_open(false);
+        if !to_tray {
+            let _ = slint::quit_event_loop();
+        }
+    }
+
     // ── 回调接线 ────────────────────────────────────────────────
 
     fn wire_callbacks(app: &AppRef, worker: Rc<Worker>) {
@@ -818,6 +865,45 @@ impl App {
         //                          报 cannot find value `wk`。
         // 展开写只多两行，但一眼能看懂、编译器也不会绕晕。
         let ui = app.borrow().ui.clone_strong();
+
+        window_config::install_minimize_recovery(&ui, || {
+            #[cfg(windows)]
+            {
+                let hwnd = find_main_hwnd("米家空调");
+                tray::attach_main_window(hwnd);
+                tray::show_main_window();
+            }
+        });
+
+        {
+            let app = app.clone();
+            ui.window().on_close_requested(move || {
+                app.borrow_mut().request_close();
+                slint::CloseRequestResponse::KeepWindowShown
+            });
+        }
+        {
+            let app = app.clone();
+            ui.on_confirm_close(move |to_tray, remember| {
+                app.borrow_mut().complete_close(to_tray, remember);
+            });
+        }
+        {
+            let app = app.clone();
+            ui.on_exit_app(move || app.borrow_mut().complete_close(false, false));
+        }
+        {
+            let app = app.clone();
+            ui.on_set_close_behavior(move |behavior| {
+                let mut a = app.borrow_mut();
+                a.settings.set_close_behavior(behavior);
+                a.ui.set_close_behavior(a.settings.close_behavior());
+                if let Err(error) = a.settings_writer.save(&a.settings) {
+                    a.toast(3, format!("保存关闭方式失败：{error}"));
+                    a.refresh_view();
+                }
+            });
+        }
 
         {
             let app = app.clone();
@@ -850,7 +936,7 @@ impl App {
                 a.settings.dark = !a.settings.dark;
                 let label = if a.settings.dark { "深色" } else { "浅色" };
                 a.add_log(format!("[设置] 主题 → {label}"));
-                if let Err(e) = a.settings.save(&a.creds) {
+                if let Err(e) = a.settings_writer.save(&a.settings) {
                     eprintln!("[设置] 保存主题失败：{e}");
                 }
                 a.refresh_view();
@@ -883,6 +969,9 @@ impl App {
                 let a = &mut *app.borrow_mut();
                 // 设备限制 16~31、步长 0.5：先取整再夹取
                 let v = ((t as f64 * 2.0).round() / 2.0).clamp(16.0, 31.0);
+                if a.ui.get_target_temp() == v as f32 {
+                    return;
+                }
                 if !a.connected {
                     // 拖动/滚轮会连续触发事件，未连接时只提示一次，
                     // 避免提示条和日志也被输入事件刷屏。
@@ -979,7 +1068,7 @@ impl App {
                 a.ui.set_transport_mode(t);
                 let name = Transport::from_index(t).label();
                 a.add_log(format!("[设置] 通信通道 → {name}"));
-                if let Err(e) = a.settings.save(&a.creds) {
+                if let Err(e) = a.settings_writer.save(&a.settings) {
                     eprintln!("[设置] 保存通道失败：{e}");
                 }
                 a.connected = false;
@@ -1012,16 +1101,19 @@ impl App {
 
         {
             let app = app.clone();
-            let _wk = worker.clone();
             ui.on_toggle_auto_refresh(move |v: bool| {
                 let a = &mut *app.borrow_mut();
+                if a.settings.auto_refresh == v {
+                    return;
+                }
                 a.settings.auto_refresh = v;
                 a.ui.set_auto_refresh(v);
                 a.add_log(format!("[设置] 自动更新 → {v}"));
-                if let Err(e) = a.settings.save(&a.creds) {
+                if let Err(e) = a.settings_writer.save(&a.settings) {
                     eprintln!("[设置] 保存自动更新失败：{e}");
                 }
-                a.refresh_view();
+                // The switch already has its new value. Rebuilding all page
+                // models here delays the click's first painted frame.
             });
         }
 
@@ -1304,10 +1396,15 @@ thread_local! {
 fn find_main_hwnd(title: &str) -> windows_sys::Win32::Foundation::HWND {
     use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowTextW,
+        EnumWindows, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
     };
 
     unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != std::process::id() {
+            return 1;
+        }
         let want = &*(lparam as *const String);
         let len = GetWindowTextLengthW(hwnd);
         if len <= 0 {
@@ -1369,6 +1466,7 @@ fn select_backend() -> Result<(), slint::PlatformError> {
     if !which.is_empty() {
         eprintln!("[后端] MIAC_BACKEND={which} → renderer={renderer}");
     }
+    window_config::configure(renderer);
     slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name(renderer.into())
@@ -1376,6 +1474,16 @@ fn select_backend() -> Result<(), slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Acquire before loading settings, migrating credentials or starting workers.
+    #[cfg(windows)]
+    let instance = match single_instance::SingleInstance::acquire() {
+        Ok(Some(instance)) => Rc::new(instance),
+        Ok(None) => {
+            tray::allow_existing_instance_foreground();
+            return Ok(());
+        }
+        Err(error) => return Err(format!("无法检测已运行的程序：{error}").into()),
+    };
     let args: Vec<String> = std::env::args().collect();
     let self_test = args.iter().any(|a| a == "--self-test");
     let probe = args.iter().any(|a| a == "--probe");
@@ -1428,6 +1536,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     tick.start(TimerMode::Repeated, Duration::from_millis(200), move || {
         tick_count += 1;
+        #[cfg(windows)]
+        if instance.take_activation() {
+            tray::request_show();
+        }
 
         // 1) 取事件——不借用 App
         let mut events = std::mem::take(&mut pending);
@@ -1453,12 +1565,17 @@ fn main() -> Result<(), slint::PlatformError> {
         // 轮盘事件只负责更新本地画面；停止输入 300ms 后才做一次磁盘写入
         // 或设备写入，避免快速滚轮把 UI 线程和工作线程都塞满。
         if let Ok(mut a) = tick_app.try_borrow_mut() {
+            while let Some(error) = a.settings_writer.try_error() {
+                a.toast(3, format!("保存设置失败：{error}"));
+                a.refresh_view();
+            }
             let now = Instant::now();
             let connected = a.connected;
             let powered_on = a.state_on();
             if let Some(command) = a.target_temp.poll(now, connected, powered_on) {
                 a.dispatch_target_temp(command, &tick_worker);
-                a.refresh_view();
+                // Temperature was painted in the input callback; dispatching
+                // it must not rebuild unrelated page models on every burst.
             }
         }
 
@@ -1555,21 +1672,17 @@ fn main() -> Result<(), slint::PlatformError> {
                     // 走 `window().show()` 是让 Slint 自己感知状态变化的正路。
                     let ok = match tick_app.try_borrow() {
                         Ok(a) => {
-                            let _ = a.ui.window().show();
-                            true
+                            a.ui.window().set_minimized(false);
+                            a.ui.window().show().is_ok()
                         }
                         Err(_) => false,
                     };
-                    tray::show_main_window();
                     if ok {
-                        // 显示后窗口句柄可能被重建，重新绑定托盘与关闭拦截
-                        let enable_tray = tick_app
-                            .try_borrow()
-                            .map(|a| a.settings.close_to_tray)
-                            .unwrap_or(true);
+                        // Slint 可能重建窗口，先更新句柄再置前，不能操作旧 HWND。
                         let hwnd = find_main_hwnd("米家空调");
                         if !hwnd.is_null() {
-                            tray::attach_main_window(hwnd, enable_tray);
+                            tray::attach_main_window(hwnd);
+                            tray::show_main_window();
                         }
                     }
                     if let Ok(mut a) = tick_app.try_borrow_mut() {
@@ -1695,14 +1808,10 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut attach_tries = 0u32;
         attach_timer.start(TimerMode::Repeated, Duration::from_millis(300), move || {
             attach_tries += 1;
-            let enable_tray = attach_app
-                .try_borrow()
-                .map(|a| a.settings.close_to_tray)
-                .unwrap_or(true);
             let hwnd = find_main_hwnd("米家空调");
             if !hwnd.is_null() {
-                // 绑定 + 挂钩「关闭时收进托盘」
-                tray::attach_main_window(hwnd, enable_tray);
+                // 保存托盘恢复与隐藏所需的窗口句柄。
+                tray::attach_main_window(hwnd);
                 if let Ok(mut a) = attach_app.try_borrow_mut() {
                     a.add_log("[托盘] 已就绪（右键菜单：显示 / 开机 / 关机 / 退出）");
                     a.refresh_view();
@@ -1725,9 +1834,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // 正确做法：先把界面句柄 clone 出来，再在无借用状态下 run。
     let code = {
         let ui = app.borrow().ui.clone_strong();
-        ui.run()
+        // The native tray is not registered with Slint. Keep processing its
+        // messages after the last Slint window is hidden, until explicit exit.
+        ui.show().and_then(|_| slint::run_event_loop_until_quit())
     };
     // 退出前让工作线程收尾（Wire 的 Drop 里也会做，这里显式一点）
+    app.borrow().settings_writer.shutdown();
     worker.shutdown();
     drop(tick);
     #[cfg(windows)]

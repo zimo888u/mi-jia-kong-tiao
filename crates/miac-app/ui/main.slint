@@ -18,6 +18,7 @@ import { DebugPage } from "pages/debug.slint";
 import { SettingsPage } from "pages/settings.slint";
 import { ToastHost, ToastItem } from "toast.slint";
 import { LoginModal, LoginDevice } from "login.slint";
+import { CloseDialog } from "close-dialog.slint";
 
 // ── 导航项 ──────────────────────────────────────────────────────
 component NavItem inherits Rectangle {
@@ -52,6 +53,8 @@ export component MainWindow inherits Window {
     min-width: 1160px;
     min-height: 720px;
     background: Theme.bg;
+    callback native-minimized(bool);
+    changed minimized => { root.native-minimized(root.minimized); }
 
     // ── 界面 ↔ 后台的契约（第 2 阶段由真实控制核心填充，现在喂假数据）──
     in property <int> view: 0;                       // 0 控制台 1 电量 2 诊断 3 属性 4 设置
@@ -93,6 +96,11 @@ export component MainWindow inherits Window {
     in property <int> pview: 0;                      // 0 日 1 月
 
     // 明暗主题开关（Rust 侧唯一真相）
+    in-out property <bool> close-dialog-open: false;
+    in property <int> close-behavior: 0;
+    callback confirm-close(bool, bool);
+    callback set-close-behavior(int);
+    callback exit-app();
     in property <bool> dark-theme: false;
     // theme.slint 的 Theme 是纯 global（没有 Window 上下文），
     // Rust 侧拿不到 Theme::get(&ui)，所以在这里把两者绑起来：
@@ -208,6 +216,8 @@ export component MainWindow inherits Window {
         }
 
         VerticalLayout {
+            width: parent.width;
+            height: parent.height;
             padding: 24px;
             spacing: 32px;
 
@@ -225,34 +235,23 @@ export component MainWindow inherits Window {
                 NavItem { label: "电量统计";  active: root.view == 1; clicked => { root.nav-to(1); } }
                 NavItem { label: "运行诊断";  active: root.view == 2; clicked => { root.nav-to(2); } }
                 NavItem { label: "高级属性"; active: root.view == 3; clicked => { root.nav-to(3); } }
-                NavItem { label: "设置";      active: root.view == 4; clicked => { root.nav-to(4); } }
+                NavItem { label: "软件设置";      active: root.view == 4; clicked => { root.nav-to(4); } }
             }
 
             // 弹性空白，把页脚推到底部
             Rectangle { vertical-stretch: 1; }
 
-            // 页脚：主题切换 / 通道 / 更新时间
+            // 页脚：退出程序 / 通道 / 更新时间
             VerticalLayout {
+                height: 80px;
+                vertical-stretch: 0;
                 spacing: 6px;
                 Rectangle {
-                    height: 32px;
+                    height: 34px;
                     border-radius: Theme.radius-sm;
-                    background: theme-touch.has-hover ? Theme.panel : transparent;
-                    HorizontalLayout {
-                        padding-left: 8px;
-                        spacing: 7px;
-                        Text { text: Theme.dark ? "☀" : "☾"; color: Theme.text-dim; font-size: Theme.font-md; }
-                        Text {
-                            text: Theme.dark ? "切换浅色" : "切换深色";
-                            color: Theme.text-dim;
-                            font-size: Theme.font-sm;
-                            vertical-alignment: center;
-                        }
-                    }
-                    theme-touch := TouchArea {
-                        mouse-cursor: pointer;
-                        clicked => { root.toggle-theme(); }
-                    }
+                    background: exit-touch.has-hover ? Theme.panel : transparent;
+                    Text { x: 8px; width: parent.width - 16px; height: parent.height; text: "退出程序"; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+                    exit-touch := TouchArea { mouse-cursor: pointer; clicked => { root.exit-app(); } }
                 }
                 HorizontalLayout {
                     height: 18px;
@@ -268,6 +267,7 @@ export component MainWindow inherits Window {
                 }
                 Text {
                     text: root.updated-at;
+                    height: 16px;
                     color: Theme.text-mute;
                     font-size: Theme.font-xs;
                 }
@@ -494,6 +494,10 @@ export component MainWindow inherits Window {
                             set-effect(w, l) => { root.set-effect(w, l); }
                         }
                         if root.view == 4 : SettingsPage {
+                            dark-theme: root.dark-theme;
+                            close-behavior: root.close-behavior;
+                            toggle-theme() => { root.toggle-theme(); }
+                            set-close-behavior(v) => { root.set-close-behavior(v); }
                             transport-mode: root.transport-mode;
                             device-info-text: root.device-info-text;
                             log-text: root.log-text;
@@ -515,7 +519,7 @@ export component MainWindow inherits Window {
         // ── 未连接遮罩 ────────────────────────────────────
         // 没有凭据（首次使用 / 换账号）时压在内容区上方，提示去登录。
         // 遮罩必须脱离主 VerticalLayout，否则会被排到页面最下面。
-        if !root.connected && root.not-ready-reason != "" : Rectangle {
+        if !root.connected && root.not-ready-reason != "" && root.view != 4 : Rectangle {
             y: Theme.topbar-h;
             width: parent.width;
             height: parent.height - Theme.topbar-h;
@@ -595,11 +599,10 @@ export component MainWindow inherits Window {
 
     // ── 右下角提示（最多 3 条）──────────────────────────────────
     // 放在 Window 最外层、所有内容之后，保证覆盖在界面之上。
-    // ToastHost 是布局组件（不能直接给 x/y），所以外面套一个定尺容器，
-    // 让布局在容器内从右下角向上堆叠。
+    // 容器距右侧和底部各 24px，每张提示卡在容器内右对齐。
     Rectangle {
-        x: parent.width - 442px;
-        y: parent.height - 20px - self.height;
+        x: parent.width - self.width - 24px;
+        y: parent.height - 24px - self.height;
         width: 420px;
         // 3 条 × 44px + 2 个 8px 间距 = 148px；按实际条数收缩
         height: root.toasts.length == 0 ? 0px
@@ -613,5 +616,11 @@ export component MainWindow inherits Window {
             items: root.toasts;
             dismiss(i) => { root.dismiss-toast(i); }
         }
+    }
+    if root.close-dialog-open : CloseDialog {
+        width: parent.width;
+        height: parent.height;
+        confirm(to-tray, remember) => { root.confirm-close(to-tray, remember); }
+        cancel() => { root.close-dialog-open = false; }
     }
 }

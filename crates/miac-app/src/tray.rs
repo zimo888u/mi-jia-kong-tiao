@@ -28,15 +28,16 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, SetWindowSubclass, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
     NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetCursorPos, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    ShowWindow, TrackPopupMenu, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_SEPARATOR, MF_STRING,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
-    WNDCLASSW, SW_HIDE,
+    GetCursorPos, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
+    SetForegroundWindow,
+    TrackPopupMenu, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_SEPARATOR, MF_STRING,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
+    WNDCLASSW,
 };
 
 /// 托盘回调用的自定义消息（图标事件都发到这个消息上）。
@@ -44,6 +45,12 @@ const WM_TRAYICON: u32 = WM_APP + 1;
 
 /// 托盘图标在通知区里的 ID。
 const TRAY_ID: u32 = 1;
+
+/// `app-icon.rc` 中的应用图标资源 ID。
+const APP_ICON_ID: usize = 1;
+const WM_SETICON: u32 = 0x0080;
+const ICON_SMALL: usize = 0;
+const ICON_BIG: usize = 1;
 
 /// 菜单项命令 ID。
 const CMD_SHOW: usize = 1001;
@@ -91,8 +98,6 @@ fn queue_push(cmd: TrayCommand) {
 /// 托盘图标是否已注册（避免重复 Add / 重复 Delete）。
 static ICON_ADDED: AtomicBool = AtomicBool::new(false);
 
-/// 「关闭按钮 = 收进托盘」是否启用（由界面设置决定）。
-static CLOSE_TO_TRAY: AtomicBool = AtomicBool::new(true);
 
 /// 消息专用窗口句柄（0 表示尚未创建）。
 static mut MSG_HWND: HWND = std::ptr::null_mut();
@@ -163,12 +168,15 @@ impl Tray {
             let hinstance = GetModuleHandleW(std::ptr::null());
             let icon = LoadImageW(
                 hinstance,
-                std::ptr::null(), // 用 exe 的默认图标
+                APP_ICON_ID as *const u16,
                 IMAGE_ICON,
                 0,
                 0,
                 LR_DEFAULTSIZE | LR_SHARED,
             );
+            if icon.is_null() {
+                return Err("读取内嵌应用图标失败".into());
+            }
             nid.hIcon = icon;
 
             // 提示文字：截断到 127 个宽字符（NOTIFYICONDATAW.szTip 容量 128）
@@ -202,72 +210,65 @@ impl Drop for Tray {
     }
 }
 
-/// 把主窗口与本模块绑定：
-///   - 记录 HWND（托盘左键切回、关闭时隐藏都要用）
-///   - 挂钩窗口子类，把「关闭」改成「隐藏到托盘」
-///
-/// 用 `SetWindowSubclass` 而不是 `SetWindowLongPtr(GWLP_WNDPROC)`：
-/// 前者维护子类链，`DefSubclassProc` 会自动把消息交还给原来的 winit 窗口过程，
-/// 不需要自己保存/转发旧过程指针（那样很容易把 winit 的消息循环搞坏）。
-pub fn attach_main_window(hwnd: HWND, close_to_tray: bool) {
+/// 记录主窗口句柄；关闭行为统一由 Slint 的 on_close_requested 处理。
+pub fn attach_main_window(hwnd: HWND) {
     unsafe {
-        if hwnd.is_null() {
-            return;
-        }
         MAIN_HWND = hwnd;
-        CLOSE_TO_TRAY.store(close_to_tray, Ordering::SeqCst);
-        SetWindowSubclass(hwnd, Some(close_interceptor), 1, 0);
+        let hinstance = GetModuleHandleW(std::ptr::null());
+        let small = LoadImageW(
+            hinstance,
+            APP_ICON_ID as *const u16,
+            IMAGE_ICON,
+            16,
+            16,
+            LR_SHARED,
+        );
+        let big = LoadImageW(
+            hinstance,
+            APP_ICON_ID as *const u16,
+            IMAGE_ICON,
+            32,
+            32,
+            LR_SHARED,
+        );
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small as LPARAM);
+        }
+        if !big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG, big as LPARAM);
+        }
     }
 }
 
-/// 主窗口的子类过程：只拦 WM_CLOSE。
-///
-/// 启用「收进托盘」时把关闭变成隐藏——窗口与进程都留着，托盘图标继续可用，
-/// 这正是「托盘待机」的内存口径。其余消息一律交给 `DefSubclassProc` 原样处理，
-/// 绝不影响 winit 自己的逻辑。
-unsafe extern "system" fn close_interceptor(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-    _id: usize,
-    _data: usize,
-) -> LRESULT {
-    if msg == WM_CLOSE && CLOSE_TO_TRAY.load(Ordering::SeqCst) {
-        // 收进托盘必须真正隐藏窗口；仅压到最底层仍会出现在任务栏、Alt+Tab，
-        // 且桌面无遮挡时可见。
-        //
-        // 为什么不隐藏（这一段是实测换来的，别轻易改回去）：
-        // 窗口一旦 SW_HIDE，客户端区域不再映射，Slint 的软件渲染后端回来后
-        // 不重画——恢复后整屏纯白（PrintWindow 取证：正常 150+ 色 → 恢复后 12 色）。
-        // 以下补救**全都无效**：
-        //   · window().request_redraw()（连续多拍请求）
-        //   · InvalidateRect + UpdateWindow
-        //   · RedrawWindow（无效化 + 擦除 + 子窗口 + 立即）
-        //   · MoveWindow 尺寸往返（同样的调用从外部脚本发有效，进程内发无效）
-        //   · 移到屏幕外（窗口仍「可见」，但渲染同样停掉，恢复后还是白）
-        //
-        // 而「压到底层」不同：窗口始终可见、始终参与合成，渲染表面一直有效。
-        // 实测遮挡 5 秒再拉回顶层，PrintWindow 仍是 153 色，画面完好。
-        hide_to_back(hwnd);
-        return 0; // 已处理：不往下传，窗口不会被销毁
-    }
-    DefSubclassProc(hwnd, msg, wparam, lparam)
+/// 只有托盘已就绪才允许隐藏；窗口可见性必须由 Slint 管理。
+pub fn is_ready() -> bool {
+    ICON_ADDED.load(Ordering::SeqCst)
 }
-
-/// 真正隐藏窗口。恢复路径由 main.rs 先调用 Slint 的 window().show()，再补 Win32 置前和重绘。
-pub fn hide_to_back(hwnd: HWND) {
-    unsafe {
-        ShowWindow(hwnd, SW_HIDE);
-        trace("hide_to_back");
-    }
-}
-
 /// 取出所有待处理的托盘命令（界面定时器里调用）。
 pub fn drain_commands() -> Vec<TrayCommand> {
     match COMMANDS.lock() {
         Ok(mut q) => std::mem::take(&mut *q),
         Err(_) => Vec::new(),
+    }
+}
+
+/// Reuse the same restoration path for a second application launch.
+pub fn request_show() {
+    queue_push(TrayCommand::Show);
+}
+
+/// Let the running instance take focus on behalf of this newly launched process.
+pub fn allow_existing_instance_foreground() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let hwnd = FindWindowExW(-3isize as HWND, std::ptr::null_mut(), CLASS_NAME.as_ptr(), std::ptr::null());
+        if !hwnd.is_null() {
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != 0 { AllowSetForegroundWindow(pid); }
+        }
     }
 }
 
@@ -279,11 +280,11 @@ pub fn show_main_window() {
         if h.is_null() {
             return;
         }
-        // 「收进托盘」是压到底层（不是隐藏），所以恢复就是拉回顶层 + 前置。
-        // 全程窗口都处于可见/已合成状态，渲染表面有效，不需要任何重绘兜底。
+        // main.rs 已通知 Slint 恢复显示；这里补上 Win32 的显示和置前。
         use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowPos;
-        const FLAGS: u32 = 0x0001 | 0x0002 | 0x0040; // NOSIZE|NOMOVE|SHOWWINDOW
+        const FLAGS: u32 = 0x0001 | 0x0002; // NOSIZE|NOMOVE: Slint owns visibility.
         SetWindowPos(h, std::ptr::null_mut(), 0, 0, 0, 0, FLAGS);
+        SetForegroundWindow(h);
         trace("show_main_window");
     }
 }

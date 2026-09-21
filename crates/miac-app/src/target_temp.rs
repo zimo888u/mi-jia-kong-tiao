@@ -165,6 +165,37 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn rapid_plus_minus_inputs_only_dispatch_the_final_temperature() {
+        let start = Instant::now();
+        let mut state = State::default();
+        for i in 0..100 {
+            let now = start + Duration::from_millis(i * 10);
+            state.input(if i % 2 == 0 { 26.5 } else { 26.0 }, now);
+            assert_eq!(state.poll(now, true, true), None);
+            assert!(!state.snapshot(Some(25.0)));
+        }
+        let settled = start + Duration::from_millis(990) + SETTLE_AFTER;
+        assert_eq!(state.override_temp(), Some(26.0));
+        assert_eq!(state.poll(settled, true, true), Some(Command::WriteProp(26.0)));
+        assert_eq!(state.poll(settled, true, true), None);
+    }
+
+    #[test]
+    fn rapid_powered_off_inputs_save_only_the_last_pending_temperature() {
+        let start = Instant::now();
+        let mut state = State::default();
+        for i in 0..31 {
+            let now = start + Duration::from_millis(i * 10);
+            state.input(16.0 + i as f64 * 0.5, now);
+            assert_eq!(state.poll(now, true, false), None);
+        }
+        let settled = start + Duration::from_millis(300) + SETTLE_AFTER;
+        assert_eq!(state.poll(settled, true, false), Some(Command::SavePending(31.0)));
+        assert_eq!(state.poll(settled, true, false), None);
+        assert_eq!(state.override_temp(), Some(31.0));
+    }
+
+    #[test]
     fn latest_manual_input_is_sent_after_the_slow_write_finishes() {
         let start = Instant::now();
         let mut state = State::default();

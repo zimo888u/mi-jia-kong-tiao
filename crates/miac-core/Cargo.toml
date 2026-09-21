@@ -43,6 +43,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_System_Memory",
     "Win32_System_Time",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

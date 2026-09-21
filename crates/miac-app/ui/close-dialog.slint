@@ -1,0 +1,38 @@
+import { Theme } from "theme.slint";
+import { FlatButton, SegButton, ToggleRow } from "common.slint";
+
+export component CloseDialog inherits Rectangle {
+    callback confirm(bool, bool);
+    callback cancel();
+    private property <bool> remember: false;
+    background: Theme.overlay;
+    // Consume pointer events so the controls behind the dialog cannot activate.
+    TouchArea { }
+    Rectangle {
+        width: 480px;
+        height: 280px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.radius;
+        background: Theme.panel;
+        border-width: 1px;
+        border-color: Theme.line;
+        VerticalLayout {
+            padding: 28px;
+            spacing: 16px;
+            Text { text: "关闭米家空调"; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; }
+            Text {
+                text: "收到托盘后，程序继续在后台运行。\n直接退出仅关闭程序，不会关闭空调。";
+                color: Theme.text-dim; font-size: Theme.font-sm; wrap: word-wrap;
+            }
+            ToggleRow { label: "始终使用此方案"; on: root.remember; toggled(v) => { root.remember = v; } }
+            Text { text: "可在「软件设置」中随时更改。"; color: Theme.text-mute; font-size: Theme.font-xs; }
+            HorizontalLayout {
+                spacing: 12px;
+                FlatButton { label: "取消"; min-w: 80px; ghost: true; clicked => { root.cancel(); } }
+                FlatButton { label: "直接退出"; min-w: 124px; clicked => { root.confirm(false, root.remember); } }
+                SegButton { label: "收到托盘"; min-w: 124px; active: true; clicked => { root.confirm(true, root.remember); } }
+            }
+        }
+    }
+}

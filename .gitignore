@@ -5,6 +5,7 @@
 /dist/*.exe
 /dist/*.pdb
 /dist/*.ico
+/dist/*.zip
 
 # Local Xiaomi credentials and device data
 device.json

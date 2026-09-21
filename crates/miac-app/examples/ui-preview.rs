@@ -4,6 +4,8 @@
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::{path::PathBuf, rc::Rc};
 slint::include_modules!();
+#[path = "../src/window_config.rs"]
+mod window_config;
 
 fn strings(values: &[&str]) -> ModelRc<SharedString> {
     Rc::new(VecModel::from(
@@ -133,6 +135,8 @@ fn fixture(ui: &MainWindow) {
     let weak = ui.as_weak();
     ui.on_toggle_auto_refresh(move |v| weak.unwrap().set_auto_refresh(v));
     let weak = ui.as_weak();
+    ui.on_set_close_behavior(move |v| weak.unwrap().set_close_behavior(v));
+    let weak = ui.as_weak();
     ui.on_set_toggle(move |key, v| {
         let u = weak.unwrap();
         match key.as_str() {
@@ -154,13 +158,46 @@ fn fixture(ui: &MainWindow) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--interactive") {
+        window_config::configure("software");
         slint::BackendSelector::new()
             .backend_name("winit".into())
             .renderer_name("software".into())
             .select()?;
         let ui = MainWindow::new()?;
         fixture(&ui);
-        ui.run()?;
+        window_config::install_minimize_recovery(&ui, || {});
+        let cycle_timer = slint::Timer::default();
+        let minimize_cycle = args.iter().any(|a| a == "--minimize-cycle");
+        if minimize_cycle || args.iter().any(|a| a == "--tray-cycle") {
+            // Native software-renderer regression: hiding the last window must
+            // not end the loop, and every restoration must repaint the scene.
+            let weak = ui.as_weak();
+            let mut step = 0;
+            cycle_timer.start(slint::TimerMode::Repeated, std::time::Duration::from_millis(700), move || {
+                let ui = weak.unwrap();
+                step += 1;
+                if step <= 10 {
+                    if minimize_cycle {
+                        ui.window().set_minimized(step % 2 == 1);
+                    } else if step % 2 == 1 {
+                        ui.hide().unwrap();
+                        assert!(!ui.window().is_visible());
+                    } else {
+                        ui.show().unwrap();
+                        ui.window().request_redraw();
+                        assert!(ui.window().is_visible());
+                    }
+                }
+            });
+            ui.window().on_close_requested(|| {
+                slint::quit_event_loop().unwrap();
+                slint::CloseRequestResponse::KeepWindowShown
+            });
+            ui.show()?;
+            slint::run_event_loop_until_quit()?;
+        } else {
+            ui.run()?;
+        }
         return Ok(());
     }
     use slint::platform::{
@@ -224,6 +261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Keep the disconnected-device prompt fully visible at the shortest supported height.
     // This guards against layout containers stretching the card through the bottom edge.
+    ui.set_view(0);
     ui.set_connected(false);
     ui.set_not_ready_reason("还没有设备信息，请先登录米家账号完成设备设置。".into());
     slint::platform::update_timers_and_animations();
@@ -296,6 +334,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         26.0,
         "minus button must adjust by half a degree"
     );
+    for _ in 0..50 {
+        click(801.0, 417.0);
+        assert_eq!(ui.get_target_temp(), 26.5, "rapid plus click");
+        click(407.0, 417.0);
+        assert_eq!(ui.get_target_temp(), 26.0, "rapid minus click");
+    }
+    for y in [417.0, 390.0, 450.0] {
+        window.dispatch_event(WindowEvent::PointerMoved {
+            position: slint::LogicalPosition::new(600.0, y),
+        });
+        assert_eq!(ui.get_target_temp(), 26.0, "hover must not adjust temperature");
+    }
+    for _ in 0..50 {
+        let previous = ui.get_auto_refresh();
+        click(1250.0, 47.0);
+        assert_eq!(ui.get_auto_refresh(), !previous, "rapid auto-refresh click");
+    }
     ui.set_target_temp(31.0);
     click(801.0, 417.0);
     assert_eq!(ui.get_target_temp(), 31.0, "upper bound");
@@ -334,7 +389,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "42",
         "raw input must propagate to the Rust-visible window property"
     );
-    println!("UI checks passed: temperature steps/bounds, scroll, power, mode, fan, comfort, navigation, raw input");
+    // Render settings and the close prompt in both themes, including the
+    // smallest supported window. No device or personal settings are touched.
+    let capture = |name: &str, width: u32, height: u32| -> Result<(), Box<dyn std::error::Error>> {
+        window.set_size(slint::PhysicalSize::new(width, height));
+        slint::platform::update_timers_and_animations();
+        window.request_redraw();
+        let mut pixels = slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(width, height);
+        assert!(window.draw_if_needed(|renderer| {
+            renderer.render(pixels.make_mut_slice(), width as usize);
+        }));
+        let file = std::fs::File::create(output.join(name))?;
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(pixels.as_bytes())?;
+        Ok(())
+    };
+    ui.set_view(4);
+    ui.set_connected(false);
+    ui.set_not_ready_reason("未连接设备".into());
+    capture("settings-offline.png", 1440, 1100)?;
+    // Software settings remain accessible without connecting an air conditioner.
+    click(904.0, 232.0);
+    assert!(ui.get_dark_theme(), "dark theme is now in software settings");
+    click(520.0, 232.0);
+    assert!(!ui.get_dark_theme(), "light theme selection");
+    for (x, behavior) in [(766.0, 1), (1057.0, 2), (475.0, 0)] {
+        click(x, 287.0);
+        assert_eq!(ui.get_close_behavior(), behavior, "close preference selection");
+    }
+    assert_eq!(ui.get_close_behavior(), 0, "close preference can return to ask every time");
+    let confirmed = Rc::new(std::cell::Cell::new(None));
+    let confirmed_cb = confirmed.clone();
+    let weak = ui.as_weak();
+    ui.on_confirm_close(move |to_tray, remember| {
+        confirmed_cb.set(Some((to_tray, remember)));
+        weak.unwrap().set_close_dialog_open(false);
+    });
+    ui.set_close_dialog_open(true);
+    capture("close-dialog-light.png", 1440, 1100)?;
+    ui.set_dark_theme(true);
+    capture("close-dialog-dark-compact.png", 1160, 720)?;
+    ui.set_dark_theme(false);
+    capture("close-dialog-light.png", 1440, 1100)?;
+    click(520.0, 550.0);
+    click(890.0, 636.0);
+    assert_eq!(confirmed.get(), Some((true, true)), "remembered tray choice");
+    ui.set_close_dialog_open(true);
+    draw();
+    click(740.0, 636.0);
+    assert_eq!(confirmed.get(), Some((false, false)), "fresh prompt does not retain remember toggle");
+    ui.set_close_dialog_open(true);
+    draw();
+    click(550.0, 636.0);
+    assert!(!ui.get_close_dialog_open(), "cancel keeps the app open");
+    ui.set_view(0);
+    ui.set_connected(true);
+    let notices = vec![
+        ToastItem { kind: 1, text: "已下发 on".into(), seq: 0 },
+        ToastItem { kind: 1, text: "目标温度已下发：26.5 ℃".into(), seq: 1 },
+        ToastItem { kind: 2, text: "正在读取最新设备状态，请稍候".into(), seq: 2 },
+    ];
+    ui.set_toasts(Rc::new(VecModel::from(vec![notices[0].clone()])).into());
+    capture("bottom-alignment-single.png", 1440, 960)?;
+    ui.set_toasts(Rc::new(VecModel::from(notices)).into());
+    capture("bottom-alignment-stacked.png", 1160, 720)?;
+    println!("UI checks passed: temperature, auto-refresh, settings themes, close choices, remember, cancel, navigation, raw input");
     ui.hide()?;
     Ok(())
 }
