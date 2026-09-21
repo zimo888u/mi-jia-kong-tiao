@@ -74,19 +74,9 @@ docs/               UI 预览、验证资料与发行说明
 
 ## 清理本机数据
 
-需要移除登录凭据、设备配置、缓存和日志时，先预览将要删除的内容：
+双击 [清理米家空调数据.cmd](清理米家空调数据.cmd) 即可自动结束程序并清除当前用户的日志、缓存、设置和登录凭据。删除后需要重新扫码登录。
 
-```powershell
-.\scripts\clear-miac-data.ps1 -WhatIf
-```
-
-确认后执行：
-
-```powershell
-.\scripts\clear-miac-data.ps1 -Confirm:$false
-```
-
-这会清空当前用户的 `%APPDATA%\米家空调` 数据，并删除项目目录和 `dist` 目录中兼容旧版便携包的凭据文件。若曾设置 `MIAC_TRACE` 输出到其他位置，请用 `-TraceLogPath` 传入该日志路径。
+它会清空 `%APPDATA%\米家空调` 和 `%LOCALAPPDATA%\米家空调`，并删除项目目录及 `dist` 目录中兼容旧版便携包的凭据文件。
 
 ## 更新日志
 
