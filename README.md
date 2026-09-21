@@ -72,6 +72,22 @@ docs/               UI 预览、验证资料与发行说明
 
 项目兼容旧版 Electron 客户端的 `device.json`、`cloud-session.json` 和 `thermometer.json`。它只访问用户选择并授权的米家设备；请勿将凭据、令牌或本地设备配置提交到仓库。
 
+## 清理本机数据
+
+需要移除登录凭据、设备配置、缓存和日志时，先预览将要删除的内容：
+
+```powershell
+.\scripts\clear-miac-data.ps1 -WhatIf
+```
+
+确认后执行：
+
+```powershell
+.\scripts\clear-miac-data.ps1 -Confirm:$false
+```
+
+这会清空当前用户的 `%APPDATA%\米家空调` 数据，并删除项目目录和 `dist` 目录中兼容旧版便携包的凭据文件。若曾设置 `MIAC_TRACE` 输出到其他位置，请用 `-TraceLogPath` 传入该日志路径。
+
 ## 更新日志
 
 完整记录见 [CHANGELOG.md](CHANGELOG.md)。
