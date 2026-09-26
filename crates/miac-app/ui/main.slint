@@ -3,7 +3,7 @@
 //
 // 对应 Electron 版 app/renderer/index.html 的结构：
 //   .sidebar（品牌 / 导航 / 主题切换 / 通道指示）
-//   .main（.topbar 标题+自动更新+刷新 / .scroll 各页面）
+//   .main（.topbar 标题+自动刷新+刷新 / .scroll 各页面）
 //
 // 内存注意：五个页面用 if 按需实例化，同一时刻只构造一个页面的元素树，
 // 而不是五个都在内存里（旧版是 DOM 全量常驻）。第 1 阶段结束后用
@@ -11,7 +11,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Theme } from "theme.slint";
-import { ControlPage } from "pages/control.slint";
+import { ControlPage, ControlChoice } from "pages/control.slint";
 import { PowerPage } from "pages/power.slint";
 import { DiagPage } from "pages/diag.slint";
 import { DebugPage } from "pages/debug.slint";
@@ -30,11 +30,21 @@ component NavItem inherits Rectangle {
     border-radius: Theme.radius-sm;
     background: active ? Theme.nav-active : (touch.has-hover ? Theme.panel : transparent);
 
+    if root.active : Rectangle {
+        x: 0px;
+        y: 12px;
+        width: 3px;
+        height: 22px;
+        border-radius: 2px;
+        background: Theme.accent;
+    }
+
     Text {
         x: 20px; width: parent.width - 40px; height: parent.height;
         text: root.label;
         color: root.active ? Theme.nav-text : Theme.text-dim;
         font-size: Theme.font-md;
+        font-weight: root.active ? 600 : 400;
         vertical-alignment: center;
     }
 
@@ -58,13 +68,28 @@ export component MainWindow inherits Window {
 
     // ── 界面 ↔ 后台的契约（第 2 阶段由真实控制核心填充，现在喂假数据）──
     in property <int> view: 0;                       // 0 控制台 1 电量 2 诊断 3 属性 4 设置
-    in property <string> device-name: "巨省电 大2匹";
+    in property <string> device-name: "米家空调";
     in property <string> transport-text: "局域网直连";
     in property <int> transport-state: 1;            // 0 未连接 1 正常 2 警告 3 错误
     in property <string> updated-at: "刚刚更新";
     in property <string> power-text: "运行中";
     in property <bool> power-on: true;
+    in property <bool> power-known: false;
     in property <float> target-temp: 26.0;
+    in property <float> temp-min: 16;
+    in property <float> temp-max: 31;
+    in property <float> temp-step: 0.5;
+    in property <[ControlChoice]> mode-options;
+    in property <[ControlChoice]> fan-options;
+    in property <bool> extended-controls: false;
+    in property <bool> can-light: false;
+    in property <bool> can-buzzer: false;
+    in property <bool> can-vswing: false;
+    in property <bool> can-hswing: false;
+    in property <bool> can-eco: false;
+    in property <bool> can-sleep: false;
+    in property <bool> can-heater: false;
+    in property <bool> can-dryer: false;
     in property <float> preset-a: 27.5;
     in property <float> preset-b: 27.0;
     in property <float> preset-c: 26.5;
@@ -72,6 +97,8 @@ export component MainWindow inherits Window {
     in property <string> sensor-temp: "26.8";
     in property <string> sensor-hum: "58";
     in property <string> energy-total: "412.6";
+    in property <string> energy-unit: "kWh";
+    in property <string> energy-hint: "累计用电量 · 详见电量统计";
     in property <string> battery-text: "电量 92%";
     in property <string> clock: "--:--";
     in property <bool> auto-refresh: true;
@@ -321,7 +348,7 @@ export component MainWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; }
 
-                    // 自动更新
+                    // 自动刷新设备状态
                     Rectangle {
                         width: 108px;
                         height: 30px;
@@ -354,7 +381,7 @@ export component MainWindow inherits Window {
                             y: 0px;
                             width: parent.width - 34px;
                             height: parent.height;
-                            text: "自动更新";
+                            text: "自动刷新";
                             color: Theme.text-dim;
                             font-size: Theme.font-sm;
                             vertical-alignment: center;
@@ -410,13 +437,29 @@ export component MainWindow inherits Window {
 
                         // 五个页面按需实例化：只有当前页在内存里
                         if root.view == 0 : ControlPage {
+                            device-name: root.device-name;
+                            temp-min: root.temp-min;
+                            temp-max: root.temp-max;
+                            temp-step: root.temp-step;
+                            mode-options: root.mode-options;
+                            fan-options: root.fan-options;
+                            extended-controls: root.extended-controls;
+                            can-vswing: root.can-vswing;
+                            can-hswing: root.can-hswing;
+                            can-eco: root.can-eco;
+                            can-sleep: root.can-sleep;
+                            can-heater: root.can-heater;
+                            can-dryer: root.can-dryer;
                             target-temp: root.target-temp;
                             power-on: root.power-on;
+                            power-known: root.power-known;
                             power-text: root.power-text;
                             room-temp: root.room-temp;
                             sensor-temp: root.sensor-temp;
                             sensor-hum: root.sensor-hum;
                             energy-total: root.energy-total;
+                            energy-unit: root.energy-unit;
+                            energy-hint: root.energy-hint;
                             battery-text: root.battery-text;
                             mode: root.mode;
                             fan: root.fan;
@@ -474,6 +517,9 @@ export component MainWindow inherits Window {
                             fault-clear: root.fault-clear;
                         }
                         if root.view == 3 : DebugPage {
+                            extended-controls: root.extended-controls;
+                            can-light: root.can-light;
+                            can-buzzer: root.can-buzzer;
                             raw-addr: root.raw-addr;
                             raw-prop-names: root.raw-prop-names;
                             prop-name-list: root.prop-name-list;

@@ -30,6 +30,9 @@ pub struct Settings {
     /// 空调关机时由用户预先选择的温度。开机成功后才下发给设备。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_temp: Option<f64>,
+    /// The device that owns the pending temperature, when saved by this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_temp_device: Option<String>,
     /// 通信通道：0 自动 / 1 强制局域网 / 2 强制云端
     #[serde(default)]
     pub transport: i32,
@@ -71,6 +74,7 @@ impl Default for Settings {
             dark: false,
             presets: default_presets(),
             pending_temp: None,
+            pending_temp_device: None,
             transport: 0,
             auto_refresh: true,
             refresh_secs: 6,
@@ -117,15 +121,16 @@ impl Settings {
             self.presets = default_presets();
         }
         for p in &mut self.presets {
-            if !p.is_finite() || !(16.0..=31.0).contains(p) {
+            if !p.is_finite() || !(5.0..=40.0).contains(p) {
                 *p = 26.5;
             }
         }
         if let Some(pending) = self.pending_temp {
-            if !pending.is_finite() || !(16.0..=31.0).contains(&pending) {
+            if !pending.is_finite() || !(5.0..=40.0).contains(&pending) {
                 self.pending_temp = None;
+                self.pending_temp_device = None;
             } else {
-                self.pending_temp = Some((pending * 2.0).round() / 2.0);
+                self.pending_temp = Some(pending); // 型号范围和步长由 Profile 在下发前校验
             }
         }
         if !(0..=2).contains(&self.transport) {
@@ -147,10 +152,10 @@ impl Settings {
 
     /// 改第 idx 个预设并返回是否真的改了。
     pub fn set_preset(&mut self, idx: usize, value: f64) -> bool {
-        if idx >= self.presets.len() || !value.is_finite() || !(16.0..=31.0).contains(&value) {
+        if idx >= self.presets.len() || !value.is_finite() || !(5.0..=40.0).contains(&value) {
             return false;
         }
-        self.presets[idx] = (value * 2.0).round() / 2.0; // 0.5 步长
+        self.presets[idx] = value; // 保留型号支持的精度
         true
     }
 }
@@ -238,12 +243,15 @@ mod tests {
     }
 
     #[test]
-    fn set_preset_snaps_to_half_degree() {
+    fn set_preset_preserves_model_specific_precision() {
         let mut s = Settings::default();
         assert!(s.set_preset(0, 26.3));
-        assert_eq!(s.presets[0], 26.5, "0.5 步长取整");
+        assert_eq!(s.presets[0], 26.3);
+        s.pending_temp = Some(32.0);
+        s.normalize();
+        assert_eq!(s.pending_temp, Some(32.0));
         assert!(!s.set_preset(9, 26.0), "越界索引应失败");
-        assert!(!s.set_preset(0, 40.0), "越界温度应失败");
+        assert!(!s.set_preset(0, 99.0), "越界温度应失败");
     }
 
     #[test]

@@ -336,6 +336,8 @@ fn save_credentials(
     let ac = devices
         .get(idx)
         .ok_or_else(|| "所选设备不在本次登录的设备列表里".to_string())?;
+    miac_core::profile::load(&ac.model, creds.primary_dir(), None)
+        .map_err(|e| format!("所选设备没有可安全使用的空调规格：{e}"))?;
 
     creds
         .write_json(FILE_SESSION, session)

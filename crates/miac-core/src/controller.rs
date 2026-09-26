@@ -175,6 +175,7 @@ pub struct PowerStats {
 
 /// 空调控制器。
 pub struct Controller {
+    pub profile: crate::profile::Profile,
     pub creds: Credentials,
     /// 通道策略
     pub prefer: crate::Transport,
@@ -191,6 +192,7 @@ impl Controller {
     pub fn new(creds: Credentials, prefer: crate::Transport) -> Self {
         let proxy = std::env::var("MIAC_PROXY").ok().filter(|s| !s.trim().is_empty());
         Self {
+            profile: crate::profile::Profile::default(),
             creds,
             prefer,
             link: None,
@@ -226,6 +228,8 @@ impl Controller {
             .read_device()
             .ok_or_else(|| ControllerError("还没有设备信息，请先登录米家账号完成设备设置。".into()))?;
         self.device = Some(dev.clone());
+        self.profile = crate::profile::load(dev.model.as_deref().unwrap_or(""), self.creds.primary_dir(), self.proxy.as_deref())
+            .map_err(|e| ControllerError(format!("读取该型号的 MIoT 规格失败：{e}")))?;
 
         match self.prefer {
             crate::Transport::Cloud => {
@@ -296,6 +300,18 @@ impl Controller {
             match local_result {
                 Ok(value) => return Ok(value),
                 Err(local_error) => {
+                    // A device-side rejection is a real result, not a broken
+                    // transport. Retrying a write through cloud could apply it twice.
+                    if matches!(&local_error, crate::miio::MiioError::Device { .. }) {
+                        return Err(local_error.into());
+                    }
+                    // A timeout does not prove that a write was not applied.
+                    // Never send the same write again through another link.
+                    if !rpc_retry_safe(method) {
+                        return Err(ControllerError(format!(
+                            "写入结果未确认：{local_error}；请刷新状态后再操作"
+                        )));
+                    }
                     // 自动模式下，局域网凭据存在不代表设备当前仍在同一个网络。
                     // 本地 UDP 超时后应尝试云端，而不是永久重连同一个失效 IP。
                     if self.prefer != crate::Transport::Local && self.has_cloud_session() {
@@ -329,6 +345,14 @@ impl Controller {
         match result {
             Ok(v) => Ok(v),
             Err(e) => {
+                if matches!(&e, cloud::CloudError::Api { code, .. } if *code != -9999) {
+                    return Err(ControllerError(e.to_string()));
+                }
+                if !rpc_retry_safe(method) {
+                    return Err(ControllerError(format!(
+                        "写入结果未确认：{e}；请刷新状态后再操作"
+                    )));
+                }
                 // 云端失败时，有本地信息就降级，别让用户卡住
                 let dev_info = self.device.clone();
                 if self.prefer != crate::Transport::Cloud {
@@ -360,23 +384,21 @@ impl Controller {
         // 名字要转成 'static 供界面用：这里要求调用方传的属性名都来自属性表
         let mut addrs = Vec::with_capacity(names.len());
         for n in names {
-            addrs.push((*n, Self::resolve_prop(n)?));
+            if let Some(p) = self.profile.properties.get(*n).filter(|p| p.readable) {
+                addrs.push((*n, (p.siid, p.piid)));
+            }
         }
 
         let params: Vec<Value> = addrs
             .iter()
             .map(|(_, (siid, piid))| json!({ "did": did, "siid": siid, "piid": piid }))
             .collect();
-        let res = self.rpc("get_properties", Value::Array(params))?;
-
-        let arr = match res {
-            Value::Array(a) => a,
-            other => vec![other],
-        };
+        let arr = read_property_batches(&params, |batch| self.rpc("get_properties", Value::Array(batch.to_vec())))?;
 
         let mut out = Vec::with_capacity(addrs.len());
-        for (i, (name, _)) in addrs.iter().enumerate() {
-            let v = match arr.get(i) {
+        for (name, (siid, piid)) in addrs.iter() {
+            // Match response addresses, not response order (cloud can reorder).
+            let v = match arr.iter().find(|item| item["siid"].as_u64() == Some(*siid as u64) && item["piid"].as_u64() == Some(*piid as u64)) {
                 None => PropValue::Missing,
                 Some(item) => match item.get("code").and_then(Value::as_i64) {
                     Some(0) => PropValue::Ok(item.get("value").cloned().unwrap_or(Value::Null)),
@@ -391,6 +413,11 @@ impl Controller {
                 .map(|(n, _)| *n)
                 .unwrap_or("unknown");
             out.push((static_name, v));
+        }
+        for n in names {
+            if !out.iter().any(|(name,_)| name == n) {
+                if let Some((name,_)) = miot::PROPS.iter().find(|(name,_)| name == n) { out.push((*name,PropValue::Missing)); }
+            }
         }
         Ok(out)
     }
@@ -422,7 +449,8 @@ impl Controller {
 
     /// 按属性名写值。
     pub fn write_prop(&mut self, name: &str, value: Value) -> Result<(), ControllerError> {
-        let (siid, piid) = Self::resolve_prop(name)?;
+        let value = self.profile.validate(name, &value).map_err(ControllerError)?;
+        let (siid, piid) = self.profile.addr(name).ok_or_else(|| ControllerError(format!("该型号不支持 {name}")))?;
         let r = self.raw_write(siid, piid, value.clone())?;
         match r {
             PropValue::Ok(_) => Ok(()),
@@ -507,18 +535,26 @@ impl Controller {
     }
 
     pub fn set_temp(&mut self, t: f64) -> Result<(), ControllerError> {
-        let t = Self::valid_temp(t)?;
         self.write_prop("targetTemp", json!(t))
     }
 
     pub fn set_mode(&mut self, m: &Value) -> Result<(), ControllerError> {
-        let v = Self::valid_mode(m)?;
-        self.write_prop("mode", json!(v))
+        let value = if let Some(s) = m.as_str() {
+            let label = match s { "cool" => "制冷", "dry" => "除湿", "fan" => "送风", "heat" => "制热", "auto" => "自动", _ => s };
+            let v = self.profile.properties.get("mode").and_then(|p| p.choices.iter().find(|(_,n)| n == label)).ok_or_else(|| ControllerError("该型号不支持所选模式".into()))?.0;
+            json!(v)
+        } else { m.clone() };
+        self.write_prop("mode", value)
     }
 
     pub fn set_fan(&mut self, level: &Value) -> Result<(), ControllerError> {
-        let v = Self::valid_fan(level)?;
-        self.write_prop("fanLevel", json!(v))
+        let choices = self.profile.properties.get("fanLevel").map(|p| &p.choices);
+        let value = match level.as_str() {
+            Some("auto") => choices.and_then(|c| c.iter().find(|(_,n)| n == "自动")).map(|(v,_)| json!(v)),
+            Some("max") => choices.and_then(|c| c.iter().max_by_key(|(v,_)| v)).map(|(v,_)| json!(v)),
+            _ => Some(level.clone()),
+        }.ok_or_else(|| ControllerError("该型号不支持该风速".into()))?;
+        self.write_prop("fanLevel", value)
     }
 
     pub fn set_wind(&mut self, d: &Value) -> Result<(), ControllerError> {
@@ -582,13 +618,10 @@ impl Controller {
     /// 关机时设备会以 `-5000` 拒绝温度写入；先开机并短暂等待后再重试。
     /// 这个「等压缩机保护延时」的行为与 v1 `applyTempPreset()` 一致。
     pub fn apply_temp_preset(&mut self, value: f64) -> Result<(bool, f64), ControllerError> {
-        let t = Self::valid_temp(value)?;
+        let t = self.profile.snap_temperature(value);
+        self.profile.validate("targetTemp", &json!(t)).map_err(ControllerError)?;
         let state = self.read_props(&["on"])?;
-        let turned_on = state
-            .iter()
-            .find(|(n, _)| *n == "on")
-            .and_then(|(_, v)| v.as_bool())
-            != Some(true);
+        let turned_on = !confirmed_power_state(&state)?;
 
         if turned_on {
             self.set_power(true)?;
@@ -622,14 +655,35 @@ impl Controller {
 
     /// 状态快照：空调状态 + 故障解读。
     pub fn snapshot(&mut self) -> Result<Snapshot, ControllerError> {
-        let status = self.read_props(miot::STATUS_PROPS)?;
+        let mut names = miot::STATUS_PROPS.to_vec();
+        // Preserve the original model's known-good property set.
+        if self.profile.model != miot::EXPECT_MODEL { names.push("fault"); }
+        // Read the safety-critical switch and temperature first. A vendor-only
+        // diagnostic or energy property must not hide the actual power state.
+        let mut status = self.read_props(&["on", "targetTemp"])?;
+        confirmed_power_state(&status)?;
+        names.retain(|name| !["on", "targetTemp"].contains(name));
+        match self.read_props(&names) {
+            Ok(extra) => status.extend(extra),
+            Err(error) => {
+                eprintln!("[状态] 可选属性读取失败：{error}");
+                for name in names {
+                    if let Some((known, _)) = miot::PROPS.iter().find(|(known, _)| *known == name) {
+                        status.push((*known, PropValue::Missing));
+                    }
+                }
+            }
+        }
         let fault_value = status
             .iter()
             .find(|(n, _)| *n == "faultValue")
             .and_then(|(_, v)| v.as_i64());
         Ok(Snapshot {
             link: self.link,
-            fault: miot::fault_info(fault_value),
+            fault: if self.profile.model == miot::EXPECT_MODEL { miot::fault_info(fault_value) } else {
+                let value = status.iter().find(|(n,_)| *n == "fault").map(|(_,v)| v);
+                miot::FaultInfo { clear: value.and_then(PropValue::as_i64) == Some(0), text: value.map(PropValue::display).unwrap_or_else(|| "该型号未提供故障读数".into()), badge: None }
+            },
             status,
         })
     }
@@ -744,6 +798,10 @@ impl Controller {
 
     /// 耗电日历：20.1 是用电量(kWh)，8.5 是当日开机时长(分钟)。
     pub fn power_stats(&mut self) -> Result<PowerStats, ControllerError> {
+        // History aggregation and units are vendor specific, not a standard MIoT contract.
+        if self.profile.model != miot::EXPECT_MODEL {
+            return Err(ControllerError("该型号暂不支持历史电量统计；实时读数见控制台".into()));
+        }
         let dev = self
             .device
             .clone()
@@ -847,6 +905,65 @@ impl ThermometerAddrs for [(&str, (u16, u16))] {
     fn map_addrs(&self) -> Vec<(u16, u16)> {
         self.iter().map(|(_, a)| *a).collect()
     }
+}
+
+// A write may have reached the device even when its acknowledgement is lost.
+// Only idempotent reads may be attempted through a fallback link.
+fn rpc_retry_safe(method: &str) -> bool {
+    method == "get_properties"
+}
+
+fn confirmed_power_state(status: &[(&str, PropValue)]) -> Result<bool, ControllerError> {
+    status
+        .iter()
+        .find(|(name, _)| *name == "on")
+        .and_then(|(_, value)| value.as_bool())
+        .ok_or_else(|| ControllerError("未能读取空调开关状态，请检查设备连接或型号规格".into()))
+}
+
+// Keep packets small: MIoT firmware can time out on oversized property lists.
+fn read_property_batches(
+    params: &[Value],
+    mut read: impl FnMut(&[Value]) -> Result<Value, ControllerError>,
+) -> Result<Vec<Value>, ControllerError> {
+    fn append(values: &mut Vec<Value>, result: Value) {
+        match result {
+            Value::Array(items) => values.extend(items),
+            other => values.push(other),
+        }
+    }
+    fn recover(
+        batch: &[Value],
+        read: &mut impl FnMut(&[Value]) -> Result<Value, ControllerError>,
+        values: &mut Vec<Value>,
+    ) -> bool {
+        if batch.len() < 2 { return false; }
+        let (left, right) = batch.split_at(batch.len() / 2);
+        let left_result = read(left);
+        let right_result = read(right);
+        let left_ok = match left_result {
+            Ok(result) => { append(values, result); true }
+            Err(_) => recover(left, read, values),
+        };
+        let right_ok = match right_result {
+            Ok(result) => { append(values, result); true }
+            Err(_) => recover(right, read, values),
+        };
+        left_ok || right_ok
+    }
+    let mut values = Vec::new();
+    let mut first_error = None;
+    let mut any_success = false;
+    for batch in params.chunks(8) {
+        match read(batch) {
+            Ok(result) => { append(&mut values, result); any_success = true; }
+            Err(error) => {
+                if first_error.is_none() { first_error = Some(error); }
+                any_success |= recover(batch, &mut read, &mut values);
+            }
+        }
+    }
+    if any_success || params.is_empty() { Ok(values) } else { Err(first_error.expect("nonempty batch failed")) }
 }
 
 fn parse_first(res: Value) -> PropValue {
@@ -1069,5 +1186,62 @@ mod tests {
         assert_eq!(Controller::resolve_prop("on").unwrap(), (2, 1));
         assert_eq!(Controller::resolve_prop("electricity").unwrap(), (20, 1));
         assert!(Controller::resolve_prop("definitelyNotAProp").is_err());
+    }
+
+    #[test]
+    fn property_reads_are_bounded_and_keep_energy_results() {
+        let params: Vec<_> = (0..17).map(|i| json!({"piid": i})).collect();
+        let mut sizes = Vec::new();
+        let result = read_property_batches(&params, |batch| {
+            sizes.push(batch.len());
+            Ok(Value::Array(batch.to_vec()))
+        }).unwrap();
+        assert_eq!(sizes, vec![8, 8, 1]);
+        assert_eq!(result, params);
+        assert!(read_property_batches(&[], |_| panic!("empty request")).unwrap().is_empty());
+        assert!(read_property_batches(&params, |_| Err(ControllerError("timeout".into()))).is_err());
+    }
+
+    #[test]
+    fn one_failing_optional_property_does_not_discard_other_results() {
+        let params: Vec<_> = (0..8).map(|i| json!({"piid": i})).collect();
+        let result = read_property_batches(&params, |batch| {
+            if batch.iter().any(|value| value["piid"] == 5) {
+                Err(ControllerError("unsupported property".into()))
+            } else {
+                Ok(Value::Array(batch.to_vec()))
+            }
+        }).unwrap();
+        assert_eq!(result.len(), 7);
+        assert!(result.iter().all(|value| value["piid"] != 5));
+        assert!(result.iter().any(|value| value["piid"] == 7));
+    }
+
+    #[test]
+    fn failures_in_both_halves_still_preserve_readable_properties() {
+        let params: Vec<_> = (0..8).map(|i| json!({"piid": i})).collect();
+        let result = read_property_batches(&params, |batch| {
+            if batch.iter().any(|value| value["piid"] == 1 || value["piid"] == 6) {
+                Err(ControllerError("unsupported property".into()))
+            } else {
+                Ok(Value::Array(batch.to_vec()))
+            }
+        }).unwrap();
+        let ids: Vec<_> = result.iter().map(|value| value["piid"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![0, 2, 3, 4, 5, 7]);
+    }
+
+    #[test]
+    fn unknown_power_state_must_not_trigger_automatic_power_on() {
+        assert_eq!(confirmed_power_state(&[("on", PropValue::Ok(json!(true)))]).unwrap(), true);
+        assert_eq!(confirmed_power_state(&[("on", PropValue::Ok(json!(false)))]).unwrap(), false);
+        assert!(confirmed_power_state(&[("on", PropValue::Missing)]).is_err());
+        assert!(confirmed_power_state(&[("on", PropValue::Err(-4004))]).is_err());
+    }
+
+    #[test]
+    fn only_reads_are_safe_to_retry_through_another_link() {
+        assert!(rpc_retry_safe("get_properties"));
+        assert!(!rpc_retry_safe("set_properties"));
     }
 }

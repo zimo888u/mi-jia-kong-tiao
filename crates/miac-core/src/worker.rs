@@ -29,7 +29,6 @@ use serde_json::Value;
 
 use crate::controller::{ActiveLink, Controller, ControllerError, PropValue, Snapshot};
 use crate::credentials::Credentials;
-use crate::miot;
 use crate::settings::Settings;
 use crate::Transport;
 
@@ -96,6 +95,7 @@ pub enum Event {
 /// 设备摘要（界面「设置」页展示，不含 token）。
 #[derive(Debug, Clone, Default)]
 pub struct DeviceSummary {
+    pub profile: crate::profile::Profile,
     pub name: String,
     pub model: String,
     pub did: String,
@@ -310,13 +310,14 @@ impl WorkerLoop {
 
         match self.creds.read_device() {
             Some(d) => DeviceSummary {
-                name: d.name.clone().unwrap_or_else(|| "米家空调".into()),
+                profile: self.ctrl.as_ref().map(|c| c.profile.clone()).unwrap_or_default(),
+                name: d.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| d.model.clone().unwrap_or_else(|| "米家空调".into())),
                 model: d.model.clone().unwrap_or_default(),
                 did: d.did.clone(),
                 localip: d.localip.clone(),
                 has_token: d.token.as_deref().is_some_and(|t| !t.trim().is_empty()),
                 saved_at: d.saved_at.clone(),
-                model_matches: d.model_matches(miot::EXPECT_MODEL),
+                model_matches: self.ctrl.as_ref().is_some_and(|c| c.profile.writable("on")),
                 credentials_dir: dir,
                 has_cloud_session,
                 has_thermometer,
@@ -345,8 +346,14 @@ impl WorkerLoop {
             Command::Init | Command::SetTransport(_) => {
                 if let Command::SetTransport(t) = cmd {
                     self.settings.transport = t.to_index();
-                    self.ctrl = None; // 强制重连
                 }
+                // Init also follows a newly selected device. Reusing the old
+                // controller would report the new name while controlling the old DID.
+                if let Some(c) = self.ctrl.as_mut() {
+                    c.dispose();
+                }
+                self.ctrl = None;
+                self.failures = 0;
                 match self.ensure() {
                     Ok(link) => {
                         self.failures = 0;
@@ -443,7 +450,8 @@ impl WorkerLoop {
                     .ensure()
                     .and_then(|_| self.ctrl.as_mut().expect("有控制器").write_prop(&name, value));
                 let ok = r.is_ok();
-                self.note(&r);
+                // A rejected value or a device business error is not evidence
+                // that the transport is down. Reads drive reconnection counts.
                 let _ = self.tx.send(Event::Wrote {
                     name,
                     ok,
@@ -569,6 +577,21 @@ impl WorkerLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_discards_old_device_connection_after_credentials_change() {
+        let creds = Credentials::isolated(std::env::temp_dir().join("miac-no-device-for-init-test"));
+        let (tx, rx) = channel();
+        let mut loop_state = WorkerLoop::new(creds.clone(), Settings::default(), tx);
+        let mut old_controller = Controller::new(creds, Transport::Auto);
+        old_controller.link = Some(ActiveLink::Local);
+        loop_state.ctrl = Some(old_controller);
+
+        loop_state.handle(Command::Init);
+
+        assert!(loop_state.ctrl.is_none());
+        assert!(matches!(rx.try_recv(), Ok(Event::NotReady { .. })));
+    }
 
     #[test]
     fn worker_starts_and_stops() {

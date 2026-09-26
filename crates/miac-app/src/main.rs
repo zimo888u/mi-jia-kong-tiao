@@ -70,6 +70,10 @@ struct Toast {
 
 /// 应用状态。
 struct App {
+    profile: miac_core::profile::Profile,
+    active_device_id: String,
+    switching_device_id: Option<String>,
+    last_snapshot_error: Option<Instant>,
     ui: MainWindow,
     // 注意：Worker 刻意**不放在 App 里**。
     // 之前放在这里时踩了个坑：定时器要先 `App.borrow()` 才能取事件，取完再
@@ -158,6 +162,10 @@ impl App {
         let creds_for_login = creds.clone();
 
         let app = Rc::new(RefCell::new(App {
+            profile: miac_core::profile::Profile::default(),
+            active_device_id: String::new(),
+            switching_device_id: None,
+            last_snapshot_error: None,
             ui,
             settings_writer: settings_writer::SettingsWriter::spawn(creds.clone()),
             creds,
@@ -269,25 +277,29 @@ impl App {
         ui.set_toasts(ModelRc::new(VecModel::from(items)));
 
         // ── 控制台：从快照取真实值 ─────────────────────────────
-        let on = self.prop_bool("on").unwrap_or(false);
+        let on_state = self.prop_bool("on");
+        let on = on_state.unwrap_or(false);
         let target = self.target_temp.override_temp().unwrap_or_else(|| {
-            if on {
-                self.prop_f64("targetTemp").unwrap_or(26.0)
-            } else {
-                self.settings
+            match on_state {
+                Some(true) => self.prop_f64("targetTemp").unwrap_or(26.0),
+                Some(false) => self.settings
                     .pending_temp
                     .or_else(|| self.prop_f64("targetTemp"))
-                    .unwrap_or(26.0)
+                    .unwrap_or(26.0),
+                None => self.prop_f64("targetTemp").unwrap_or(26.0),
             }
         });
         ui.set_power_on(on);
-        ui.set_power_text(if on { "运行中" } else { "已关机" }.into());
-        ui.set_target_temp(target as f32);
-        ui.set_preset_a(self.settings.preset(0).unwrap_or(27.5) as f32);
-        ui.set_preset_b(self.settings.preset(1).unwrap_or(27.0) as f32);
-        ui.set_preset_c(self.settings.preset(2).unwrap_or(26.5) as f32);
+        ui.set_power_known(on_state.is_some());
+        ui.set_power_text(if on_state.is_none() { "状态未知" } else if on { "运行中" } else { "已关机" }.into());
+        ui.set_target_temp(self.profile.snap_temperature(target) as f32);
+        ui.set_preset_a(self.profile.snap_temperature(self.settings.preset(0).unwrap_or(27.5)) as f32);
+        ui.set_preset_b(self.profile.snap_temperature(self.settings.preset(1).unwrap_or(27.0)) as f32);
+        ui.set_preset_c(self.profile.snap_temperature(self.settings.preset(2).unwrap_or(26.5)) as f32);
         ui.set_room_temp(fmt_or(self.prop_f64("roomTemp"), |v| format!("{v:.1}")));
-        ui.set_energy_total(fmt_or(self.prop_f64("electricity"), |v| format!("{v:.1}")));
+        ui.set_energy_total(if self.profile.properties.get("electricity").is_some_and(|p| p.readable) {
+            fmt_or(self.prop_f64("electricity"), |v| format!("{v:.1}"))
+        } else { "--".into() });
 
         // 温湿度计
         match self.thermometer.as_ref().filter(|t| t.available) {
@@ -341,7 +353,7 @@ impl App {
         let labels: Vec<slint::SharedString> = self
             .diag
             .iter()
-            .map(|(n, _)| slint::SharedString::from(*n))
+            .map(|(n, _)| slint::SharedString::from(diagnostic_label(n)))
             .collect();
         let values: Vec<slint::SharedString> = self
             .diag
@@ -359,13 +371,16 @@ impl App {
                     .map(|(_, v)| v.display())
                     .unwrap_or_else(|| "--".into())
             };
-            ui.set_clean_text(if *cleaning { "运行中".into() } else { "未运行".into() });
+            ui.set_clean_text(if !self.profile.properties.contains_key("clean") { "该型号未提供".into() } else if *cleaning { "运行中".into() } else { "未运行".into() });
             ui.set_examine_text(get("examine").into());
             ui.set_run_text(format!("{} 小时", get("runDuration")).into());
         }
 
         // 故障
-        let fault = miot::fault_info(self.prop_i64("faultValue"));
+        let fault = if self.profile.model == miot::EXPECT_MODEL { miot::fault_info(self.prop_i64("faultValue")) } else {
+            let value = self.props.iter().find(|(n,_)| *n == "fault").map(|(_,v)| v);
+            miot::FaultInfo { clear: value.and_then(PropValue::as_i64) == Some(0), text: value.map(PropValue::display).unwrap_or_else(|| "该型号未提供故障读数".into()), badge: None }
+        };
         ui.set_fault_badge(fault.badge.clone().unwrap_or_else(|| "—".into()).into());
         ui.set_fault_text(fault.text.clone().into());
         ui.set_fault_clear(fault.clear);
@@ -405,9 +420,9 @@ impl App {
         ui.set_all_props(ModelRc::new(VecModel::from(all)));
 
         // 高级页：原始属性地址与结果
-        let names = demo::prop_names();
+        let names: Vec<_> = self.profile.properties.keys().cloned().collect();
         let selected = names.get(self.selected_prop).cloned().unwrap_or_default();
-        if let Some((siid, piid)) = miot::prop_addr(&selected) {
+        if let Some((siid, piid)) = self.profile.addr(&selected) {
             ui.set_raw_addr(format!("{siid}.{piid}").into());
         }
         if let Some((siid, piid, v)) = self.raw_result.as_ref() {
@@ -439,15 +454,16 @@ impl App {
 
     /// 把设置里的预设温度反映到界面按钮上。
     fn push_presets(&mut self) {
-        self.ui.set_preset_a(self.settings.preset(0).unwrap_or(27.5) as f32);
-        self.ui.set_preset_b(self.settings.preset(1).unwrap_or(27.0) as f32);
-        self.ui.set_preset_c(self.settings.preset(2).unwrap_or(26.5) as f32);
+        self.ui.set_preset_a(self.profile.snap_temperature(self.settings.preset(0).unwrap_or(27.5)) as f32);
+        self.ui.set_preset_b(self.profile.snap_temperature(self.settings.preset(1).unwrap_or(27.0)) as f32);
+        self.ui.set_preset_c(self.profile.snap_temperature(self.settings.preset(2).unwrap_or(26.5)) as f32);
     }
 
     /// 空调关机时只在本地记录目标温度，成功开机后再由事件链下发。
     fn save_pending_temp(&mut self, temp: f64) {
-        let value = ((temp * 2.0).round() / 2.0).clamp(16.0, 31.0);
+        let value = self.profile.snap_temperature(temp);
         self.settings.pending_temp = Some(value);
+        self.settings.pending_temp_device = Some(self.active_device_id.clone());
         if let Err(e) = self.settings_writer.save(&self.settings) {
             self.toast(3, format!("保存待应用温度失败：{e}"));
         }
@@ -517,8 +533,40 @@ impl App {
 
     fn handle_events(&mut self, events: Vec<Event>, worker: &Rc<Worker>) {
         for e in events {
+            if let Some(expected_did) = self.switching_device_id.as_deref() {
+                match &e {
+                    Event::Ready { device, .. } if device.did == expected_did => {}
+                    Event::NotReady { .. } | Event::Log(_) | Event::CredentialsEncrypted { .. } => {}
+                    _ => continue,
+                }
+            }
             match e {
                 Event::Ready { link, device } => {
+                    self.switching_device_id = None;
+                    self.profile = device.profile.clone();
+                    if self.active_device_id != device.did {
+                        if !self.active_device_id.is_empty()
+                            || (self.settings.pending_temp.is_some()
+                                && self.settings.pending_temp_device.as_deref()
+                                    != Some(device.did.as_str())) {
+                            self.settings.pending_temp = None;
+                            self.settings.pending_temp_device = None;
+                            let _ = self.settings_writer.save(&self.settings);
+                        }
+                        self.active_device_id = device.did.clone();
+                        self.target_temp = TargetTempState::default();
+                        self.props.clear();
+                        self.power = None;
+                        self.diag.clear();
+                        self.maintenance = None;
+                        self.power_on_in_flight = None;
+                        self.raw_result = None;
+                        self.last_update = None;
+                        self.last_snapshot_error = None;
+                        self.snapshot_in_flight = false;
+                    }
+                    self.selected_prop = 0;
+                    self.ui.set_selected_prop(0);
                     self.connected = true;
                     self.not_ready_reason.clear();
                     self.link_label = link.label().to_string();
@@ -529,7 +577,7 @@ impl App {
                     worker.send(Command::Diag);
                     worker.send(Command::Thermometer);
                     worker.send(Command::Maintenance);
-                    worker.send(Command::PowerStats);
+                    if self.profile.model == miot::EXPECT_MODEL { worker.send(Command::PowerStats); }
                 }
                 Event::NotReady { reason } => {
                     self.connected = false;
@@ -541,6 +589,7 @@ impl App {
                 Event::Snapshot(s) => {
                     self.snapshot_in_flight = false;
                     self.last_update = Some(Instant::now());
+                    self.last_snapshot_error = None;
                     if let Some(link) = s.link {
                         self.link_label = link.label().to_string();
                     }
@@ -548,7 +597,7 @@ impl App {
                     self.fault_from_snapshot(&s);
                     // 旧快照不能解除仍在途的写入；只有设备回读值追上本地
                     // 乐观值后，状态机才会撤掉覆盖。
-                    self.target_temp.snapshot(self.prop_f64("targetTemp"));
+                    self.target_temp.snapshot(self.prop_f64("targetTemp"), self.profile.temperature_range()[2]);
                 }
                 Event::Diag(v) => {
                     self.diag = v;
@@ -575,12 +624,14 @@ impl App {
                     if ok {
                         self.toast(1, format!("已下发 {name}"));
                         if name == "on" {
-                            let turned_on = self.power_on_in_flight.take() == Some(true);
+                            let acknowledged = self.power_on_in_flight.take();
+                            acknowledge_power(&mut self.props, acknowledged);
+                            let turned_on = acknowledged == Some(true);
                             if turned_on {
                                 if let Some(temp) = self.settings.pending_temp {
                                     self.add_log(format!("[预设] 开机成功，应用待处理温度 {temp:.1} ℃"));
                                     if let Some(command) =
-                                        self.target_temp.start_preset(temp, Instant::now())
+                                        self.target_temp.start_preset(self.profile.snap_temperature(temp), Instant::now())
                                     {
                                         self.dispatch_target_temp(command, worker);
                                     }
@@ -591,13 +642,15 @@ impl App {
                         if name == "targetTemp" {
                             let completed_preset = self.target_temp.in_flight_is_preset();
                             let powered_on = self.state_on();
+                            let power_known = self.prop_bool("on").is_some();
                             let (next, completion) = self.target_temp.finish_write(
                                 true,
                                 Instant::now(),
-                                self.connected,
+                                self.connected && power_known,
                                 powered_on,
                             );
                             if completed_preset && self.settings.pending_temp.take().is_some() {
+                                self.settings.pending_temp_device = None;
                                 let _ = self.settings_writer.save(&self.settings);
                             }
                             if let Some(command) = next {
@@ -615,12 +668,18 @@ impl App {
                         self.request_snapshot(worker);
                     } else {
                         let mut recover_snapshot = false;
+                        if name == "on" {
+                            self.power_on_in_flight = None;
+                            forget_power_state(&mut self.props);
+                            recover_snapshot = true;
+                        }
                         if name == "targetTemp" {
                             let powered_on = self.state_on();
+                            let power_known = self.prop_bool("on").is_some();
                             let (next, completion) = self.target_temp.finish_write(
                                 false,
                                 Instant::now(),
-                                self.connected,
+                                self.connected && power_known,
                                 powered_on,
                             );
                             if let Some(command) = next {
@@ -638,6 +697,12 @@ impl App {
                 Event::Failed { op, error } => {
                     if op == "读状态" {
                         self.snapshot_in_flight = false;
+                        let repeated = self.last_snapshot_error.is_some_and(|t| t.elapsed() < Duration::from_secs(60));
+                        self.last_snapshot_error = Some(Instant::now());
+                        if repeated {
+                            self.add_log(format!("{op} 失败：{error}"));
+                            continue;
+                        }
                     }
                     self.toast(3, format!("{op} 失败：{error}"));
                 }
@@ -692,6 +757,49 @@ impl App {
                     self.login_status = "请选择要控制的设备".into();
                 }
                 login_ui::LoginEvent::Saved { device, thermometer } => {
+                    self.connected = false;
+                    self.not_ready_reason = "正在连接新选择的空调…".into();
+                    self.switching_device_id = Some(self.creds.read_device().map(|d| d.did).unwrap_or_default());
+                    // 旧 DID 留到 Ready，用它判定持久化的待应用温度是否属于新设备。
+                    self.profile = miac_core::profile::Profile::default();
+                    self.target_temp = TargetTempState::default();
+                    self.props.clear();
+                    self.power = None;
+                    self.diag.clear();
+                    self.maintenance = None;
+                    self.thermometer = None;
+                    self.raw_result = None;
+                    self.last_update = None;
+                    self.last_snapshot_error = None;
+                    self.snapshot_in_flight = false;
+                    self.power_on_in_flight = None;
+                    self.selected_prop = 0;
+                    self.ui.set_selected_prop(0);
+                    self.ui.set_device_name(device.clone().into());
+                    self.ui.set_device_info_text(format!("名称：{device}\n正在连接并读取设备信息…").into());
+                    self.ui.set_prop_name_list(ModelRc::new(VecModel::from(Vec::<slint::SharedString>::new())));
+                    self.ui.set_mode_options(ModelRc::new(VecModel::from(Vec::<ControlChoice>::new())));
+                    self.ui.set_fan_options(ModelRc::new(VecModel::from(Vec::<ControlChoice>::new())));
+                    self.ui.set_extended_controls(false);
+                    self.ui.set_can_light(false);
+                    self.ui.set_can_buzzer(false);
+                    self.ui.set_can_vswing(false);
+                    self.ui.set_can_hswing(false);
+                    self.ui.set_can_eco(false);
+                    self.ui.set_can_sleep(false);
+                    self.ui.set_can_heater(false);
+                    self.ui.set_can_dryer(false);
+                    self.ui.set_energy_unit("".into());
+                    self.ui.set_energy_hint("等待连接设备后读取".into());
+                    let [min, max, step] = self.profile.temperature_range();
+                    self.ui.set_temp_min(min as f32);
+                    self.ui.set_temp_max(max as f32);
+                    self.ui.set_temp_step(step as f32);
+                    self.ui.set_raw_addr("—".into());
+                    self.ui.set_raw_out("连接设备后可读取属性".into());
+                    self.ui.set_clean_text("尚未读取".into());
+                    self.ui.set_examine_text("尚未读取".into());
+                    self.ui.set_run_text("尚未读取".into());
                     self.login_state = 0;
                     self.login_open = false;
                     self.login_qr = None;
@@ -723,6 +831,38 @@ impl App {
     }
 
     fn push_device_info(&self, d: &DeviceSummary) {
+        let name = if d.name.trim().is_empty() { &d.model } else { &d.name };
+        self.ui.set_device_name(name.clone().into());
+        let [min, max, step] = d.profile.temperature_range();
+        self.ui.set_temp_min(min as f32);
+        self.ui.set_temp_max(max as f32);
+        self.ui.set_temp_step(step as f32);
+        let options = |key: &str| -> ModelRc<ControlChoice> {
+            ModelRc::new(VecModel::from(d.profile.properties.get(key).filter(|p| p.writable)
+                .map(|p| p.choices.iter().map(|(value,label)| ControlChoice { value: *value as i32, label: label.clone().into() }).collect::<Vec<_>>()).unwrap_or_default()))
+        };
+        self.ui.set_mode_options(options("mode"));
+        self.ui.set_fan_options(options("fanLevel"));
+        self.ui.set_extended_controls(d.model == miot::EXPECT_MODEL);
+        self.ui.set_can_light(d.profile.writable("light"));
+        self.ui.set_can_buzzer(d.profile.writable("buzzer"));
+        self.ui.set_can_vswing(d.profile.writable("verticalSwing"));
+        self.ui.set_can_hswing(d.profile.writable("horizontalSwing"));
+        self.ui.set_can_eco(d.profile.writable("eco"));
+        self.ui.set_can_sleep(d.profile.writable("sleep"));
+        self.ui.set_can_heater(d.profile.writable("heater"));
+        self.ui.set_can_dryer(d.profile.writable("dryer"));
+        if d.model == miot::EXPECT_MODEL {
+            self.ui.set_energy_unit(" kWh".into());
+            self.ui.set_energy_hint("累计用电量 · 详见电量统计".into());
+        } else {
+            self.ui.set_energy_unit("".into());
+            self.ui.set_energy_hint(if d.profile.properties.get("electricity").is_some_and(|p| p.readable) {
+                "设备上报值 · 单位未确认".into()
+            } else { "该型号未公开电量读数".into() });
+        }
+        self.ui.set_prop_name_list(ModelRc::new(VecModel::from(d.profile.properties.keys().cloned().map(Into::into).collect::<Vec<slint::SharedString>>())));
+
         let mut lines = Vec::new();
         lines.push(format!(
             "名称：{}",
@@ -731,8 +871,11 @@ impl App {
         lines.push(format!(
             "型号：{}{}",
             if d.model.is_empty() { "—" } else { &d.model },
-            if d.model_matches { "" } else { "（⚠ 与目标机型不一致）" }
+            if d.model_matches { "" } else { "（尚未取得可用的型号规格）" }
         ));
+        if matches!(d.profile.spec_status.as_str(), "preview" | "debug") {
+            lines.push(format!("公开规格：{}（非正式版本，请以设备实际表现为准）", d.profile.spec_status));
+        }
         lines.push(format!(
             "did：{}",
             if d.did.is_empty() { "—" } else { &d.did }
@@ -783,8 +926,13 @@ impl App {
             ui.set_p_year("--".into());
             ui.set_p_today_h("--".into());
             ui.set_p_month_h("--".into());
-            ui.set_cal_title("电量使用".into());
+            ui.set_cal_title(if self.profile.model == miot::EXPECT_MODEL { "电量使用".into() } else { "该型号暂无历史电量统计".into() });
+            ui.set_cal_first_weekday(0);
+            ui.set_cal_days(0);
+            ui.set_cal_today(0);
+            ui.set_cal_max_milli(1);
             ui.set_cal_energy_milli(ModelRc::new(VecModel::from(Vec::<i32>::new())));
+            ui.set_month_energy(ModelRc::new(VecModel::from(Vec::<f32>::new())));
             return;
         };
 
@@ -913,7 +1061,7 @@ impl App {
                 a.ui.set_view(v);
                 match v {
                     1 => {
-                        if a.power.is_none() {
+                        if a.power.is_none() && a.profile.model == miot::EXPECT_MODEL {
                             wk.send(Command::PowerStats);
                         }
                     }
@@ -950,9 +1098,20 @@ impl App {
                 let a = &mut *app.borrow_mut();
                 if !a.connected {
                     a.toast(2, "尚未连接设备，无法开关机");
+                    a.refresh_view();
                     return;
                 }
-                let next = !a.prop_bool("on").unwrap_or(false);
+                if a.prop_bool("on").is_none() {
+                    a.toast(2, "尚未读到空调开关状态，请先刷新");
+                    a.refresh_view();
+                    return;
+                }
+                if a.power_on_in_flight.is_some() {
+                    a.toast(2, "电源指令正在执行，请稍候");
+                    a.refresh_view();
+                    return;
+                }
+                let next = !a.state_on();
                 a.add_log(format!("[操作] 电源 → {}", if next { "开机" } else { "关机" }));
                 a.power_on_in_flight = Some(next);
                 wk.send(Command::WriteProp {
@@ -967,16 +1126,26 @@ impl App {
             let app = app.clone();
             ui.on_set_target_temp(move |t: f32| {
                 let a = &mut *app.borrow_mut();
-                // 设备限制 16~31、步长 0.5：先取整再夹取
-                let v = ((t as f64 * 2.0).round() / 2.0).clamp(16.0, 31.0);
+                // 按自动识别的型号范围和步长取整
+                let v = a.profile.snap_temperature(t as f64);
                 if a.ui.get_target_temp() == v as f32 {
                     return;
                 }
                 if !a.connected {
                     // 拖动/滚轮会连续触发事件，未连接时只提示一次，
                     // 避免提示条和日志也被输入事件刷屏。
-                    if !a.target_temp.has_pending_input() {
-                        a.toast(2, "尚未连接设备，无法调温");
+                    let message = "尚未连接设备，无法调温";
+                    if !a.toasts.iter().any(|toast| toast.text == message) {
+                        a.toast(2, message);
+                        a.refresh_view();
+                    }
+                    return;
+                }
+                if a.prop_bool("on").is_none() {
+                    let message = "尚未读到空调开关状态，请先刷新";
+                    if !a.toasts.iter().any(|toast| toast.text == message) {
+                        a.toast(2, message);
+                        a.refresh_view();
                     }
                     return;
                 }
@@ -1048,7 +1217,17 @@ impl App {
             let wk = worker.clone();
             ui.on_set_preset(move |t: f32| {
                 let a = &mut *app.borrow_mut();
-                let temp = t as f64;
+                if !a.connected {
+                    a.toast(2, "尚未连接设备，无法应用预设温度");
+                    a.refresh_view();
+                    return;
+                }
+                if a.prop_bool("on").is_none() {
+                    a.toast(2, "尚未读到空调开关状态，请先刷新");
+                    a.refresh_view();
+                    return;
+                }
+                let temp = a.profile.snap_temperature(t as f64);
                 a.target_temp.preset(temp, Instant::now());
                 let powered_on = a.state_on();
                 let connected = a.connected;
@@ -1108,9 +1287,9 @@ impl App {
                 }
                 a.settings.auto_refresh = v;
                 a.ui.set_auto_refresh(v);
-                a.add_log(format!("[设置] 自动更新 → {v}"));
+                a.add_log(format!("[设置] 自动刷新 → {v}"));
                 if let Err(e) = a.settings_writer.save(&a.settings) {
-                    eprintln!("[设置] 保存自动更新失败：{e}");
+                    eprintln!("[设置] 保存自动刷新失败：{e}");
                 }
                 // The switch already has its new value. Rebuilding all page
                 // models here delays the click's first painted frame.
@@ -1168,9 +1347,9 @@ impl App {
             let wk = worker.clone();
             ui.on_raw_read(move || {
                 let a = &mut *app.borrow_mut();
-                let names = demo::prop_names();
+                let names: Vec<_> = a.profile.properties.keys().cloned().collect();
                 let selected = names.get(a.selected_prop).cloned().unwrap_or_default();
-                match miot::prop_addr(&selected) {
+                match a.profile.addr(&selected) {
                     Some((siid, piid)) => {
                         a.add_log(format!("[操作] 读取原始属性 {selected}（{siid}.{piid}）"));
                         wk.send(Command::RawRead { siid, piid });
@@ -1186,10 +1365,10 @@ impl App {
             let wk = worker.clone();
             ui.on_raw_write(move || {
                 let a = &mut *app.borrow_mut();
-                let names = demo::prop_names();
+                let names: Vec<_> = a.profile.properties.keys().cloned().collect();
                 let selected = names.get(a.selected_prop).cloned().unwrap_or_default();
                 let text = a.ui.get_raw_value().to_string();
-                let Some((siid, piid)) = miot::prop_addr(&selected) else {
+                let Some((_siid, _piid)) = a.profile.addr(&selected) else {
                     a.toast(2, "请先选择一个属性");
                     return;
                 };
@@ -1208,7 +1387,7 @@ impl App {
                     }
                 };
                 a.add_log(format!("[操作] 写入 {selected}={value}"));
-                wk.send(Command::RawWrite { siid, piid, value });
+                wk.send(Command::WriteProp { name: selected, value });
                 a.refresh_view();
             });
         }
@@ -1261,7 +1440,7 @@ impl App {
             let app = app.clone();
             ui.on_select_prop(move |index: i32| {
                 let a = &mut *app.borrow_mut();
-                if index >= 0 && (index as usize) < demo::prop_names().len() {
+                if index >= 0 && (index as usize) < a.profile.properties.len() {
                     a.selected_prop = index as usize;
                     a.ui.set_selected_prop(index);
                     a.refresh_view();
@@ -1571,11 +1750,12 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             let now = Instant::now();
             let connected = a.connected;
-            let powered_on = a.state_on();
-            if let Some(command) = a.target_temp.poll(now, connected, powered_on) {
-                a.dispatch_target_temp(command, &tick_worker);
-                // Temperature was painted in the input callback; dispatching
-                // it must not rebuild unrelated page models on every burst.
+            if let Some(powered_on) = a.prop_bool("on") {
+                if let Some(command) = a.target_temp.poll(now, connected, powered_on) {
+                    a.dispatch_target_temp(command, &tick_worker);
+                    // Temperature was painted in the input callback; dispatching
+                    // it must not rebuild unrelated page models on every burst.
+                }
             }
         }
 
@@ -1607,7 +1787,10 @@ fn main() -> Result<(), slint::PlatformError> {
                     // a snapshot in front of the newest value; the worker is
                     // serial, so that stale read would otherwise add one full
                     // network round trip before the next temperature write.
-                    && !a.target_temp.blocks_snapshot()
+                    && (!a.target_temp.blocks_snapshot()
+                        || (a.prop_bool("on").is_none() && a.target_temp.has_pending_input()))
+                    && a.power_on_in_flight.is_none()
+                    && a.last_snapshot_error.is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
                     && tick_count % (5 * secs) == 0
                 {
                     a.request_snapshot(&tick_worker);
@@ -1697,25 +1880,30 @@ fn main() -> Result<(), slint::PlatformError> {
                         .try_borrow()
                         .map(|a| a.connected)
                         .unwrap_or(false);
-                    if connected {
+                    let power_busy = tick_app.try_borrow().map(|a| a.power_on_in_flight.is_some()).unwrap_or(true);
+                    if connected && !power_busy {
                         let next = tick_app
                             .try_borrow()
                             .ok()
                             .and_then(|a| a.prop_bool("on"))
-                            .map(|on| !on)
-                            .unwrap_or(true);
-                        if let Ok(mut a) = tick_app.try_borrow_mut() {
-                            a.power_on_in_flight = Some(next);
-                            a.add_log(format!(
-                                "[托盘] 电源 → {}",
-                                if next { "开机" } else { "关机" }
-                            ));
+                            .map(|on| !on);
+                        if let Some(next) = next {
+                            if let Ok(mut a) = tick_app.try_borrow_mut() {
+                                a.power_on_in_flight = Some(next);
+                                a.add_log(format!(
+                                    "[托盘] 电源 → {}",
+                                    if next { "开机" } else { "关机" }
+                                ));
+                                a.refresh_view();
+                                tick_worker.send(Command::WriteProp {
+                                    name: "on".into(),
+                                    value: serde_json::Value::Bool(next),
+                                });
+                            }
+                        } else if let Ok(mut a) = tick_app.try_borrow_mut() {
+                            a.toast(2, "尚未读到空调开关状态，请先刷新");
                             a.refresh_view();
                         }
-                        tick_worker.send(Command::WriteProp {
-                            name: "on".into(),
-                            value: serde_json::Value::Bool(next),
-                        });
                     } else if let Ok(mut a) = tick_app.try_borrow_mut() {
                         a.toast(2, "尚未连接设备，托盘开机/关机不可用");
                         a.refresh_view();
@@ -1923,4 +2111,79 @@ fn run_self_test(app: &AppRef) -> Result<(), slint::PlatformError> {
 
     let _ = ui.run();
     Ok(())
+}
+
+
+// A successful write acknowledgement remains usable when the follow-up read
+// times out. Never assume a failed or merely queued write changed the device.
+fn acknowledge_power(props: &mut Vec<(&'static str, PropValue)>, acknowledged: Option<bool>) {
+    if let Some(on) = acknowledged {
+        props.retain(|(name, _)| *name != "on");
+        props.push(("on", PropValue::Ok(serde_json::json!(on))));
+    }
+}
+
+fn forget_power_state(props: &mut Vec<(&'static str, PropValue)>) {
+    props.retain(|(name, _)| *name != "on");
+}
+
+fn diagnostic_label(name: &str) -> &str {
+    match name {
+        "indoorPipeTemp" => "indoorPipeTemp/室内盘管温度",
+        "indoorFanSpeed" => "indoorFanSpeed/室内风机转速",
+        "outdoorTemp" => "outdoorTemp/室外温度",
+        "outdoorPipeTemp" => "outdoorPipeTemp/室外盘管温度",
+        "compressorFreq" => "compressorFreq/压缩机频率",
+        "outdoorCurrent" => "outdoorCurrent/室外机电流",
+        "outdoorVoltage" => "outdoorVoltage/室外机电压",
+        "runDuration" => "runDuration/累计运行时长",
+        _ => name,
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_label_tests {
+    use super::diagnostic_label;
+
+    #[test]
+    fn all_machine_diagnostic_names_have_chinese_translations() {
+        for name in miac_core::miot::DIAG_PROPS {
+            assert!(diagnostic_label(name).starts_with(&format!("{name}/")), "{name}");
+        }
+        assert_eq!(diagnostic_label("unknownProperty"), "unknownProperty");
+    }
+}
+
+#[cfg(test)]
+mod power_regression_tests {
+    use super::*;
+
+    #[test]
+    fn successful_on_ack_allows_off_even_without_followup_snapshot() {
+        let mut props = vec![("on", PropValue::Ok(serde_json::json!(false))),
+            ("electricity", PropValue::Ok(serde_json::json!(41.82)))];
+        acknowledge_power(&mut props, Some(true));
+        let on = props.iter().find(|(name, _)| *name == "on").unwrap().1.as_bool().unwrap();
+        assert!(!(!on), "next toggle must send false, not another power-on");
+        assert_eq!(props.len(), 2);
+        acknowledge_power(&mut props, Some(false));
+        assert_eq!(props.iter().find(|(name, _)| *name == "on").unwrap().1.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn missing_ack_does_not_invent_a_power_state() {
+        let mut props = vec![];
+        acknowledge_power(&mut props, None);
+        assert!(props.is_empty());
+    }
+
+    #[test]
+    fn failed_power_write_discards_stale_state_but_keeps_other_readings() {
+        let mut props = vec![("on", PropValue::Ok(serde_json::json!(false))),
+            ("electricity", PropValue::Ok(serde_json::json!(41.82)))];
+        forget_power_state(&mut props);
+        assert!(props.iter().all(|(name, _)| *name != "on"));
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].1.as_f64(), Some(41.82));
+    }
 }

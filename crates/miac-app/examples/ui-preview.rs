@@ -14,8 +14,22 @@ fn strings(values: &[&str]) -> ModelRc<SharedString> {
     .into()
 }
 fn fixture(ui: &MainWindow) {
+    let p = miac_core::profile::Profile::legacy();
+    let choices = |key: &str| ModelRc::new(VecModel::from(p.properties[key].choices.iter().map(|(v,n)| ControlChoice { value: *v as i32, label: n.clone().into() }).collect::<Vec<_>>()));
+    ui.set_mode_options(choices("mode"));
+    ui.set_fan_options(choices("fanLevel"));
+    ui.set_extended_controls(true);
+    ui.set_can_vswing(true);
+    ui.set_can_hswing(true);
+    ui.set_can_eco(true);
+    ui.set_can_sleep(true);
+    ui.set_can_heater(true);
+    ui.set_can_dryer(true);
+    ui.set_can_light(true);
+    ui.set_can_buzzer(true);
     ui.set_device_name("米家空调 · 离线预览".into());
     ui.set_connected(true);
+    ui.set_power_known(true);
     ui.set_not_ready_reason("".into());
     ui.set_dark_theme(false);
     ui.set_room_temp("29.0".into());
@@ -50,26 +64,24 @@ fn fixture(ui: &MainWindow) {
         .into(),
     );
     ui.set_diag_labels(strings(&[
-        "室内温度",
-        "室外温度",
-        "压缩机频率",
-        "室内盘管",
-        "室外盘管",
-        "排气温度",
-        "运行功率",
-        "电流",
-        "累计运行",
+        "indoorPipeTemp/室内盘管温度",
+        "indoorFanSpeed/室内风机转速",
+        "outdoorTemp/室外温度",
+        "outdoorPipeTemp/室外盘管温度",
+        "compressorFreq/压缩机频率",
+        "outdoorCurrent/室外机电流",
+        "outdoorVoltage/室外机电压",
+        "runDuration/累计运行时长",
     ]));
     ui.set_diag_values(strings(&[
-        "29.0°C",
-        "32.0°C",
-        "42 Hz",
-        "12.0°C",
-        "38.0°C",
-        "48.0°C",
-        "620 W",
-        "2.8 A",
-        "128 小时",
+        "23.9",
+        "0",
+        "13",
+        "12",
+        "0.0",
+        "0.0",
+        "225.0",
+        "278.6",
     ]));
     ui.set_clean_text("待机".into());
     ui.set_examine_text("未运行".into());
@@ -456,6 +468,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_toasts(Rc::new(VecModel::from(notices)).into());
     capture("bottom-alignment-stacked.png", 1160, 720)?;
     println!("UI checks passed: temperature, auto-refresh, settings themes, close choices, remember, cancel, navigation, raw input");
+    ui.set_toasts(ModelRc::default());
+    let p = miac_core::profile::Profile::parse("xiaomi.aircondition.ma7", &miac_core::profile::bundled_specs()["xiaomi.aircondition.ma7"])?;
+    let [min,max,step] = p.temperature_range();
+    ui.set_device_name("卧室空调 · 自动识别示例".into());
+    ui.set_energy_unit("".into());
+    ui.set_energy_hint("该型号未公开电量读数".into());
+    ui.set_temp_min(min as f32);
+    ui.set_temp_max(max as f32);
+    ui.set_temp_step(step as f32);
+    ui.set_target_temp(31.0);
+    ui.set_extended_controls(false);
+    let choices = |key: &str| ModelRc::new(VecModel::from(p.properties[key].choices.iter().map(|(v,n)| ControlChoice { value: *v as i32, label: n.clone().into() }).collect::<Vec<_>>()));
+    ui.set_mode_options(choices("mode"));
+    ui.set_fan_options(choices("fanLevel"));
+    ui.set_can_vswing(p.writable("verticalSwing"));
+    ui.set_can_hswing(p.writable("horizontalSwing"));
+    ui.set_can_eco(p.writable("eco"));
+    ui.set_can_sleep(p.writable("sleep"));
+    ui.set_can_heater(p.writable("heater"));
+    ui.set_can_dryer(p.writable("dryer"));
+    capture("alternate-model.png", 1440, 1100)?;
+    click(801.0, 417.0);
+    assert_eq!(ui.get_target_temp(), 32.0, "alternate model uses 1 degree step and 32 degree limit");
+    click(801.0, 417.0);
+    assert_eq!(ui.get_target_temp(), 32.0);
+    click(407.0, 417.0);
+    assert_eq!(ui.get_target_temp(), 31.0);
+    println!("Alternate-model UI checks passed");
     ui.hide()?;
     Ok(())
 }

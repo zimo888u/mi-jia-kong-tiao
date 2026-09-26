@@ -1,33 +1,80 @@
 @echo off
-@chcp 65001 >nul
-setlocal
+chcp 65001 >nul
+setlocal EnableExtensions DisableDelayedExpansion
+set "failed=0"
+set "testmode=0"
+if /i "%~1"=="--test" goto testmode
+goto start
 
-rem 双击运行：结束米家空调并清理凭据、设置、缓存和日志。
-rem 删除后需重新扫码登录；此脚本不删除程序文件或项目源码。
+:testmode
+rem A copied script and marker are required for isolated tests.
+if not exist "%~dp0.cleanup-test-root" exit /b 2
+set "testmode=1"
+set "APPDATA=%~dp0roaming"
+set "LOCALAPPDATA=%~dp0local"
 
-taskkill /f /im miac-app.exe >nul 2>&1
-taskkill /f /im miac-cli.exe >nul 2>&1
+:start
+echo 仅清理米家空调数据；保留 EXE、源码和其他文件。
+echo 删除的凭据不可恢复，完成后需重新扫码登录。
+if "%testmode%"=="1" goto clean
+call :stop "miac-app.exe"
+call :stop "miac-cli.exe"
+call :stop "米家空调.exe"
+if "%failed%"=="1" goto finish
 
-rem 默认应用数据（当前 Rust 版与旧版 Electron 客户端）。
-rd /s /q "%APPDATA%\米家空调" >nul 2>&1
-rd /s /q "%LOCALAPPDATA%\米家空调" >nul 2>&1
+:clean
+if not defined APPDATA goto invalid
+if not defined LOCALAPPDATA goto invalid
+rem Delete only the exact named application subdirectories.
+for %%P in ("%APPDATA%" "%LOCALAPPDATA%") do if not "%%~fP"=="%%~dP\" call :remove_app_dir "%%~fP\米家空调"
+call :portable "%~dp0."
+call :portable "%~dp0dist"
+call :portable "%~dp0target\debug"
+call :portable "%~dp0target\release"
+goto finish
 
-rem 兼容旧版便携包：清理脚本所在项目目录及 dist 目录旁的凭据和日志。
-for %%D in ("%~dp0" "%~dp0dist") do (
-    del /f /q "%%~fD\device.json" >nul 2>&1
-    del /f /q "%%~fD\cloud-session.json" >nul 2>&1
-    del /f /q "%%~fD\thermometer.json" >nul 2>&1
-    del /f /q "%%~fD\settings.json" >nul 2>&1
-    del /f /q "%%~fD\credentials.json" >nul 2>&1
-    del /f /q "%%~fD\.device.json.*.tmp" >nul 2>&1
-    del /f /q "%%~fD\.cloud-session.json.*.tmp" >nul 2>&1
-    del /f /q "%%~fD\.thermometer.json.*.tmp" >nul 2>&1
-    del /f /q "%%~fD\.settings.json.*.tmp" >nul 2>&1
-    del /f /q "%%~fD\*.log" >nul 2>&1
+:invalid
+echo [失败] 无法确定当前用户的数据目录，已停止。
+set "failed=1"
+goto finish
+
+:stop
+tasklist /fi "IMAGENAME eq %~1" /nh 2>nul | find /i "%~1" >nul
+if errorlevel 1 exit /b
+taskkill /f /t /im "%~1"
+if errorlevel 1 set "failed=1"
+exit /b
+
+:remove_app_dir
+if not exist "%~1" exit /b
+echo [清理目录] "%~1"
+rd /s /q "%~1"
+if exist "%~1" (
+    echo [失败] 目录仍然存在："%~1"
+    set "failed=1"
 )
+exit /b
 
-rem 若启动时通过 MIAC_TRACE 指定了外部追踪日志，也一并删除。
-if not "%MIAC_TRACE%"=="" del /f /q "%MIAC_TRACE%" >nul 2>&1
+:portable
+if not exist "%~1\" exit /b
+rem Exact filenames only; never remove EXEs or the project directory.
+for %%F in (device.json cloud-session.json thermometer.json settings.json credentials.json) do call :remove_file "%~1\%%F"
+for %%F in ("%~1\.device.json.*.tmp" "%~1\.cloud-session.json.*.tmp" "%~1\.thermometer.json.*.tmp" "%~1\.settings.json.*.tmp" "%~1\*.log") do call :remove_file "%%~fF"
+exit /b
 
-echo 米家空调的日志、缓存、设置和凭据已清理。
-endlocal
+:remove_file
+if not exist "%~1" exit /b
+if exist "%~1\" exit /b
+echo [清理文件] "%~1"
+del /f /q /a "%~1"
+if exist "%~1" (
+    echo [失败] 文件仍然存在："%~1"
+    set "failed=1"
+)
+exit /b
+
+:finish
+echo.
+if "%failed%"=="0" (echo [成功] 已检查清理目标，EXE 和源码未删除。) else (echo [未完成] 上方有未删除项目，请关闭占用程序；若提示拒绝访问，可右键以管理员身份运行。)
+if "%testmode%"=="0" pause
+exit /b %failed%

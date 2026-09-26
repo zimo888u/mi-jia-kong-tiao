@@ -15,7 +15,7 @@ export component Card inherits Rectangle {
 
     background: Theme.panel;
     border-radius: Theme.radius;
-    border-width: 0px;
+    border-width: 1px;
     border-color: Theme.line-soft;
     // 标题行和内容行使用明确的内边距，避免卡片高度变化时选项整体漂移。
     height: content.preferred-height + 2 * 24px + (title == "" ? 0px : 40px);
@@ -56,6 +56,7 @@ export component SegButton inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
     in property <bool> accent: false;      // 「Max」「防直吹」这类强调项
+    in property <bool> power-icon: false;
     in property <length> min-w: 46px;
     callback clicked;
 
@@ -65,15 +66,15 @@ export component SegButton inherits Rectangle {
     min-width: min-w;
     preferred-width: min-w;
     border-radius: Theme.radius-sm;
-    background: active ? (accent ? Theme.accent : Theme.accent)
+    background: active ? Theme.accent
                        : (seg-touch.has-hover ? Theme.panel-hi : Theme.bg-soft);
-    border-width: 0px;
-    border-color: active ? Theme.accent : (accent ? Theme.accent-deep : Theme.line);
-    opacity: !active && accent ? 0.92 : 1.0;
+    border-width: 1px;
+    border-color: active ? Theme.accent : (seg-touch.has-hover ? Theme.line : Theme.line-soft);
 
     // 显式铺满按钮盒子；只设置 horizontal-alignment 会让不同字宽的中文
     // 文本按自己的 preferred-width 绘制，正是之前“选项偏移”的来源。
     label-text := Text {
+        visible: !root.power-icon;
         x: 0px;
         y: 0px;
         width: parent.width;
@@ -84,6 +85,38 @@ export component SegButton inherits Rectangle {
         font-weight: root.active ? 600 : 400;
         horizontal-alignment: center;
         vertical-alignment: center;
+    }
+
+    if root.power-icon : HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        alignment: center;
+        spacing: 6px;
+
+        VerticalLayout {
+            width: 16px;
+            height: root.height;
+            alignment: center;
+            Path {
+                width: 16px;
+                height: 16px;
+                commands: "M 12.4 4.3 A 6 6 0 1 1 3.6 4.3 M 8 1.5 L 8 8.5";
+                stroke: root.active ? Theme.on-accent : Theme.text-dim;
+                stroke-width: 1.8px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+        }
+        Text {
+            height: root.height;
+            text: root.label;
+            color: root.active ? Theme.on-accent : Theme.text-dim;
+            font-size: Theme.font-sm;
+            font-weight: root.active ? 600 : 400;
+            vertical-alignment: center;
+        }
     }
 
     seg-touch := TouchArea {
@@ -127,14 +160,16 @@ export component ToggleRow inherits Rectangle {
             alignment: center;
             Rectangle {
                 width: 38px;
-                height: 21px;
+                height: 22px;
                 border-radius: 11px;
                 background: root.on ? Theme.accent : Theme.line;
+                border-width: 1px;
+                border-color: root.on ? Theme.accent : Theme.line;
                 animate background { duration: 140ms; }
                 Rectangle {
-                    width: 15px; height: 15px;
-                    y: 3px;
-                    x: root.on ? parent.width - 18px : 3px;
+                    width: 16px; height: 16px;
+                    y: 2px;
+                    x: root.on ? parent.width - 19px : 2px;
                     border-radius: 8px;
                     background: #ffffff;
                     animate x { duration: 140ms; easing: ease-in-out; }
@@ -197,8 +232,9 @@ export component FlatButton inherits Rectangle {
         width: parent.width;
         height: parent.height;
         text: root.label;
-        color: root.danger ? (btn-touch.has-hover ? Theme.bg : Theme.red) : Theme.text-dim;
+        color: root.danger ? (btn-touch.has-hover ? Theme.bg : Theme.red) : Theme.text;
         font-size: Theme.font-sm;
+        font-weight: 600;
         horizontal-alignment: center;
         vertical-alignment: center;
     }

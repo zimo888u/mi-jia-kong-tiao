@@ -17,6 +17,7 @@ pub mod login;
 pub mod migration;
 pub mod miio;
 pub mod miot;
+pub mod profile;
 pub mod settings;
 pub mod tls;
 pub mod worker;

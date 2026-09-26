@@ -2,10 +2,15 @@ import { Theme } from "../theme.slint";
 import { Card, SegButton, ToggleRow, Metric } from "../common.slint";
 import { DialMath } from "../dial-math.slint";
 
+export struct ControlChoice { value: int, label: string }
+
 // Geometry uses degrees, matching Slint's trigonometric API. The ring consists
 // of small overlapping circles, so the software renderer needs no SVG assets.
 component TempDial inherits Rectangle {
     in property <float> value: 26;
+    in property <float> temp-min: 16;
+    in property <float> temp-max: 31;
+    in property <float> temp-step: 0.5;
     callback adjusted(float);
     width: 300px; height: 300px;
     background: transparent;
@@ -14,12 +19,12 @@ component TempDial inherits Rectangle {
         width: 12px; height: 12px; border-radius: 6px;
         x: 144px + DialMath.point-x((DialMath.tick-angle(i, 181) - 90), 126) * 1px;
         y: 144px + DialMath.point-y((DialMath.tick-angle(i, 181) - 90), 126) * 1px;
-        background: i <= round(DialMath.ratio(root.value, 16, 31) * 180) ? Theme.dial-fill : Theme.dial-track;
+        background: i <= round(DialMath.ratio(root.value, root.temp-min, root.temp-max) * 180) ? Theme.dial-fill : Theme.dial-track;
     }
     Rectangle {
         width: 20px; height: 20px; border-radius: 10px;
-        x: 140px + DialMath.point-x((DialMath.tick-angle(round(DialMath.ratio(root.value, 16, 31) * 180), 181) - 90), 126) * 1px;
-        y: 140px + DialMath.point-y((DialMath.tick-angle(round(DialMath.ratio(root.value, 16, 31) * 180), 181) - 90), 126) * 1px;
+        x: 140px + DialMath.point-x((DialMath.tick-angle(round(DialMath.ratio(root.value, root.temp-min, root.temp-max) * 180), 181) - 90), 126) * 1px;
+        y: 140px + DialMath.point-y((DialMath.tick-angle(round(DialMath.ratio(root.value, root.temp-min, root.temp-max) * 180), 181) - 90), 126) * 1px;
         background: Theme.accent; border-width: 3px; border-color: Theme.panel;
     }
     VerticalLayout {
@@ -27,7 +32,7 @@ component TempDial inherits Rectangle {
         alignment: center; spacing: 6px;
         Text { text: "设定温度"; color: Theme.text-mute; font-size: 12px; horizontal-alignment: center; }
         Text { text: root.value + "°"; color: Theme.accent; font-size: 64px; font-weight: 400; horizontal-alignment: center; }
-        Text { text: "拖动或滚轮调节 · 每档 0.5°C"; color: Theme.text-mute; font-size: 10px; horizontal-alignment: center; }
+        Text { text: "拖动或滚轮调节 · 每档 " + root.temp-step + "°C"; color: Theme.text-mute; font-size: 10px; horizontal-alignment: center; }
     }
     dial-touch := TouchArea {
         property <float> pressed-value: root.value;
@@ -35,10 +40,10 @@ component TempDial inherits Rectangle {
         pointer-event(event) => {
             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { self.pressed-value = root.value; }
         }
-        moved => { root.adjusted(max(16, min(31, round((self.pressed-value + (self.pressed-y - self.mouse-y) / 18px) * 2) / 2))); }
+        moved => { root.adjusted(max(root.temp-min, min(root.temp-max, root.temp-min + round((self.pressed-value - root.temp-min + (self.pressed-y - self.mouse-y) / 18px) / root.temp-step) * root.temp-step))); }
         scroll-event(e) => {
-            if e.delta-y > 0 { root.adjusted(min(31, root.value + 0.5)); }
-            else if e.delta-y < 0 { root.adjusted(max(16, root.value - 0.5)); }
+            if e.delta-y > 0 { root.adjusted(min(root.temp-max, root.value + root.temp-step)); }
+            else if e.delta-y < 0 { root.adjusted(max(root.temp-min, root.value - root.temp-step)); }
             accept
         }
     }
@@ -46,12 +51,28 @@ component TempDial inherits Rectangle {
 
 export component ControlPage inherits VerticalLayout {
     in property <float> target-temp: 26.0;
+    in property <string> device-name: "米家空调";
+    in property <float> temp-min: 16;
+    in property <float> temp-max: 31;
+    in property <float> temp-step: 0.5;
+    in property <[ControlChoice]> mode-options;
+    in property <[ControlChoice]> fan-options;
+    in property <bool> extended-controls: false;
+    in property <bool> can-vswing: false;
+    in property <bool> can-hswing: false;
+    in property <bool> can-eco: false;
+    in property <bool> can-sleep: false;
+    in property <bool> can-heater: false;
+    in property <bool> can-dryer: false;
     in property <bool> power-on: true;
+    in property <bool> power-known: false;
     in property <string> power-text: "运行中";
     in property <string> room-temp: "--";
     in property <string> sensor-temp: "--";
     in property <string> sensor-hum: "--";
     in property <string> energy-total: "--";
+    in property <string> energy-unit: "";
+    in property <string> energy-hint: "该型号未公开电量读数";
     in property <string> battery-text: "";
     in property <int> mode: 2;
     in property <int> fan: 0;
@@ -87,40 +108,37 @@ export component ControlPage inherits VerticalLayout {
             width: (root.width - Theme.gap) * 0.62;
             spacing: Theme.gap;
             Card {
-                title: "米家空调";
+                title: root.device-name;
                 hint: root.power-text;
                 HorizontalLayout {
                     height: 38px;
                     Text { text: "调到喜欢的温度，让舒适自然发生。"; color: Theme.text-mute; font-size: Theme.font-sm; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
-                    SegButton { label: root.power-on ? "⏻  已开机" : "⏻  已关机"; width: 140px; active: root.power-on; clicked => { root.toggle-power(); } }
+                    SegButton { label: !root.power-known ? "状态未知" : (root.power-on ? "已开机" : "已关机"); power-icon: true; width: 140px; active: root.power-on && root.power-known; clicked => { root.toggle-power(); } }
                 }
                 HorizontalLayout {
                     height: 310px; alignment: center; spacing: 24px;
-                    VerticalLayout { alignment: center; SegButton { label: "−"; min-w: 46px; clicked => { root.set-target-temp(max(16, root.target-temp - 0.5)); } } }
-                    Rectangle { width: 300px; height: 300px; TempDial { value: root.target-temp; adjusted(v) => { root.set-target-temp(v); } } }
-                    VerticalLayout { alignment: center; SegButton { label: "+"; min-w: 46px; clicked => { root.set-target-temp(min(31, root.target-temp + 0.5)); } } }
+                    VerticalLayout { alignment: center; SegButton { label: "−"; min-w: 46px; clicked => { root.set-target-temp(max(root.temp-min, root.target-temp - root.temp-step)); } } }
+                    Rectangle { width: 300px; height: 300px; TempDial { value: root.target-temp; temp-min: root.temp-min; temp-max: root.temp-max; temp-step: root.temp-step; adjusted(v) => { root.set-target-temp(v); } } }
+                    VerticalLayout { alignment: center; SegButton { label: "+"; min-w: 46px; clicked => { root.set-target-temp(min(root.temp-max, root.target-temp + root.temp-step)); } } }
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    SegButton { horizontal-stretch: 1; label: "制冷"; active: root.mode == 2; clicked => { root.set-mode(2); } }
-                    SegButton { horizontal-stretch: 1; label: "除湿"; active: root.mode == 3; clicked => { root.set-mode(3); } }
-                    SegButton { horizontal-stretch: 1; label: "送风"; active: root.mode == 4; clicked => { root.set-mode(4); } }
-                    SegButton { horizontal-stretch: 1; label: "制热"; active: root.mode == 5; clicked => { root.set-mode(5); } }
+                    for option in root.mode-options : SegButton { horizontal-stretch: 1; label: option.label; active: root.mode == option.value; clicked => { root.set-mode(option.value); } }
+                    if root.mode-options.length == 0 : Text { text: "该型号未公开可确认的模式档位"; color: Theme.text-mute; font-size: Theme.font-sm; }
                 }
             }
             Card {
                 title: "风随心动"; hint: "风速 · 摆风";
                 HorizontalLayout {
                     spacing: 6px;
-                    SegButton { label: "自动"; min-w: 58px; active: root.fan == 0; clicked => { root.set-fan(0); } }
-                    for i in 7 : SegButton { horizontal-stretch: 1; min-w: 32px; label: "" + (i + 1); active: root.fan == i + 1; clicked => { root.set-fan(i + 1); } }
-                    SegButton { label: "Max"; min-w: 46px; active: root.fan == 8; clicked => { root.set-fan(8); } }
+                    for option in root.fan-options : SegButton { horizontal-stretch: 1; min-w: 32px; label: option.label; active: root.fan == option.value; clicked => { root.set-fan(option.value); } }
+                    if root.fan-options.length == 0 : Text { text: "该型号未公开风速档位"; color: Theme.text-mute; font-size: Theme.font-sm; }
                 }
                 HorizontalLayout {
                     spacing: 12px;
-                    ToggleRow { horizontal-stretch: 1; label: "上下摆风"; on: root.vswing; toggled(v) => { root.set-toggle("verticalSwing", v); } }
-                    ToggleRow { horizontal-stretch: 1; label: "左右扫风"; on: root.hswing; toggled(v) => { root.set-toggle("horizontalSwing", v); } }
+                    if root.can-vswing : ToggleRow { horizontal-stretch: 1; label: "上下摆风"; on: root.vswing; toggled(v) => { root.set-toggle("verticalSwing", v); } }
+                    if root.can-hswing : ToggleRow { horizontal-stretch: 1; label: "左右扫风"; on: root.hswing; toggled(v) => { root.set-toggle("horizontalSwing", v); } }
                 }
             }
     // ── 温度预设 ──────────────────────────────────────────────
@@ -183,26 +201,26 @@ export component ControlPage inherits VerticalLayout {
             }
             Card {
                 title: "把舒适交给它";
-                ToggleRow { label: "ECO 节能"; on: root.eco; toggled(v) => { root.set-toggle("eco", v); } }
-                ToggleRow { label: "睡眠模式"; on: root.sleep; toggled(v) => { root.set-toggle("sleep", v); } }
-                ToggleRow { label: "辅助电热"; on: root.heater; toggled(v) => { root.set-toggle("heater", v); } }
-                ToggleRow { label: "干燥防霉"; on: root.dryer; toggled(v) => { root.set-toggle("dryer", v); } }
-                ToggleRow { label: "喜好模式"; on: root.favorite; toggled(v) => { root.set-toggle("favoriteOn", v); } }
-                ToggleRow { label: "风感开关"; on: root.wind-on; toggled(v) => { root.set-toggle("windSensation", v); } }
+                if root.can-eco : ToggleRow { label: "ECO 节能"; on: root.eco; toggled(v) => { root.set-toggle("eco", v); } }
+                if root.can-sleep : ToggleRow { label: "睡眠模式"; on: root.sleep; toggled(v) => { root.set-toggle("sleep", v); } }
+                if root.can-heater : ToggleRow { label: "辅助电热"; on: root.heater; toggled(v) => { root.set-toggle("heater", v); } }
+                if root.can-dryer : ToggleRow { label: "干燥防霉"; on: root.dryer; toggled(v) => { root.set-toggle("dryer", v); } }
+                if root.extended-controls : ToggleRow { label: "喜好模式"; on: root.favorite; toggled(v) => { root.set-toggle("favoriteOn", v); } }
+                if root.extended-controls : ToggleRow { label: "风感开关"; on: root.wind-on; toggled(v) => { root.set-toggle("windSensation", v); } }
             }
             Rectangle {
                 height: 168px; border-radius: Theme.radius; background: Theme.energy-bg;
                 VerticalLayout {
                     padding: 24px; spacing: 8px;
                     Text { text: "每一度，都心中有数"; color: Theme.energy-text; font-size: 18px; }
-                    Text { text: root.energy-total + " kWh"; color: Theme.energy-text; font-size: 32px; }
-                    Text { text: "累计用电量 · 详见电量统计"; color: Theme.energy-muted; font-size: Theme.font-xs; }
+                    Text { text: root.energy-total + root.energy-unit; color: Theme.energy-text; font-size: 32px; }
+                    Text { text: root.energy-hint; color: Theme.energy-muted; font-size: Theme.font-xs; }
                 }
             }
             Rectangle { vertical-stretch: 1; }
         }
     }
-    Card {
+    if root.extended-controls : Card {
         title: "精细风向"; hint: "让风停在喜欢的位置";
         HorizontalLayout {
             spacing: 8px;
@@ -215,7 +233,7 @@ export component ControlPage inherits VerticalLayout {
         }
     }
     // ── 定格 ──────────────────────────────────────────────────
-    HorizontalLayout {
+    if root.extended-controls : HorizontalLayout {
         spacing: Theme.gap;
         Card {
             title: "上下定格";

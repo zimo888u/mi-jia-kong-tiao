@@ -127,14 +127,15 @@ impl State {
         }
     }
 
-    pub fn snapshot(&mut self, actual: Option<f64>) -> bool {
+    pub fn snapshot(&mut self, actual: Option<f64>, step: f64) -> bool {
         if self.in_flight.is_some() || self.pending.is_some() {
             return false;
         }
         let Some(local) = self.override_temp else {
             return false;
         };
-        if actual.is_some_and(|value| (local - value).abs() <= 0.25) {
+        let tolerance = (step.abs() / 2.0).min(0.25);
+        if actual.is_some_and(|value| (local - value).abs() + 1e-6 < tolerance) {
             self.override_temp = None;
             return true;
         }
@@ -165,6 +166,18 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn tenth_degree_profile_does_not_accept_a_different_readback() {
+        let now = Instant::now();
+        let mut state = State::default();
+        state.input(26.3, now);
+        assert_eq!(state.poll(now + SETTLE_AFTER, true, true), Some(Command::WriteProp(26.3)));
+        let _ = state.finish_write(true, now + SETTLE_AFTER, true, true);
+        assert!(!state.snapshot(Some(26.1), 0.1));
+        assert_eq!(state.override_temp(), Some(26.3));
+        assert!(state.snapshot(Some(26.3), 0.1));
+    }
+
+    #[test]
     fn rapid_plus_minus_inputs_only_dispatch_the_final_temperature() {
         let start = Instant::now();
         let mut state = State::default();
@@ -172,7 +185,7 @@ mod tests {
             let now = start + Duration::from_millis(i * 10);
             state.input(if i % 2 == 0 { 26.5 } else { 26.0 }, now);
             assert_eq!(state.poll(now, true, true), None);
-            assert!(!state.snapshot(Some(25.0)));
+            assert!(!state.snapshot(Some(25.0), 0.5));
         }
         let settled = start + Duration::from_millis(990) + SETTLE_AFTER;
         assert_eq!(state.override_temp(), Some(26.0));
@@ -233,7 +246,7 @@ mod tests {
             Some(Command::WriteProp(24.0))
         );
 
-        assert!(!state.snapshot(Some(24.0)));
+        assert!(!state.snapshot(Some(24.0), 0.5));
         assert!(state.blocks_snapshot());
         assert_eq!(state.override_temp(), Some(24.0));
     }

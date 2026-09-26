@@ -11,6 +11,9 @@ import { Theme } from "../theme.slint";
 import { Card, SegButton, ToggleRow, FlatButton, KvRow } from "../common.slint";
 
 export component DebugPage inherits VerticalLayout {
+    in property <bool> extended-controls: false;
+    in property <bool> can-light: false;
+    in property <bool> can-buzzer: false;
     in property <string> raw-addr: "—";
     in property <string> raw-prop-names: "";
     in-out property <string> raw-value: "";
@@ -149,38 +152,39 @@ export component DebugPage inherits VerticalLayout {
         title: "灯光、声音与效果"; background: Theme.sage-panel;
         GridLayout {
             spacing: 8px;
-            ToggleRow { col: 0; row: 0; horizontal-stretch: 1; label: "指示灯"; on: root.light-on; toggled(v) => { root.set-toggle("light", v); } }
-            ToggleRow { col: 0; row: 1; horizontal-stretch: 1; label: "提示音"; on: root.buzzer-on; toggled(v) => { root.set-toggle("buzzer", v); } }
+            ToggleRow { visible: root.can-light; col: 0; row: 0; horizontal-stretch: 1; label: "指示灯"; on: root.light-on; toggled(v) => { root.set-toggle("light", v); } }
+            ToggleRow { visible: root.can-buzzer; col: 0; row: 1; horizontal-stretch: 1; label: "提示音"; on: root.buzzer-on; toggled(v) => { root.set-toggle("buzzer", v); } }
         }
+        if root.extended-controls : VerticalLayout {
         Text { text: "指示灯亮度"; color: Theme.text-mute; font-size: Theme.font-xs; }
         HorizontalLayout {
             spacing: 6px;
-            SegButton { label: "自动"; min-w: 58px; active: root.bright == 0; clicked => { root.set-bright(0); } }
-            SegButton { label: "中亮"; min-w: 58px; active: root.bright == 1; clicked => { root.set-bright(1); } }
-            SegButton { label: "高亮"; min-w: 58px; active: root.bright == 2; clicked => { root.set-bright(2); } }
-            Rectangle { horizontal-stretch: 1; }
+            SegButton { label: "自动"; min-w: 58px; horizontal-stretch: 1; active: root.bright == 0; clicked => { root.set-bright(0); } }
+            SegButton { label: "中亮"; min-w: 58px; horizontal-stretch: 1; active: root.bright == 1; clicked => { root.set-bright(1); } }
+            SegButton { label: "高亮"; min-w: 58px; horizontal-stretch: 1; active: root.bright == 2; clicked => { root.set-bright(2); } }
         }
         Text { text: "制冷效果（1 弱 → 5 强）"; color: Theme.text-mute; font-size: Theme.font-xs; }
         HorizontalLayout {
             spacing: 6px;
             for i in 5 : SegButton {
                 label: "" + (i + 1);
-                width: 48px;
+                min-w: 48px;
+                horizontal-stretch: 1;
                 active: root.effect-cool == i + 1;
                 clicked => { root.set-effect("cool", i + 1); }
             }
-            Rectangle { horizontal-stretch: 1; }
         }
         Text { text: "制热效果（1 弱 → 5 强）"; color: Theme.text-mute; font-size: Theme.font-xs; }
         HorizontalLayout {
             spacing: 6px;
             for i in 5 : SegButton {
                 label: "" + (i + 1);
-                width: 48px;
+                min-w: 48px;
+                horizontal-stretch: 1;
                 active: root.effect-heat == i + 1;
                 clicked => { root.set-effect("heat", i + 1); }
             }
-            Rectangle { horizontal-stretch: 1; }
+        }
         }
     }
             Rectangle { vertical-stretch: 1; }
