@@ -83,6 +83,7 @@ fn fixture(ui: &MainWindow) {
         "225.0",
         "278.6",
     ]));
+    ui.set_diag_units(strings(&["℃", "rpm", "℃", "℃", "Hz", "A", "V", "小时"]));
     ui.set_clean_text("待机".into());
     ui.set_examine_text("未运行".into());
     ui.set_run_text("128 小时".into());
@@ -111,6 +112,8 @@ fn fixture(ui: &MainWindow) {
         "设备名称    米家空调\n设备型号    xiaomi.airc.h53h00\n连接方式    局域网直连".into(),
     );
     ui.set_credentials_dir("%APPDATA%\\米家空调".into());
+    ui.set_credentials_status_title("离线预览：未检查本机凭据".into());
+    ui.set_credentials_status_detail("真实程序会自动加密新登录凭据，并在启动时升级可读的旧凭据；预览不会访问本机文件。".into());
     ui.set_migration_summary("离线预览：不读取或修改本机配置。".into());
     ui.set_log_text("14:32:06  设备状态更新成功\n14:32:00  已切换到局域网直连\n14:31:58  温湿度计已连接\n14:31:55  已载入本地设备配置".into());
     ui.set_about_text("mi / 米家空调 v2\n轻一点，也舒适一点。".into());
@@ -226,6 +229,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     slint::platform::set_platform(Box::new(Headless(window.clone())))?;
     let ui = MainWindow::new()?;
     fixture(&ui);
+    let export_clicks = Rc::new(std::cell::Cell::new(0));
+    let count = export_clicks.clone();
+    ui.on_export_log(move || count.set(count.get() + 1));
     ui.show()?;
     let output = PathBuf::from(args.first().map(String::as_str).unwrap_or("/tmp/miac-ui"));
     std::fs::create_dir_all(&output)?;
@@ -388,6 +394,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(ui.get_view(), view, "sidebar navigation");
         draw();
     }
+    ui.set_view(4);
+    draw();
+    click(820.0, 823.0);
+    assert_eq!(export_clicks.get(), 1, "export log button callback");
     ui.set_view(3);
     draw();
     ui.set_raw_value("".into());
@@ -418,6 +428,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         encoder.write_header()?.write_image_data(pixels.as_bytes())?;
         Ok(())
     };
+    ui.set_view(0);
+    ui.set_auto_refresh(false);
+    capture("auto-refresh-off-light.png", 1440, 1100)?;
+    ui.set_dark_theme(true);
+    capture("auto-refresh-off-dark.png", 1440, 1100)?;
+    ui.set_auto_refresh(true);
+    ui.set_dark_theme(false);
     ui.set_view(4);
     ui.set_connected(false);
     ui.set_not_ready_reason("未连接设备".into());
@@ -467,7 +484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     capture("bottom-alignment-single.png", 1440, 960)?;
     ui.set_toasts(Rc::new(VecModel::from(notices)).into());
     capture("bottom-alignment-stacked.png", 1160, 720)?;
-    println!("UI checks passed: temperature, auto-refresh, settings themes, close choices, remember, cancel, navigation, raw input");
+    println!("UI checks passed: temperature, auto-refresh, export-log, settings themes, close choices, remember, cancel, navigation, raw input");
     ui.set_toasts(ModelRc::default());
     let p = miac_core::profile::Profile::parse("xiaomi.aircondition.ma7", &miac_core::profile::bundled_specs()["xiaomi.aircondition.ma7"])?;
     let [min,max,step] = p.temperature_range();

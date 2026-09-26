@@ -32,7 +32,7 @@ use crate::settings::{Settings, FILE_SETTINGS};
 /// 迁移过程中做完的每一件事，供界面展示「已从旧版继承了哪些东西」。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Migrated {
-    /// 复制了一个凭据文件（文件名, 来源目录）
+    /// 加密继承了一个凭据文件（文件名, 来源目录）
     Credential { file: String, from: PathBuf },
     /// 继承到旧版的明暗主题
     Theme { dark: bool },
@@ -113,9 +113,9 @@ pub fn run(creds: &Credentials, settings: &mut Settings) -> MigrationReport {
 
     report.ran = true;
 
-    // ── 1. 凭据：从旧位置复制到主目录 ──────────────────────────
-    // credentials 的读取本来就会回退查找旧目录，所以即使不复制也能用；
-    // 这里显式复制一份，是为了让 v2 之后能独立写入（例如 DPAPI 加密版）。
+    // ── 1. 凭据：从旧位置加密迁入主目录 ────────────────────────
+    // 读取旧位置后直接加密写入主目录，绝不把旧明文原样复制成新副本。
+    // 旧位置可能仍有原文件；迁移不擅自删除用户的旧版数据。
     for file in CREDENTIAL_FILES {
         let Some(src) = creds.locate(file) else { continue };
         let dst = creds.primary_dir().join(file);
@@ -126,23 +126,20 @@ pub fn run(creds: &Credentials, settings: &mut Settings) -> MigrationReport {
         }
 
         let Some(from_dir) = src.parent().map(Path::to_path_buf) else { continue };
-        if std::fs::create_dir_all(creds.primary_dir()).is_err() {
+        let Some(value) = creds.read_json::<serde_json::Value>(file) else {
+            eprintln!("[迁移] {file} 无法读取，未创建新副本");
+            continue;
+        };
+        if !value.is_object() {
+            eprintln!("[迁移] {file} 不是有效的凭据对象，未创建新副本");
             continue;
         }
-        // 复制后的凭据必须立即收紧权限。失败时移除这份新副本，继续从旧位置只读，
-        // 绝不能为了迁移而在新目录留下权限未知的敏感文件。
-        match std::fs::copy(&src, &dst) {
+        match creds.write_json(file, &value) {
             Ok(_) => {
-                #[cfg(windows)]
-                if let Err(e) = crate::credentials::harden_permissions(&dst) {
-                    let _ = std::fs::remove_file(&dst);
-                    eprintln!("[迁移] 收紧 {file} 权限失败，已移除新副本：{e}");
-                    continue;
-                }
                 report.actions.push(Migrated::Credential { file: file.to_string(), from: from_dir });
             }
             Err(e) => {
-                eprintln!("[迁移] 复制 {file} 失败（不影响读取）：{e}");
+                eprintln!("[迁移] 加密迁移 {file} 失败（不影响旧位置读取）：{e}");
             }
         }
     }

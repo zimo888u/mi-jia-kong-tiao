@@ -33,6 +33,7 @@ mod tray;
 
 mod target_temp;
 mod settings_writer;
+mod log_export;
 mod window_config;
 #[cfg(windows)]
 mod single_instance;
@@ -154,6 +155,9 @@ impl App {
         // ── 首次启动迁移（第 5 阶段）────────────────────────────
         let mut settings = Settings::load(&creds);
         let report = migration::run(&creds, &mut settings);
+        // 旧明文和旧版 DPAPI 凭据在启动时自动升级；失败的文件保持原样，
+        // 让用户仍可重试登录，不把设置开关当作加密成功的证明。
+        let upgrade_report = creds.upgrade_existing();
 
         // 凭据目录已确定，可以起两个线程了：
         //   worker 负责控制通道（读 device.json 决定局域网/云端）
@@ -208,7 +212,6 @@ impl App {
             let dark = a.settings.dark;
             let transport = a.settings.transport;
             let auto = a.settings.auto_refresh;
-            let encrypted = a.settings.encrypt_credentials;
             let summary = report.summary();
 
             a.push_static_data();
@@ -218,9 +221,15 @@ impl App {
             ));
             a.add_log(format!("[启动] 凭据目录 {dir}"));
             a.add_log(format!("[迁移] {summary}"));
+            if upgrade_report.upgraded > 0 {
+                a.add_log(format!("[凭据] 已自动升级 {} 个凭据文件为 Windows 用户级加密", upgrade_report.upgraded));
+            }
+            for error in &upgrade_report.failures {
+                a.add_log(format!("[凭据] 自动升级未完成：{error}"));
+            }
             a.ui.set_migration_summary(summary.into());
             a.ui.set_credentials_dir(dir.into());
-            a.ui.set_credentials_encrypted(encrypted);
+            a.sync_credential_status();
             a.ui.set_dark_theme(dark);
             a.ui.set_transport_mode(transport);
             a.ui.set_auto_refresh(auto);
@@ -244,6 +253,38 @@ impl App {
     }
 
     /// 把当前状态推进界面。
+    fn sync_credential_status(&self) {
+        let status = self.creds.protection_status();
+        let encrypted = status.active_files_protected();
+        let (title, mut detail) = if status.present == 0 {
+            (
+                "尚未保存本机凭据".to_string(),
+                "扫码登录后，凭据会自动使用当前 Windows 用户的 DPAPI 加密保存。".to_string(),
+            )
+        } else if status.unreadable > 0 {
+            (
+                "部分凭据无法读取".to_string(),
+                format!("有 {} 个凭据文件损坏或无法解密；请检查文件或重新登录。", status.unreadable),
+            )
+        } else if encrypted {
+            (
+                "当前凭据已加密".to_string(),
+                format!("已用当前 Windows 用户的 DPAPI 保护 {} 个凭据文件，自动连接不变。同一用户运行的程序仍可能解密。", status.current_format),
+            )
+        } else {
+            (
+                "部分凭据尚未升级加密".to_string(),
+                format!("{} 个明文、{} 个旧版 DPAPI 文件待升级；新登录会自动加密，也可点击下方按钮转换。", status.plaintext, status.old_dpapi),
+            )
+        };
+        if status.legacy_plaintext > 0 {
+            detail.push_str(&format!(" 另有 {} 个旧位置明文副本未自动删除，请确认不再使用旧版后手动清理。", status.legacy_plaintext));
+        }
+        self.ui.set_credentials_encrypted(encrypted);
+        self.ui.set_credentials_status_title(title.into());
+        self.ui.set_credentials_status_detail(detail.into());
+    }
+
     fn refresh_view(&self) {
         let ui = &self.ui;
 
@@ -355,13 +396,17 @@ impl App {
             .iter()
             .map(|(n, _)| slint::SharedString::from(diagnostic_label(n)))
             .collect();
-        let values: Vec<slint::SharedString> = self
+        let (values, units): (Vec<slint::SharedString>, Vec<slint::SharedString>) = self
             .diag
             .iter()
-            .map(|(_, v)| slint::SharedString::from(v.display()))
-            .collect();
+            .map(|(name, value)| {
+                let text = value.display();
+                (slint::SharedString::from(text.as_str()), slint::SharedString::from(diagnostic_unit(name, &text)))
+            })
+            .unzip();
         ui.set_diag_labels(ModelRc::new(VecModel::from(labels)));
         ui.set_diag_values(ModelRc::new(VecModel::from(values)));
+        ui.set_diag_units(ModelRc::new(VecModel::from(units)));
 
         if let Some((values, cleaning)) = self.maintenance.as_ref() {
             let get = |name: &str| {
@@ -707,14 +752,9 @@ impl App {
                     self.toast(3, format!("{op} 失败：{error}"));
                 }
                 Event::CredentialsEncrypted { ok, error } => {
+                    self.sync_credential_status();
                     if ok {
-                        self.settings.encrypt_credentials = true;
-                        self.ui.set_credentials_encrypted(true);
-                        if let Err(e) = self.settings_writer.save(&self.settings) {
-                            self.toast(3, format!("保存加密设置失败：{e}"));
-                        } else {
-                            self.toast(1, "凭据已改为 DPAPI 加密存储");
-                        }
+                        self.toast(1, "当前凭据已改为 Windows 用户级加密存储");
                     } else {
                         self.toast(3, format!(
                             "凭据加密失败：{}",
@@ -757,6 +797,7 @@ impl App {
                     self.login_status = "请选择要控制的设备".into();
                 }
                 login_ui::LoginEvent::Saved { device, thermometer } => {
+                    self.sync_credential_status();
                     self.connected = false;
                     self.not_ready_reason = "正在连接新选择的空调…".into();
                     self.switching_device_id = Some(self.creds.read_device().map(|d| d.did).unwrap_or_default());
@@ -1394,6 +1435,34 @@ impl App {
 
         {
             let app = app.clone();
+            ui.on_export_log(move || {
+                // 快照先取出来，不在系统保存对话框期间持有 App 的可变借用。
+                let lines = app.borrow().log.clone();
+                match log_export::choose_path() {
+                    Ok(Some(path)) => {
+                        let result = log_export::save(&path, &lines);
+                        let a = &mut *app.borrow_mut();
+                        match result {
+                            Ok(()) => {
+                                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                                a.toast(0, format!("日志已导出：{name}"));
+                            }
+                            Err(e) => a.toast(2, format!("日志导出失败：{e}")),
+                        }
+                        a.refresh_view();
+                    }
+                    Ok(None) => {} // 用户取消，不生成文件，也不显示错误。
+                    Err(e) => {
+                        let a = &mut *app.borrow_mut();
+                        a.toast(2, format!("保存窗口打开失败：{e}"));
+                        a.refresh_view();
+                    }
+                }
+            });
+        }
+
+        {
+            let app = app.clone();
             let _wk = worker.clone();
             ui.on_clear_log(move || {
                 let a = &mut *app.borrow_mut();
@@ -1426,8 +1495,13 @@ impl App {
             let wk = worker.clone();
             ui.on_encrypt_credentials(move || {
                 let a = &mut *app.borrow_mut();
-                if a.settings.encrypt_credentials {
-                    a.toast(0, "凭据已经是 DPAPI 加密存储");
+                let status = a.creds.protection_status();
+                if status.present == 0 {
+                    a.toast(0, "尚未保存凭据，扫码登录后会自动加密");
+                    return;
+                }
+                if status.active_files_protected() {
+                    a.toast(0, "当前凭据已经是 Windows 用户级加密存储");
                     return;
                 }
                 wk.send(Command::EncryptCredentials);
@@ -2141,9 +2215,25 @@ fn diagnostic_label(name: &str) -> &str {
     }
 }
 
+fn diagnostic_unit(name: &str, value: &str) -> &'static str {
+    // 读取错误、缺失占位和非数字文本都不能附上物理单位。
+    if !value.trim().parse::<f64>().is_ok_and(f64::is_finite) {
+        return "";
+    }
+    match name {
+        "indoorPipeTemp" | "outdoorTemp" | "outdoorPipeTemp" => "℃",
+        "indoorFanSpeed" => "rpm",
+        "compressorFreq" => "Hz",
+        "outdoorCurrent" => "A",
+        "outdoorVoltage" => "V",
+        "runDuration" => "小时",
+        _ => "",
+    }
+}
+
 #[cfg(test)]
 mod diagnostic_label_tests {
-    use super::diagnostic_label;
+    use super::{diagnostic_label, diagnostic_unit};
 
     #[test]
     fn all_machine_diagnostic_names_have_chinese_translations() {
@@ -2151,6 +2241,27 @@ mod diagnostic_label_tests {
             assert!(diagnostic_label(name).starts_with(&format!("{name}/")), "{name}");
         }
         assert_eq!(diagnostic_label("unknownProperty"), "unknownProperty");
+    }
+
+    #[test]
+    fn only_numeric_diagnostic_readings_get_their_units() {
+        for (name, unit) in [
+            ("indoorPipeTemp", "℃"),
+            ("indoorFanSpeed", "rpm"),
+            ("outdoorTemp", "℃"),
+            ("outdoorPipeTemp", "℃"),
+            ("compressorFreq", "Hz"),
+            ("outdoorCurrent", "A"),
+            ("outdoorVoltage", "V"),
+            ("runDuration", "小时"),
+        ] {
+            assert_eq!(diagnostic_unit(name, "0"), unit, "{name}");
+            assert_eq!(diagnostic_unit(name, "23.8"), unit, "{name}");
+            for missing in ["--", "—", "err(-1)", "null", "NaN"] {
+                assert_eq!(diagnostic_unit(name, missing), "", "{name}: {missing}");
+            }
+        }
+        assert_eq!(diagnostic_unit("unknownProperty", "42"), "");
     }
 }
 

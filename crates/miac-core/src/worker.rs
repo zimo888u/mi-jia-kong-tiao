@@ -524,45 +524,17 @@ impl WorkerLoop {
 
             Command::EncryptCredentials => {
                 self.log("[凭据] 开始改用 DPAPI 加密存储…");
-                let mut done = 0;
-                let mut failed = Vec::new();
-
-                // device.json
-                if let Some(d) = self.creds.read_device() {
-                    match self.creds.write_json_maybe_encrypted(
-                        crate::credentials::FILE_DEVICE,
-                        &d,
-                        true,
-                    ) {
-                        Ok(_) => done += 1,
-                        Err(e) => failed.push(format!("device.json: {e}")),
-                    }
+                let report = self.creds.upgrade_existing();
+                let status = self.creds.protection_status();
+                let mut failed = report.failures;
+                if status.present == 0 && failed.is_empty() {
+                    failed.push("尚未找到可加密的凭据".into());
                 }
-                // cloud-session.json
-                if let Some(s) = self.creds.read_session() {
-                    match self.creds.write_json_maybe_encrypted(
-                        crate::credentials::FILE_SESSION,
-                        &s,
-                        true,
-                    ) {
-                        Ok(_) => done += 1,
-                        Err(e) => failed.push(format!("cloud-session.json: {e}")),
-                    }
+                if status.present > 0 && !status.active_files_protected() && failed.is_empty() {
+                    failed.push("加密后校验未通过，请检查凭据文件".into());
                 }
-                // thermometer.json
-                if let Some(t) = self.creds.read_thermometer() {
-                    match self.creds.write_json_maybe_encrypted(
-                        crate::credentials::FILE_THERMOMETER,
-                        &t,
-                        true,
-                    ) {
-                        Ok(_) => done += 1,
-                        Err(e) => failed.push(format!("thermometer.json: {e}")),
-                    }
-                }
-
                 if failed.is_empty() {
-                    self.log(format!("[凭据] 已加密 {done} 个文件（绑定当前 Windows 用户与本机）"));
+                    self.log(format!("[凭据] 已使用当前 Windows 用户的 DPAPI 加密 {} 个文件", status.current_format));
                     let _ = self.tx.send(Event::CredentialsEncrypted { ok: true, error: None });
                 } else {
                     let error = failed.join("；");

@@ -14,10 +14,10 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/miac-core", "crates/miac-app", "crates/miac-cli"]
+members = ["crates/miac-core", "crates/miac-app", "crates/miac-cli", "skills/miac-control"]
 
 [workspace.package]
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 rust-version = "1.92"
 authors = ["米家空调项目"]

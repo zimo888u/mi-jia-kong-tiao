@@ -51,7 +51,7 @@ pub struct Settings {
     /// 是否已经完成过首次迁移（避免每次启动都跑一遍）
     #[serde(default)]
     pub migrated: bool,
-    /// 是否已启用 DPAPI 加密存储凭据
+    /// 旧版本的显示标记；真实状态必须检查凭据文件，不能信任此字段。
     #[serde(default)]
     pub encrypt_credentials: bool,
 }

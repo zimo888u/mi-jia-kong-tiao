@@ -26,10 +26,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_Time",
+    "Win32_System_SystemInformation",
     "Win32_System_LibraryLoader",
     # 托盘图标走 Win32 Shell_NotifyIcon：单进程、不额外起进程，
     # 也不引入 tray-icon / muda 这类会拉进 GTK 生态的依赖
     "Win32_UI_Shell",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",

@@ -4,24 +4,15 @@
 //!
 //! - 三个文件：`device.json`（did/token/localip）、`cloud-session.json`、
 //!   `thermometer.json`
-//! - 写入目录：默认项目目录；打包版指向 `%APPDATA%\米家空调\`
-//! - **读取时先找主目录，再回退旧目录**，所以从命令行版配好之后装上图形版
-//!   会自动复用，不用重新登录
-//! - 写密文时先设 0600，再用 icacls 断掉继承权限，只留当前用户
+//! - 写入目录：打包版指向 `%APPDATA%\米家空调\`
+//! - 主目录没有文件时才回退旧目录，兼容旧版凭据
+//! - 三个敏感文件的所有新写入都使用当前 Windows 用户范围的 DPAPI
+//! - 写密文时用 icacls 收紧权限
 //!
 //! ## 与 v1 的差别：DPAPI
 //!
-//! v1 只靠文件权限保护明文 JSON。v2 在此基础上支持 Windows DPAPI：
-//! 用 `CryptProtectData` 把内容加密成只能由**当前 Windows 用户 + 当前电脑**
-//! 解开的密文。DPAPI 的密文里绑定了用户 SID 与机器密钥，拷到别的机器或
-//! 别的账户下都解不开，比单纯的文件权限强一档。
-//!
-//! 兼容策略（重要）：**读的时候两种格式都认**——
-//!   1. 先当明文 JSON 解析（v1 留下的文件）
-//!   2. 失败则当 DPAPI 密文解（v2 写的文件）
-//! 写的时候默认写明文（保持与 v1 互相可读），只有显式调用
-//! `write_encrypted` 才写 DPAPI 密文。这样新旧两版可以并存测试，
-//! 直到回归验证通过再统一切换到加密存储。
+//! 读取兼容 v1 明文和旧 DPAPI 密文；写入一律使用新版带文件名用途隔离的
+//! DPAPI 格式。用户级保护并不能抵御已经以同一 Windows 用户身份运行的恶意程序。
 
 use std::fs;
 use std::io::Write;
@@ -29,7 +20,19 @@ use std::path::{Path, PathBuf};
 
 use crate::cloud::CloudSession;
 
-/// 凭据文件名（装敏感信息，将来用 DPAPI 加密）。
+fn wipe_bytes(bytes: &mut [u8]) {
+    for byte in bytes {
+        unsafe { std::ptr::write_volatile(byte, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn is_json_object(bytes: &[u8]) -> bool {
+    bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{')
+        && serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok()
+}
+
+/// 凭据文件名（装敏感信息，写入时强制使用 DPAPI）。
 pub const FILE_DEVICE: &str = "device.json";
 pub const FILE_SESSION: &str = "cloud-session.json";
 pub const FILE_THERMOMETER: &str = "thermometer.json";
@@ -49,6 +52,62 @@ pub const ALL_FILES: [&str; 4] = [
     FILE_THERMOMETER,
     FILE_SETTINGS,
 ];
+
+/// 实际文件扫描结果，不依赖 settings.json 中的旧加密开关。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectionStatus {
+    pub present: usize,
+    pub current_format: usize,
+    pub old_dpapi: usize,
+    pub plaintext: usize,
+    pub unreadable: usize,
+    /// 回退目录里的旧明文副本；不会在不知情时删除或改写。
+    pub legacy_plaintext: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct UpgradeReport {
+    pub upgraded: usize,
+    pub failures: Vec<String>,
+}
+
+impl ProtectionStatus {
+    pub fn active_files_protected(self) -> bool {
+        self.present > 0 && self.current_format == self.present
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileProtection {
+    Plaintext,
+    Current,
+    OldDpapi,
+    Unreadable,
+}
+
+fn classify_file(file: &str, path: &Path) -> FileProtection {
+    let Ok(mut raw) = fs::read(path) else { return FileProtection::Unreadable };
+    if is_json_object(&raw) {
+        wipe_bytes(&mut raw);
+        return FileProtection::Plaintext;
+    }
+    let decrypted = crate::dpapi::unprotect_for(file, &raw).map(|mut plain| {
+        let valid = is_json_object(&plain);
+        wipe_bytes(&mut plain);
+        valid
+    }).unwrap_or(false);
+    let current = crate::dpapi::is_current_format(&raw);
+    wipe_bytes(&mut raw);
+    if decrypted {
+        if current {
+            FileProtection::Current
+        } else {
+            FileProtection::OldDpapi
+        }
+    } else {
+        FileProtection::Unreadable
+    }
+}
 
 /// `device.json` —— 空调的 did / token / localip。
 ///
@@ -196,23 +255,72 @@ impl Credentials {
         self.locate(file).is_some()
     }
 
-    /// 读取并解析为 JSON；找不到或坏掉都返回 None（调用方按「未配置」处理）。
-    pub fn read_json<T: serde::de::DeserializeOwned>(&self, file: &str) -> Option<T> {
-        // 每个候选文件都独立尝试明文与 DPAPI。主目录里留下半写入/损坏文件时，
-        // 不能因此遮住仍然有效的旧版回退凭据。
-        for dir in self.search_dirs() {
-            let Ok(raw) = fs::read(dir.join(file)) else { continue };
-            if let Ok(value) = serde_json::from_slice(&raw) {
-                return Some(value);
+    /// 只检查凭据文件本身，不把历史设置开关当作加密成功的证明。
+    pub fn protection_status(&self) -> ProtectionStatus {
+        let mut status = ProtectionStatus::default();
+        for file in CREDENTIAL_FILES {
+            if let Some(path) = self.locate(file) {
+                status.present += 1;
+                match classify_file(file, &path) {
+                    FileProtection::Plaintext => status.plaintext += 1,
+                    FileProtection::Current => status.current_format += 1,
+                    FileProtection::OldDpapi => status.old_dpapi += 1,
+                    FileProtection::Unreadable => status.unreadable += 1,
+                }
             }
-            #[cfg(windows)]
-            if let Some(plain) = crate::dpapi::unprotect(&raw) {
-                if let Ok(value) = serde_json::from_slice(&plain) {
-                    return Some(value);
+            for dir in &self.fallbacks {
+                let path = dir.join(file);
+                if path.is_file() && classify_file(file, &path) == FileProtection::Plaintext {
+                    status.legacy_plaintext += 1;
                 }
             }
         }
-        None
+        status
+    }
+
+    /// 把所有可读的旧明文/旧 DPAPI 凭据升级到当前格式，供启动和按钮复用。
+    /// 每个文件单独原子写入；损坏文件不会被覆盖，旧位置副本不会被删。
+    pub fn upgrade_existing(&self) -> UpgradeReport {
+        let mut report = UpgradeReport::default();
+        for file in CREDENTIAL_FILES {
+            let Some(path) = self.locate(file) else { continue };
+            if classify_file(file, &path) == FileProtection::Current {
+                continue;
+            }
+            let Some(value) = self.read_json::<serde_json::Value>(file) else {
+                report.failures.push(format!("{file} 无法读取或解密"));
+                continue;
+            };
+            if !value.is_object() {
+                report.failures.push(format!("{file} 不是有效的凭据对象"));
+                continue;
+            }
+            match self.write_json(file, &value) {
+                Ok(written) if classify_file(file, &written) == FileProtection::Current => {
+                    report.upgraded += 1;
+                }
+                Ok(_) => report.failures.push(format!("{file} 写入后校验失败")),
+                Err(e) => report.failures.push(format!("{file} 加密写入失败：{e}")),
+            }
+        }
+        report
+    }
+
+    /// 读取并解析为 JSON；找不到或坏掉都返回 None（调用方按「未配置」处理）。
+    pub fn read_json<T: serde::de::DeserializeOwned>(&self, file: &str) -> Option<T> {
+        // 主目录的文件若存在却损坏或无法解密，不退回到陈旧的旧版副本。
+        let path = self.locate(file)?;
+        let mut raw = fs::read(path).ok()?;
+        if let Ok(value) = serde_json::from_slice(&raw) {
+            if CREDENTIAL_FILES.contains(&file) { wipe_bytes(&mut raw); }
+            return Some(value);
+        }
+        let decrypted = crate::dpapi::unprotect_for(file, &raw);
+        wipe_bytes(&mut raw);
+        let mut plain = decrypted?;
+        let value = serde_json::from_slice(&plain).ok();
+        wipe_bytes(&mut plain);
+        value
     }
 
     pub fn read_device(&self) -> Option<DeviceInfo> {
@@ -227,41 +335,21 @@ impl Credentials {
         self.read_json(FILE_THERMOMETER)
     }
 
-    /// 写明文 JSON（与 v1 格式一致，保证旧版仍可读）。
+    /// 写 JSON：敏感文件强制 DPAPI；仅 settings.json 保持明文。
     pub fn write_json<T: serde::Serialize>(&self, file: &str, data: &T) -> std::io::Result<PathBuf> {
-        let text = serde_json::to_string_pretty(data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.write_bytes(file, text.as_bytes())
-    }
-
-    /// 写 DPAPI 加密的 JSON（v2 专属格式）。
-    ///
-    /// 传 `encrypt = false` 时退化为写明文，便于新旧并存测试期切换。
-    pub fn write_json_maybe_encrypted<T: serde::Serialize>(
-        &self,
-        file: &str,
-        data: &T,
-        encrypt: bool,
-    ) -> std::io::Result<PathBuf> {
-        let text = serde_json::to_string_pretty(data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        if !encrypt {
-            return self.write_bytes(file, text.as_bytes());
+        if !ALL_FILES.contains(&file) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "未知的凭据文件"));
         }
-
-        #[cfg(windows)]
-        {
-            let blob = crate::dpapi::protect(text.as_bytes()).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("DPAPI 加密失败：{e}"))
-            })?;
-            return self.write_bytes(file, &blob);
+        let mut text = serde_json::to_vec_pretty(data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if file == FILE_SETTINGS {
+            return self.write_bytes(file, &text);
         }
-        #[cfg(not(windows))]
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "当前平台不支持 DPAPI 凭据加密",
-        ));
+        let protected = crate::dpapi::protect_for(file, &text);
+        wipe_bytes(&mut text);
+        let blob = protected
+            .map_err(|e| std::io::Error::other(format!("DPAPI 加密失败：{e}")))?;
+        self.write_bytes(file, &blob)
     }
 
     /// 底层写入：建目录 → 写文件 → 收紧权限。
@@ -312,6 +400,60 @@ pub fn user_data_dir() -> Option<PathBuf> {
     Some(PathBuf::from(appdata).join("米家空调"))
 }
 
+/// 用进程令牌里的真实 SID，而不是可伪造的 USERNAME 环境变量。
+#[cfg(windows)]
+fn current_user_sid() -> std::io::Result<String> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token = ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = (|| {
+            let mut size = 0u32;
+            GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut size);
+            if size < std::mem::size_of::<TOKEN_USER>() as u32 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let words = (size as usize).div_ceil(std::mem::size_of::<usize>());
+            let mut buffer = vec![0usize; words];
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                size,
+                &mut size,
+            ) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+            let mut sid_text = ptr::null_mut();
+            if ConvertSidToStringSidW(user.User.Sid, &mut sid_text) == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut len = 0usize;
+            while len < 256 && *sid_text.add(len) != 0 {
+                len += 1;
+            }
+            let converted = if len == 256 {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Windows SID 过长"))
+            } else {
+                String::from_utf16(std::slice::from_raw_parts(sid_text, len))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            };
+            LocalFree(sid_text.cast());
+            converted
+        })();
+        CloseHandle(token);
+        result
+    }
+}
+
 /// 用 icacls 断掉权限继承，只保留当前用户可访问。
 ///
 /// 与 v1 `credentials.js` 的做法一致：失败直接报错，绝不留下权限过宽的凭据文件。
@@ -321,12 +463,7 @@ pub(crate) fn harden_permissions(path: &Path) -> std::io::Result<()> {
     use std::process::Command;
     use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-    let user = std::env::var("USERNAME").map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "无法确定当前 Windows 用户，拒绝保存凭据",
-        )
-    })?;
+    let sid = current_user_sid()?;
 
     let out = Command::new("icacls")
         // A GUI parent does not hide console children automatically. Settings
@@ -335,7 +472,7 @@ pub(crate) fn harden_permissions(path: &Path) -> std::io::Result<()> {
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("{user}:(F)"))
+        .arg(format!("*{sid}:(F)"))
         .output()?;
 
     if !out.status.success() {
@@ -353,6 +490,16 @@ pub(crate) fn harden_permissions(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("miac-credentials-{label}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     #[test]
     fn device_json_reads_v1_format() {
@@ -408,5 +555,65 @@ mod tests {
         let c = Credentials::portable();
         let err = c.write_bytes("evil.json", b"{}").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn all_sensitive_writes_are_encrypted_but_settings_stay_plaintext() {
+        let dir = test_dir("write");
+        let creds = Credentials::isolated(&dir);
+        let value = serde_json::json!({ "did": "test-only", "token": "test-secret" });
+        for file in CREDENTIAL_FILES {
+            creds.write_json(file, &value).unwrap();
+            let raw = fs::read(dir.join(file)).unwrap();
+            assert!(crate::dpapi::is_current_format(&raw));
+            assert!(!String::from_utf8_lossy(&raw).contains("test-secret"));
+            assert_eq!(creds.read_json::<serde_json::Value>(file).unwrap(), value);
+            // 重复写入必须仍可替换目标文件，不能因 Windows rename 语义失败。
+            creds.write_json(file, &value).unwrap();
+        }
+        creds.write_json(FILE_SETTINGS, &serde_json::json!({"dark": true})).unwrap();
+        assert!(fs::read_to_string(dir.join(FILE_SETTINGS)).unwrap().contains("dark"));
+        assert!(creds.protection_status().active_files_protected());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn upgrades_legacy_plaintext_without_deleting_old_copy() {
+        let root = test_dir("upgrade");
+        let primary = root.join("new");
+        let old = root.join("old");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(FILE_DEVICE), br#"{"did":"legacy","token":"test-secret"}"#).unwrap();
+        let creds = Credentials { primary: primary.clone(), fallbacks: vec![old.clone()] };
+        assert_eq!(creds.protection_status().plaintext, 1);
+        let report = creds.upgrade_existing();
+        assert_eq!(report.upgraded, 1);
+        assert!(report.failures.is_empty());
+        assert!(crate::dpapi::is_current_format(&fs::read(primary.join(FILE_DEVICE)).unwrap()));
+        assert_eq!(creds.read_device().unwrap().did, "legacy");
+        assert_eq!(creds.protection_status().legacy_plaintext, 1);
+        assert!(old.join(FILE_DEVICE).exists(), "旧版数据不能被暗中删除");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_primary_never_falls_back_to_stale_plaintext() {
+        let root = test_dir("fail-closed");
+        let primary = root.join("new");
+        let old = root.join("old");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&old).unwrap();
+        fs::write(primary.join(FILE_DEVICE), b"damaged ciphertext").unwrap();
+        fs::write(old.join(FILE_DEVICE), br#"{"did":"stale"}"#).unwrap();
+        let creds = Credentials { primary, fallbacks: vec![old] };
+        assert!(creds.read_device().is_none());
+        let report = creds.upgrade_existing();
+        assert_eq!(report.upgraded, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(creds.protection_status().unreadable, 1);
+        fs::remove_dir_all(root).unwrap();
     }
 }

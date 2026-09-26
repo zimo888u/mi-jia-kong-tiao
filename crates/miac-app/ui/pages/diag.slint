@@ -12,6 +12,7 @@ import { Card, KvRow } from "../common.slint";
 component DiagCell inherits Rectangle {
     in property <string> label;
     in property <string> value;
+    in property <string> unit;
 
     height: 92px;
     border-radius: Theme.radius-sm;
@@ -22,12 +23,22 @@ component DiagCell inherits Rectangle {
         alignment: center;
         spacing: 8px;
         Text { text: root.label; color: Theme.text-mute; font-size: Theme.font-xs; horizontal-alignment: center; }
-        Text {
-            text: root.value;
-            color: Theme.text;
-            font-size: 25px;
-            font-weight: 600;
-            horizontal-alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            spacing: 4px;
+            Text {
+                text: root.value;
+                color: Theme.text;
+                font-size: 25px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            if root.unit != "" : Text {
+                text: root.unit;
+                color: Theme.text-mute;
+                font-size: Theme.font-sm;
+                vertical-alignment: bottom;
+            }
         }
     }
 }
@@ -35,6 +46,7 @@ component DiagCell inherits Rectangle {
 export component DiagPage inherits VerticalLayout {
     in property <[string]> diag-labels: [];
     in property <[string]> diag-values: [];
+    in property <[string]> diag-units: [];
     in property <string> sensor-temp: "--";
     in property <string> sensor-hum: "--";
     in property <string> clean-text: "—";
@@ -58,6 +70,7 @@ export component DiagPage inherits VerticalLayout {
                 horizontal-stretch: 1;
                 label: i < root.diag-labels.length ? root.diag-labels[i] : "—";
                 value: i < root.diag-values.length ? root.diag-values[i] : "--";
+                unit: i < root.diag-units.length ? root.diag-units[i] : "";
             }
         }
     }

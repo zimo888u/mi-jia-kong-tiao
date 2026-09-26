@@ -18,12 +18,15 @@ export component SettingsPage inherits VerticalLayout {
     in property <string> migration-summary: "";
     in property <string> credentials-dir: "";
     in property <bool> credentials-encrypted: false;
+    in property <string> credentials-status-title: "检查中…";
+    in property <string> credentials-status-detail: "";
     in property <bool> dark-theme: false;
     in property <int> close-behavior: 0;
     callback toggle-theme();
     callback set-close-behavior(int);
 
     callback set-transport(int);
+    callback export-log();
     callback clear-log();
     callback encrypt-credentials();
 
@@ -102,9 +105,12 @@ export component SettingsPage inherits VerticalLayout {
         title: "运行日志";
         HorizontalLayout {
             height: 38px;
+            spacing: 8px;
             Rectangle { horizontal-stretch: 1; }
-            FlatButton { label: "清空"; ghost: true; min-w: 60px; clicked => { root.clear-log(); } }
+            FlatButton { label: "导出日志"; min-w: 88px; max-width: 88px; clicked => { root.export-log(); } }
+            FlatButton { label: "清空"; ghost: true; min-w: 60px; max-width: 60px; clicked => { root.clear-log(); } }
         }
+        Text { text: "导出本次运行的最近 200 条日志；分享前请检查设备名称等信息。"; color: Theme.text-mute; font-size: Theme.font-xs; wrap: word-wrap; }
         Rectangle {
             height: 168px;
             border-radius: Theme.radius-sm;
@@ -129,7 +135,7 @@ export component SettingsPage inherits VerticalLayout {
         VerticalLayout { width: (root.width - Theme.gap) * 0.38; spacing: Theme.gap;
     Card {
         title: "本机凭据"; background: Theme.sage-panel;
-        Text { text: root.credentials-encrypted ? "已启用 DPAPI 加密" : "当前为明文存储"; color: Theme.text-dim; font-size: Theme.font-sm; }
+        Text { text: root.credentials-status-title; color: Theme.text-dim; font-size: Theme.font-sm; }
         Text {
             text: "存储位置：" + (root.credentials-dir == "" ? "—" : root.credentials-dir);
             color: Theme.text-dim;
@@ -137,9 +143,7 @@ export component SettingsPage inherits VerticalLayout {
             wrap: word-wrap;
         }
         Text {
-            text: root.credentials-encrypted
-                ? "三个凭据文件已用 Windows DPAPI 加密，只能由当前 Windows 用户在本机解开；换用户或换电脑都无法读取。"
-                : "凭据目前是明文 JSON（与旧版 Electron 版格式一致，便于两版并存测试）。启用加密后只有当前 Windows 用户在本机能读，旧版将无法再读取这些文件。";
+            text: root.credentials-status-detail;
             color: Theme.text-mute;
             font-size: Theme.font-sm;
             wrap: word-wrap;
@@ -148,7 +152,7 @@ export component SettingsPage inherits VerticalLayout {
             height: 32px;
             spacing: 10px;
             FlatButton {
-                label: root.credentials-encrypted ? "已加密" : "启用 DPAPI 加密";
+                label: root.credentials-encrypted ? "当前凭据已加密" : "加密现有凭据";
                 min-w: 150px;
                 danger: !root.credentials-encrypted;
                 clicked => { root.encrypt-credentials(); }

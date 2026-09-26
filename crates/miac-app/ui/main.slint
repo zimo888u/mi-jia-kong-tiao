@@ -150,8 +150,10 @@ export component MainWindow inherits Window {
     in property <string> migration-summary: "";
     /// 凭据目录（设置页展示）
     in property <string> credentials-dir: "";
-    /// 是否已启用 DPAPI 加密存储
+    /// 根据实际文件检查出的当前凭据加密状态
     in property <bool> credentials-encrypted: false;
+    in property <string> credentials-status-title: "检查中…";
+    in property <string> credentials-status-detail: "";
     /// 工具提示/悬停提示用的最后错误
     in property <string> last-error: "";
     callback dismiss-toast(int);
@@ -188,6 +190,7 @@ export component MainWindow inherits Window {
     in property <bool> fault-clear: true;
     in property <[string]> diag-labels: [];
     in property <[string]> diag-values: [];
+    in property <[string]> diag-units: [];
     in property <string> clean-text: "—";
     in property <string> examine-text: "—";
     in property <string> run-text: "—";
@@ -226,6 +229,7 @@ export component MainWindow inherits Window {
     callback raw-read();
     callback raw-write();
     callback select-prop(int);
+    callback export-log();
     callback clear-log();
 
     // ── 侧边栏 ──────────────────────────────────────────────
@@ -355,25 +359,24 @@ export component MainWindow inherits Window {
                         border-radius: Theme.radius-sm;
                         background: auto-touch.has-hover ? Theme.panel-hi : transparent;
                         Rectangle {
-                            x: 8px;
-                            y: (parent.height - 15px) / 2;
-                            width: 15px;
-                            height: 15px;
-                            border-radius: 4px;
+                            x: 7px;
+                            y: (parent.height - 18px) / 2;
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 5px;
                             border-width: 1px;
                             border-color: root.auto-refresh ? Theme.accent : Theme.line;
                             background: root.auto-refresh ? Theme.accent : transparent;
-                            Text {
-                                x: 0px;
-                                y: 0px;
-                                width: parent.width;
-                                height: parent.height;
-                                text: "✓";
-                                color: Theme.on-accent;
-                                font-size: 10px;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                visible: root.auto-refresh;
+                            Path {
+                                x: 2px;
+                                y: 2px;
+                                width: 14px;
+                                height: 14px;
+                                commands: "M 12.7 6 A 5.5 5.5 0 0 0 3.2 4.2 M 3 1.5 L 3 4.5 L 6 4.5 M 3.3 10 A 5.5 5.5 0 0 0 12.8 11.8 M 13 14.5 L 13 11.5 L 10 11.5";
+                                stroke: root.auto-refresh ? Theme.on-accent : Theme.text-dim;
+                                stroke-width: 1.6px;
+                                stroke-line-cap: round;
+                                stroke-line-join: round;
                             }
                         }
                         Text {
@@ -507,6 +510,7 @@ export component MainWindow inherits Window {
                         if root.view == 2 : DiagPage {
                             diag-labels: root.diag-labels;
                             diag-values: root.diag-values;
+                            diag-units: root.diag-units;
                             sensor-temp: root.sensor-temp;
                             sensor-hum: root.sensor-hum;
                             clean-text: root.clean-text;
@@ -553,7 +557,10 @@ export component MainWindow inherits Window {
                             migration-summary: root.migration-summary;
                             credentials-dir: root.credentials-dir;
                             credentials-encrypted: root.credentials-encrypted;
+                            credentials-status-title: root.credentials-status-title;
+                            credentials-status-detail: root.credentials-status-detail;
                             set-transport(t) => { root.set-transport(t); }
+                            export-log() => { root.export-log(); }
                             clear-log() => { root.clear-log(); }
                             encrypt-credentials() => { root.encrypt-credentials(); }
                         }

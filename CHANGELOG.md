@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 的格式，版本号采用语义化版本。
 
-## [未发布]
+## [2.2.0] - 2026-09-26
 
 ### 新增
 
@@ -10,6 +10,15 @@
 - 自动显示米家设备名称；按型号生成模式、风速、温度范围和步长。
 - 摆风、ECO、睡眠、辅热、干燥、灯光与提示音按设备能力显示。
 - 添加规格刷新脚本、多型号解析与温度校验测试、替代型号离线界面检查。
+- 新增可选的 `miac-control` 对话控制 Skill 安装包，复用型号规格并返回结构化操作结果。
+- 设置页新增运行日志导出，可保存最近 200 条本次运行日志。
+- 诊断读数显示单位，自动刷新控件增加清晰的刷新图标。
+
+### 安全性
+
+- 登录和命令行凭据写入统一使用当前 Windows 用户范围的 DPAPI；可读旧凭据在启动时自动升级。
+- 加密格式按文件名隔离并带版本标记，文件写入权限改用进程令牌中的真实用户 SID 收紧。
+- 旧位置的明文副本会提示用户检查，不会自动删除；同一 Windows 用户运行的程序仍可调用 DPAPI 解密。
 
 ### 修复
 
@@ -63,5 +72,6 @@
 - 发布 Rust + Slint 原生桌面客户端，支持米家空调控制、设备诊断、电量数据、扫码登录和托盘运行。
 
 [2.1.0]: https://github.com/zimo888u/mi-jia-kong-tiao/compare/v2.0.1...v2.1.0
+[2.2.0]: https://github.com/zimo888u/mi-jia-kong-tiao/compare/v2.1.0...v2.2.0
 [2.0.1]: https://github.com/zimo888u/mi-jia-kong-tiao/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.0.0

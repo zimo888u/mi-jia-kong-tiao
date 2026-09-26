@@ -1,0 +1,16 @@
+[package]
+name = "miac-assistant"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "米家空调对话控制 Skill 的命令接口"
+
+[[bin]]
+name = "miac-assistant"
+path = "src/main.rs"
+
+[dependencies]
+miac-core = { path = "../../crates/miac-core" }
+serde_json = "1"
