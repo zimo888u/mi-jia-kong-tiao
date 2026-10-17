@@ -1,17 +1,12 @@
 //! miac-core —— 米家空调控制核心（无界面、无进程副作用）
 //!
-//! 阶段规划：
-//!   第 1 阶段：`miot` 属性表 + `demo` 假数据，供内存原型使用 ✅
-//!   第 2 阶段：`crypto` / `miio`（局域网 UDP）/ `cloud`（云端 RPC）/ `controller`
-//!   第 3 阶段：`credentials`（兼容现有 JSON + DPAPI 加密）、`login`（扫码登录）
-//!
-//! 设计原则：本 crate 不依赖任何界面库，可被将来的命令行版 / MCP server 复用。
+//! 提供局域网与云端通信、型号能力、登录凭据、状态读取和后台工作线程。
+//! 本 crate 不依赖界面库，由桌面端、CLI 和对话控制助手共用。
 
 pub mod cloud;
 pub mod controller;
 pub mod credentials;
 pub mod crypto;
-pub mod demo;
 pub mod dpapi;
 pub mod login;
 pub mod io_limits;

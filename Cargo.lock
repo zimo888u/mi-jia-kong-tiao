@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "miac-app"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "miac-core",
  "png",
@@ -2494,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "miac-assistant"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "miac-core",
  "serde_json",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "miac-cli"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "miac-core",
  "serde_json",
@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "miac-core"
-version = "2.3.0"
+version = "2.3.1"
 dependencies = [
  "aes",
  "base64 0.22.1",

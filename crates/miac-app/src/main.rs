@@ -59,7 +59,7 @@ use miac_core::miot;
 use miac_core::migration;
 use miac_core::settings::Settings;
 use miac_core::worker::{Command, DeviceSummary, Event, Worker};
-use miac_core::{demo, Transport};
+use miac_core::Transport;
 use target_temp::{Command as TargetTempCommand, Completion as TargetTempCompletion, State as TargetTempState};
 
 /// 界面上最多同时显示的提示条数（需求：最多三个）。
@@ -1062,11 +1062,11 @@ impl App {
         self.ui.set_device_info_text(lines.join("\n").into());
     }
 
-    // ── 假数据/静态内容 ─────────────────────────────────────────
+    // ── 初始属性列表与软件说明 ─────────────────────────────────
 
     fn push_static_data(&mut self) {
         let names: Vec<slint::SharedString> =
-            demo::prop_names().into_iter().map(Into::into).collect();
+            miot::PROPS.iter().map(|(name, _)| (*name).into()).collect();
         self.ui.set_prop_name_list(ModelRc::new(VecModel::from(names)));
 
         self.ui.set_about_text(
@@ -1075,7 +1075,8 @@ impl App {
                  单进程，无 Electron / Chromium / Node.js\n\
                  渲染后端：Slint software renderer\n\
                  控制核心：miIO 局域网直连 + 小米云 RPC 双通道\n\
-                 凭据：兼容旧版 JSON，可选 Windows DPAPI 加密",
+                 凭据：Windows 用户级 DPAPI 加密，账号与设备事务保存\n\
+                 许可：MIAC-NC-SR-1.0，仅限非商业；复用或修改代码须公开源码",
                 env!("CARGO_PKG_VERSION")
             )
             .into(),

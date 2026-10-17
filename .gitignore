@@ -35,3 +35,17 @@ __pycache__/
 # Local audit notes are not part of the published project
 /上一个记忆发现的问题.txt
 /mi-jia-kong-tiao-audit-report.md
+
+# Private machine-specific verification records and obsolete snapshots
+/BACKUP-README.md
+/docs-slint-ui/
+/docs/audit-remediation-*.md
+/docs/deployment-verification-*.md
+/docs/memory-optimization-*.md
+/docs/minimize-restore-*.md
+/docs/runtime-log-scroll-*.md
+
+# Local environment secrets (keep example configurations publishable)
+.env
+.env.*
+!.env.example

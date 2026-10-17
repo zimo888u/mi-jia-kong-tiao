@@ -1,4 +1,4 @@
-//! miot.rs —— MIoT 属性映射与常量表（**本文件由 tools/gen-miot.js 自动生成**）
+//! 原机型 MIoT 属性映射与显示常量；其他型号的能力由 profile 模块解析。
 //!
 //! 目标机型：空调 巨省电 大2匹新一级能效
 //!   MIoT: xiaomi.airc.h53h00

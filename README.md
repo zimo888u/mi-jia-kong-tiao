@@ -2,6 +2,8 @@
 
 一款使用 Rust 和 Slint 构建的 Windows 米家空调原生桌面控制器。支持局域网与云端连接、46 个型号的内置 MIoT 规格、设备控制、电量统计和运行诊断，提供浅色、深色、macOS、丛雨·亮色和丛雨·暗色五种主题，并可选安装 Codex 对话控制 Skill。
 
+**许可：仅限非商业使用；修改或复用代码形成衍生作品时，须公开完整源码并沿用相同条款。** 详见 [LICENSE](LICENSE)。
+
 ![米家空调控制台预览](docs/ui/preview-light.png)
 
 ## 为什么使用它
@@ -16,7 +18,7 @@
 
 ## 下载与开始使用
 
-从 [v2.3.0 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.0) 下载 Windows x86-64 便携版 `miac-app-v2.3.0-windows-x86_64.zip`，解压后运行 `miac-app.exe`。也可下载独立的 `miac-app.exe`。可选的对话控制 Skill 和文件校验值也在同一发行页提供。
+从 [v2.3.1 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.1) 下载 Windows x86-64 便携版 `miac-app-v2.3.1-windows-x86_64.zip`，解压后运行 `miac-app.exe`。便携包包含许可证及第三方声明，请一并保留。可选的对话控制 Skill 和文件校验值也在同一发行页提供。
 
 首次启动时，点击“扫码登录米家账号”，使用米家 App 扫码并选择要控制的空调。程序会将凭据保存到当前 Windows 用户的米家空调数据目录。
 
@@ -72,7 +74,7 @@ cargo test --workspace --locked
 cargo run -p miac-app --example ui-preview -- docs/ui-preview
 ```
 
-`ui-preview` 不连接设备、不读取凭据，会导出各页面的五种主题预览图并检查温度控制、登录界面和运行日志滚动等交互。Windows 原生窗口的重绘与最小化恢复检查见 [窗口修复记录](docs/minimize-restore-2026-10-17.md)，五种主题下的日志滚动检查见 [日志修复记录](docs/runtime-log-scroll-2026-10-17.md)。
+`ui-preview` 不连接设备、不读取凭据，会导出各页面的五种主题预览图并检查温度控制、登录界面和运行日志滚动等交互。Windows 原生重绘、最小化恢复和打包步骤见 [开发与验证](docs/development.md)。
 
 ## 项目结构
 
@@ -95,8 +97,14 @@ docs/               UI 预览、验证资料与发行说明
 
 清理范围仅为 `%APPDATA%\米家空调` 和 `%LOCALAPPDATA%\米家空调`、本软件专用注册表项及 `Miac.Desktop.v2` 自启动项。工作目录、EXE 目录、项目目录、`dist` 和通用 `Software\miac` 注册表键会保留。链接根目录会被拒绝；遍历中通过 Windows 目录句柄防止目录被替换。旧版便携文件可由用户确认后自行处理。
 
-两份审计的逐项修复和验证记录见 [2026-10-15 审计修复对照](docs/audit-remediation-2026-10-15.md)。
-
 ## 更新日志
 
 完整记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 许可证与第三方声明
+
+自 v2.3.1 起，项目原创代码和文档采用 [MIAC 非商业与源码互惠许可证 1.0](LICENSE)。普通用户原样运行程序无须公开个人配置；修改或复用代码形成衍生作品后，运行、部署、联网提供服务或分发之前须公开完整源码，并沿用相同许可。禁止未经书面许可的商业使用。
+
+这属于带使用限制的源码可用项目，不是 OSI 定义的开源许可。以前版本标注的 MIT 授权不能被本许可证追溯撤回。第三方依赖、公开规格数据及角色素材保留各自的权利声明，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.18.0/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)
