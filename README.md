@@ -18,7 +18,7 @@
 
 ## 下载与开始使用
 
-从 [v2.3.2 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.2) 下载 Windows x86-64 便携版 `miac-app-v2.3.2-windows-x86_64.zip`，解压后运行 `miac-app.exe`。便携包包含许可证及第三方声明，请一并保留。可选的对话控制 Skill、完整对应源码包和文件校验值也在同一发行页提供。
+从 [v2.3.2 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.2) 下载 Windows x86-64 单文件程序 `miac-app-v2.3.2-windows-x86_64.exe`，双击即可运行，无需解压。请同时保留同页的 `LICENSE` 文件，其中收录项目 AFPL 正文及独立的第三方授权声明。可选的 Codex 对话控制 Skill 只保留一份压缩包；项目源码可通过对应版本标签或 GitHub 自动提供的源码入口取得。
 
 首次启动时，点击“扫码登录米家账号”，使用米家 App 扫码并选择要控制的空调。程序会将凭据保存到当前 Windows 用户的米家空调数据目录。
 
