@@ -30,3 +30,7 @@ __pycache__/
 
 # Cargo registry installation markers in vendored source
 /vendor/**/.cargo-ok
+
+# Local audit notes are not part of the published project
+/上一个记忆发现的问题.txt
+/mi-jia-kong-tiao-audit-report.md
