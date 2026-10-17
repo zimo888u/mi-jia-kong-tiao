@@ -1,6 +1,6 @@
 # 米家空调
 
-一款面向 Windows 的米家空调桌面控制器。它用 Rust 和 Slint 构建，直接连接已授权的米家空调，让常用控制、电量数据、运行诊断和设备属性集中在一个轻量的原生客户端中。
+一款使用 Rust 和 Slint 构建的 Windows 米家空调原生桌面控制器。支持局域网与云端连接、46 个型号的内置 MIoT 规格、设备控制、电量统计和运行诊断，提供浅色、深色、macOS、丛雨·亮色和丛雨·暗色五种主题，并可选安装 Codex 对话控制 Skill。
 
 ![米家空调控制台预览](docs/ui/preview-light.png)
 
@@ -10,12 +10,13 @@
 - **日常操作集中**：开关机、模式、目标温度、风速、摆风和舒适功能都在一个界面完成。
 - **看得见设备状态**：提供电量统计、温湿度、运行诊断和高级属性读写。
 - **适合长期运行**：单实例、系统托盘、自动刷新，以及关闭时“收进托盘 / 直接退出”的可记忆选择。
+- **五种主题**：浅色、深色、macOS 与两种丛雨主题即时切换；支持开机自启动、日志滚动查看和导出。
 - **原生且轻量**：不依赖 Electron、Chromium 或 Node.js；发布版启用体积优化与 LTO。
 - **安全保存凭据**：新登录和旧凭据升级都使用当前 Windows 用户范围的 DPAPI 加密，保持自动连接。
 
 ## 下载与开始使用
 
-从 [v2.2.0 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.2.0) 下载 Windows x86-64 便携版 `miac-app-v2.2.0-windows-x86_64.zip`，解压后运行 `miac-app.exe`。也可下载独立的 `miac-app.exe`。
+从 [v2.3.0 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.0) 下载 Windows x86-64 便携版 `miac-app-v2.3.0-windows-x86_64.zip`，解压后运行 `miac-app.exe`。也可下载独立的 `miac-app.exe`。可选的对话控制 Skill 和文件校验值也在同一发行页提供。
 
 首次启动时，点击“扫码登录米家账号”，使用米家 App 扫码并选择要控制的空调。程序会将凭据保存到当前 Windows 用户的米家空调数据目录。
 
