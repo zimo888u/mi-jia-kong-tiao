@@ -17,11 +17,11 @@ resolver = "2"
 members = ["crates/miac-core", "crates/miac-app", "crates/miac-cli", "skills/miac-control"]
 
 [workspace.package]
-version = "2.3.1"
+version = "2.3.2"
 edition = "2021"
 rust-version = "1.92"
 authors = ["米家空调项目"]
-license-file = "LICENSE"
+license = "Aladdin"
 
 [workspace.dependencies]
 # default-features = false：默认会带上 winit + femtovg + wgpu + skia 全套后端，

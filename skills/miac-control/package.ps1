@@ -10,6 +10,7 @@ $files = [ordered]@{
     'miac-control/scripts/miac-app.exe' = Join-Path $PSScriptRoot 'scripts\miac-app.exe'
     'miac-control/LICENSE' = Join-Path $PSScriptRoot '..\..\LICENSE'
     'miac-control/THIRD-PARTY-NOTICES.md' = Join-Path $PSScriptRoot '..\..\THIRD-PARTY-NOTICES.md'
+    'miac-control/LICENSE-NOTICE.md' = Join-Path $PSScriptRoot '..\..\LICENSE-NOTICE.md'
 }
 
 foreach ($source in $files.Values) {

@@ -2,7 +2,7 @@
 
 一款使用 Rust 和 Slint 构建的 Windows 米家空调原生桌面控制器。支持局域网与云端连接、46 个型号的内置 MIoT 规格、设备控制、电量统计和运行诊断，提供浅色、深色、macOS、丛雨·亮色和丛雨·暗色五种主题，并可选安装 Codex 对话控制 Skill。
 
-**许可：仅限非商业使用；修改或复用代码形成衍生作品时，须公开完整源码并沿用相同条款。** 详见 [LICENSE](LICENSE)。
+**许可：AFPL（Aladdin Free Public License）。商业收费再分发受限；分发衍生版本须提供完整源码并沿用 AFPL。** 详见 [LICENSE](LICENSE) 及 [许可说明](LICENSE-NOTICE.md)。
 
 ![米家空调控制台预览](docs/ui/preview-light.png)
 
@@ -18,7 +18,7 @@
 
 ## 下载与开始使用
 
-从 [v2.3.1 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.1) 下载 Windows x86-64 便携版 `miac-app-v2.3.1-windows-x86_64.zip`，解压后运行 `miac-app.exe`。便携包包含许可证及第三方声明，请一并保留。可选的对话控制 Skill 和文件校验值也在同一发行页提供。
+从 [v2.3.2 发行版](https://github.com/zimo888u/mi-jia-kong-tiao/releases/tag/v2.3.2) 下载 Windows x86-64 便携版 `miac-app-v2.3.2-windows-x86_64.zip`，解压后运行 `miac-app.exe`。便携包包含许可证及第三方声明，请一并保留。可选的对话控制 Skill、完整对应源码包和文件校验值也在同一发行页提供。
 
 首次启动时，点击“扫码登录米家账号”，使用米家 App 扫码并选择要控制的空调。程序会将凭据保存到当前 Windows 用户的米家空调数据目录。
 
@@ -103,8 +103,10 @@ docs/               UI 预览、验证资料与发行说明
 
 ## 许可证与第三方声明
 
-自 v2.3.1 起，项目原创代码和文档采用 [MIAC 非商业与源码互惠许可证 1.0](LICENSE)。普通用户原样运行程序无须公开个人配置；修改或复用代码形成衍生作品后，运行、部署、联网提供服务或分发之前须公开完整源码，并沿用相同许可。禁止未经书面许可的商业使用。
+自 v2.3.2 起，本项目原创程序采用公开的 [Aladdin Free Public License（AFPL，Version 8）](LICENSE)，SPDX 标识为 `Aladdin`。许可正文取自 [SPDX 官方文本](https://spdx.org/licenses/Aladdin.html)，只按该许可明确允许的方式替换第 0 节首段的项目名称和权利人信息，没有增添自定义限制。
 
-这属于带使用限制的源码可用项目，不是 OSI 定义的开源许可。以前版本标注的 MIT 授权不能被本许可证追溯撤回。第三方依赖、公开规格数据及角色素材保留各自的权利声明，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+AFPL 限制商业组织进行直接或间接收费的再分发，并要求分发包含或衍生自本项目的作品时提供完整对应源码、沿用相同许可和保留声明。它允许企业内部运行，包含特定分发例外，不能描述为全面禁止所有商用；私下修改且不分发也不等于必须向公众发布代码。具体边界见 [许可说明](LICENSE-NOTICE.md)。
+
+AFPL 不是 GPL/AGPL，也不是 OSI 批准的开源许可。旧版本已合法取得的授权不被追溯撤销。第三方依赖、公开规格数据及角色素材保留各自权利，详见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 [![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.18.0/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev/)

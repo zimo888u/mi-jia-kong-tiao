@@ -1076,7 +1076,7 @@ impl App {
                  渲染后端：Slint software renderer\n\
                  控制核心：miIO 局域网直连 + 小米云 RPC 双通道\n\
                  凭据：Windows 用户级 DPAPI 加密，账号与设备事务保存\n\
-                 许可：MIAC-NC-SR-1.0，仅限非商业；复用或修改代码须公开源码",
+                 ©2026 zimo888u · 无担保 · 可按 AFPL 条件再分发，条款见随包 LICENSE",
                 env!("CARGO_PKG_VERSION")
             )
             .into(),

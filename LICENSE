@@ -1,93 +1,62 @@
-米家空调非商业与源码互惠许可证 1.0
-MIAC Noncommercial Source-Reciprocal License 1.0 (MIAC-NC-SR-1.0)
+Aladdin Free Public License
+(Version 8, November 18, 1999)
 
-Copyright (c) 2026 zimo888u 及对各自贡献享有权利的贡献者。
-项目地址：https://github.com/zimo888u/mi-jia-kong-tiao
-本许可证自 v2.3.1 起适用于明确采用本许可证的项目原创部分。
+Copyright (C) 1994, 1995, 1997, 1998, 1999 Aladdin Enterprises, Menlo Park, California, U.S.A. All rights reserved.
 
-1. 适用范围
+NOTE: This License is not the same as any of the GNU Licenses published by the Free Software Foundation. Its terms are substantially different from those of the GNU Licenses. If you are familiar with the GNU Licenses, please read this license with extra care.
 
-“本软件”指权利人有权授权并明确按本许可证提供的源代码、文档及其他原创
-作品。“衍生作品”包括对本软件的修改，以及复制、改编或集成本软件中受
-著作权保护的代码而形成的程序或模块。单纯一同分发、仅通过通用协议通信、
-或未复制受保护表达而独立开发的作品，不因此自动成为衍生作品。
+Aladdin Enterprises hereby grants to anyone the permission to apply this License to their own work, as long as the entire License (including the above notices and this paragraph) is copied with no changes, additions, or deletions except for changing the first paragraph of Section 0 to include a suitable description of the work to which the license is being applied and of the person or entity that holds the copyright in the work, and, if the License is being applied to a work created in a country other than the United States, replacing the first paragraph of Section 6 with an appropriate reference to the laws of the appropriate country.
 
-本许可证仅授予权利人有权授予的权利。第三方依赖、vendor 目录、公开型号
-规格数据、角色图像及其他另有权利声明的内容不因本许可证而变更授权；应
-分别遵守其原有许可和权利要求。参见 THIRD-PARTY-NOTICES.md。
+0. Subject Matter
+This License applies to the computer program known as "米家空调 (mi-jia-kong-tiao)." The "Program", below, refers to such program. The Program is a copyrighted work whose copyright is held by zimo888u and the respective copyright holders of their contributions (the "Licensor").
 
-2. 有条件的非商业授权
+A "work based on the Program" means either the Program or any derivative work of the Program, as defined in the United States Copyright Act of 1976, such as a translation or a modification.
 
-在完整遵守以下条件的前提下，你可为非商业目的使用、复制、研究、修改、
-编译及分发本软件和衍生作品。普通用户原样运行本软件控制自己的设备，无须
-公开个人数据或另建代码仓库。法律明确允许且不能通过合同排除的使用不受
-本许可证限制。
+BY MODIFYING OR DISTRIBUTING THE PROGRAM (OR ANY WORK BASED ON THE PROGRAM), YOU INDICATE YOUR ACCEPTANCE OF THIS LICENSE TO DO SO, AND ALL ITS TERMS AND CONDITIONS FOR COPYING, DISTRIBUTING OR MODIFYING THE PROGRAM OR WORKS BASED ON IT. NOTHING OTHER THAN THIS LICENSE GRANTS YOU PERMISSION TO MODIFY OR DISTRIBUTE THE PROGRAM OR ITS DERIVATIVE WORKS. THESE ACTIONS ARE PROHIBITED BY LAW. IF YOU DO NOT ACCEPT THESE TERMS AND CONDITIONS, DO NOT MODIFY OR DISTRIBUTE THE PROGRAM.
 
-3. 禁止商业使用
+1. Licenses.
+Licensor hereby grants you the following rights, provided that you comply with all of the restrictions set forth in this License and provided, further, that you distribute an unmodified copy of this License with the Program:
 
-未经相关权利人另行书面许可，不得将本软件或衍生作品用于直接或间接取得
-商业利益、报酬或商业竞争优势的目的。禁止的情形包括但不限于：
+     (a) You may copy and distribute literal (i.e., verbatim) copies of the Program's source code as you receive it throughout the world, in any medium.
+     (b) You may modify the Program, create works based on the Program and distribute copies of such throughout the world, in any medium.
 
-（a）出售、收费许可、付费下载、付费解锁、订阅、出租或收费部署；
-（b）作为收费软件、硬件、服务、插件、解决方案或商业交付的一部分；
-（c）为营利企业的业务运营、客户服务、生产经营或商业研发而使用；
-（d）借助广告、付费托管、商业推广或代运营等方式对其使用进行变现。
+2. Restrictions.
+This license is subject to the following restrictions:
 
-不谋求上述利益的个人学习、业余研究和非商业公益活动可以依第 2 条使用。
-免费提供或公开源码本身，不会使商业使用变为非商业使用。
+     (a) Distribution of the Program or any work based on the Program by a commercial organization to any third party is prohibited if any payment is made in connection with such distribution, whether directly (as in payment for a copy of the Program) or indirectly (as in payment for some service related to the Program, or payment for some product or service that includes a copy of the Program "without charge"; these are only examples, and not an exhaustive enumeration of prohibited activities). The following methods of distribution involving payment shall not in and of themselves be a violation of this restriction:
 
-4. 复用、修改与完整源码公开
+          (i) Posting the Program on a public access information storage and retrieval service for which a fee is received for retrieving information (such as an on-line service), provided that the fee is not content-dependent (i.e., the fee would be the same for retrieving the same volume of information consisting of random data) and that access to the service and to the Program is available independent of any other product or service. An example of a service that does not fall under this section is an on-line service that is operated by a company and that is only available to customers of that company. (This is not an exhaustive enumeration.)
+          (ii) Distributing the Program on removable computer-readable media, provided that the files containing the Program are reproduced entirely and verbatim on such media, that all information on such media be redistributable for non-commercial purposes without charge, and that such media are distributed by themselves (except for accompanying documentation) independent of any other product or service. Examples of such media include CD-ROM, magnetic tape, and optical storage media. (This is not intended to be an exhaustive list.) An example of a distribution that does not fall under this section is a CD-ROM included in a book or magazine. (This is not an exhaustive enumeration.)
 
-如果你修改本软件，或将其受著作权保护的代码复用于其他程序或模块，则在
-首次运行、部署、提供网络访问或向他人分发该衍生作品之前，必须通过公众
-可免费访问、无需单独申请授权的网址，公开该衍生作品的完整对应源代码。
-仅在本地进行、尚未运行或提供给他人的编辑与未完成草稿不触发此公开条件。
+     (b) Activities other than copying, distribution and modification of the Program are not subject to this License and they are outside its scope. Functional use (running) of the Program is not restricted, and any output produced through the use of the Program is subject to this license only if its contents constitute a work based on the Program (independent of having been made by running the Program).
 
-完整对应源代码须为开发者实际用于修改的首选形式，并包含你控制的相关
-源文件、修改内容、依赖清单、构建脚本及可复现构建所需的说明；不得只提供
-二进制、混淆代码、缺失必要模块的代码或无法还原作品的片段。
+     (c) You must meet all of the following conditions with respect to any work that you distribute or publish that in whole or in part contains or is derived from the Program or any part thereof ("the Work"):
 
-源码公开不得要求付费、签署保密协议或取得额外许可。公开状态应在你使用、
-部署、提供网络访问或分发衍生作品期间持续保持。每次提供新的衍生版本，
-应同步提供与其一致的完整源码，并向接收者显著提供源码网址。
+          (i) If you have modified the Program, you must cause the Work to carry prominent notices stating that you have modified the Program's files and the date of any change. In each source file that you have modified, you must include a prominent notice that you have modified the file, including your name, your e-mail address (if any), and the date and purpose of the change;
+          (ii) You must cause the Work to be licensed as a whole and at no charge to all third parties under the terms of this License;
+          (iii) If the Work normally reads commands interactively when run, you must cause it, at each time the Work commences operation, to print or display an announcement including an appropriate copyright notice and a notice that there is no warranty (or else, saying that you provide a warranty). Such notice must also state that users may redistribute the Work only under the conditions of this License and tell the user how to view the copy of this License included with the Work. (Exceptions: if the Program is interactive but normally prints or displays such an announcement only at the request of a user, such as in an "About box", the Work is required to print or display the notice only under the same circumstances; if the Program itself is interactive but does not normally print such an announcement, the Work is not required to print an announcement.);
+          (iv) You must accompany the Work with the complete corresponding machine-readable source code, delivered on a medium customarily used for software interchange. The source code for a work means the preferred form of the work for making modifications to it. For an executable work, complete source code means all the source code for all modules it contains, plus any associated interface definition files, plus the scripts used to control compilation and installation of the executable code. If you distribute with the Work any component that is normally distributed (in either source or binary form) with the major components (compiler, kernel, and so on) of the operating system on which the executable runs, you must also distribute the source code of that component if you have it and are allowed to do so;
+          (v) If you distribute any written or printed material at all with the Work, such material must include either a written copy of this License, or a prominent written indication that the Work is covered by this License and written instructions for printing and/or displaying the copy of the License on the distribution medium;
+          (vi) You may not impose any further restrictions on the recipient's exercise of the rights granted herein.
 
-账号凭据、密钥、token、私人配置和用户数据不属于必须公开的对应源码；
-应使用不含秘密的示例配置，并提供正常构建与运行所需的公开说明。
+If distribution of executable or object code is made by offering the equivalent ability to copy from a designated place, then offering equivalent ability to copy the source code from the same place counts as distribution of the source code, even though third parties are not compelled to copy the source code along with the object code.
 
-5. 保留署名与相同许可
+3. Reservation of Rights.
+No rights are granted to the Program except as expressly set forth herein. You may not copy, modify, sublicense, or distribute the Program except as expressly provided under this License. Any attempt otherwise to copy, modify, sublicense or distribute the Program is void, and will automatically terminate your rights under this License. However, parties who have received copies, or rights, from you under this License will not have their licenses terminated so long as such parties remain in full compliance.
 
-分发本软件或衍生作品时，必须保留现有著作权声明、许可文本和第三方声明，
-注明本项目地址，并说明对原作所作的修改。衍生作品中由你控制的原创代码，
-必须以本许可证同一版本向接收者授予相同的非商业和源码互惠权利，不得
-改为闭源、商业可用或施加妨碍上述权利的额外限制。
+4. Other Restrictions.
+If the distribution and/or use of the Program is restricted in certain countries for any reason, Licensor may add an explicit geographical distribution limitation excluding those countries, so that distribution is permitted only in or among countries not thus excluded. In such case, this License incorporates the limitation as if written in the body of this License.
 
-第三方组件继续适用各自许可；不得声称其原有权利因本许可证而被收回。
-若某种组合无法同时遵守本许可证与第三方许可，则本许可证不授权该组合。
+5. Limitations.
+THE PROGRAM IS PROVIDED TO YOU "AS IS," WITHOUT WARRANTY. THERE IS NO WARRANTY FOR THE PROGRAM, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF THIRD PARTY RIGHTS. THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM IS WITH YOU. SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
 
-6. 其他权利与旧版本
+IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING WILL LICENSOR, OR ANY OTHER PARTY WHO MAY MODIFY AND/OR REDISTRIBUTE THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS), EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
 
-未明确授予的权利由相关权利人保留。本许可证不授予第三方商标、角色形象、
-肖像、专利或其他独立权利，也不表示第三方认可你的作品。权利人可就自己
-有权授权的部分另行提供书面许可。
+6. General.
+This License is governed by the laws of the State of California, U.S.A., excluding choice of law rules.
 
-此前已依旧版本许可合法取得的权利，不因本许可证发布而被追溯撤回。
-不得将本版本的新代码与改动误标为此前的 MIT 授权。
+If any part of this License is found to be in conflict with the law, that part shall be interpreted in its broadest meaning consistent with the law, and no other parts of the License shall be affected.
 
-7. 违约与终止
+For United States Government users, the Program is provided with RESTRICTED RIGHTS. If you are a unit or agency of the United States Government or are acquiring the Program for any such unit or agency, the following apply:
 
-不遵守本许可证条件时，本许可证授予你的权限自动终止。发现违规后应立即
-停止未获授权的使用和分发，并消除违规状态。除法律另有规定外，恢复授权
-须取得相关权利人的明确书面同意。符合许可的其他接收者既有权利不因你的
-违规而自动终止。
-
-8. 无担保与责任限制
-
-在法律允许的范围内，本软件按现状提供，不承诺适销性、特定用途适用性、
-不侵权、连续可用或无缺陷。除法律强制规定或另有书面约定外，权利人和
-贡献者不就使用本软件造成的直接、间接、附带或后果性损害承担责任。
-
-9. 许可性质
-
-这是一份项目专用的源码可用许可证，包含非商业限制，不是 MIT、GPL、AGPL、
-Creative Commons 或经 OSI 批准的开源许可证；不应将其描述为允许不受限制
-商业使用的开源许可。中文文本为本许可证的正式文本。
+If the unit or agency is the Department of Defense ("DOD"), the Program and its documentation are classified as "commercial computer software" and "commercial computer software documentation" respectively and, pursuant to DFAR Section 227.7202, the Government is acquiring the Program and its documentation in accordance with the terms of this License. If the unit or agency is other than DOD, the Program and its documentation are classified as "commercial computer software" and "commercial computer software documentation" respectively and, pursuant to FAR Section 12.212, the Government is acquiring the Program and its documentation in accordance with the terms of this License.

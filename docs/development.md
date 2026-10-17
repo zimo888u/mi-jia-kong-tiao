@@ -32,6 +32,8 @@ cargo run -p miac-app --release --example window-repaint --locked -- target/rest
 
 ## 分发
 
-Skill 可运行 `skills/miac-control/package.ps1` 打包。发布包须同时包含 `LICENSE` 和 `THIRD-PARTY-NOTICES.md`，保留 Slint 署名及第三方声明。桌面端和助手应使用同一版本。
+Skill 可运行 `skills/miac-control/package.ps1` 打包。发布包须同时包含 `LICENSE`、`LICENSE-NOTICE.md` 和 `THIRD-PARTY-NOTICES.md`，保留 Slint 署名及第三方声明。桌面端和助手应使用同一版本。
+
+AFPL 发行版同时提供完整对应源码包，包含项目、依赖源码及可离线解析的 Cargo 构建配置；第三方代码保留原有许可。完整源码包与程序包放在同一发行页，参见 `LICENSE` 第 2(c) 节。
 
 发版前检查源码标签、包内文件、SHA-256 和公开下载结果。运行日志、凭据、审计原稿、机器路径与个人验收截图仅在本地保存，不应加入源码或发行包。

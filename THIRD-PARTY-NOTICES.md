@@ -1,6 +1,6 @@
 # 第三方声明与授权文本
 
-本文件列出 Windows x86-64 工作区依赖图中组件的授权表达式与版权/许可文本；它们不受项目根目录的 MIAC-NC-SR-1.0 重新授权。编译器、Windows 系统组件及另行安装的软件仍适用自身条款。
+本文件列出 Windows x86-64 工作区依赖图中组件的授权表达式与版权/许可文本；它们保留原有授权，不因本项目采用 AFPL 而被重新授权。编译器、Windows 系统组件及另行安装的软件仍适用自身条款。
 
 Slint 相关组件作为本桌面应用的一部分，按 **Slint Royalty-free Desktop, Mobile, and Web Applications License 2.0** 使用。公开 README 和发行页显示 Made with Slint 徽章；vendor 保留上游多重许可、版权和补丁说明。发布源码不将 Slint 作为独立工具包再许可。
 
