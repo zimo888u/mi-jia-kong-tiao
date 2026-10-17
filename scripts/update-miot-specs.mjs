@@ -1,5 +1,8 @@
 // Refresh public MIoT fixtures. No Xiaomi account or device credentials required.
-import { writeFile, mkdir } from 'node:fs/promises';
+import { open, mkdir, rename, rm } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 const base = 'https://miot-spec.org/miot-spec-v2/';
 async function get(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(60000) });
@@ -43,6 +46,16 @@ for (let offset = 0; offset < selected.length; offset += 4) {
 if (failures.length || Object.keys(bundle).length !== selected.length) {
   throw new Error(`Specification refresh incomplete; original bundle unchanged. ${failures.join('; ')}`);
 }
-await mkdir('crates/miac-core/specs', {recursive:true});
-await writeFile('crates/miac-core/specs/air-conditioners.json', JSON.stringify(Object.fromEntries(Object.entries(bundle).sort())) + '\n');
+const directory = fileURLToPath(new URL('../crates/miac-core/specs/', import.meta.url));
+await mkdir(directory, {recursive:true});
+const target = join(directory, 'air-conditioners.json');
+const temporary = join(dirname(target), `.air-conditioners.${process.pid}.${randomUUID()}.tmp`);
+try {
+  const file = await open(temporary, 'wx');
+  try {
+    await file.writeFile(JSON.stringify(Object.fromEntries(Object.entries(bundle).sort())) + '\n');
+    await file.sync();
+  } finally { await file.close(); }
+  await rename(temporary, target);
+} finally { await rm(temporary, {force:true}); }
 console.log(`Downloaded ${Object.keys(bundle).length} model specifications.`);

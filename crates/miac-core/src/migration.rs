@@ -205,7 +205,7 @@ pub fn read_theme_from_leveldb(dir: &Path) -> Option<bool> {
         if !matches!(ext, "ldb" | "log") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = crate::io_limits::read_file(&path, crate::io_limits::SPEC_BYTES) else { continue };
 
         for key in KEYS {
             let kb = key.as_bytes();

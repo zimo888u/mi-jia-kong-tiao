@@ -66,6 +66,11 @@ impl std::error::Error for LoginError {}
 /// 且不允许带用户名密码。这是防止服务端返回的跳转把凭据带到别处。
 pub fn official_url(value: &str) -> Result<String, LoginError> {
     let trimmed = value.trim();
+    // HTTP URL parsers normalize backslashes and strip some control characters.
+    // Reject them before checking the authority so validation and transport agree.
+    if trimmed.contains('\\') || trimmed.chars().any(char::is_control) {
+        return Err(LoginError::BadUrl("地址包含控制字符或反斜杠".into()));
+    }
     let full = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         trimmed.to_string()
     } else if let Some(rest) = trimmed.strip_prefix("//") {
@@ -87,27 +92,67 @@ pub fn official_url(value: &str) -> Result<String, LoginError> {
     if authority.is_empty() || authority.contains('@') {
         return Err(LoginError::BadUrl(full));
     }
-    // 去掉端口再比对主机名
-    let host = authority.split(':').next().unwrap_or("").to_ascii_lowercase();
-    let ok = host == "xiaomi.com"
-        || host.ends_with(".xiaomi.com")
-        || host == "mi.com"
-        || host.ends_with(".mi.com");
-    if !ok {
+    let (host, port) = authority.split_once(':')
+        .map_or((authority, None), |(host, port)| (host, Some(port)));
+    if port.is_some_and(|port| port != "443") {
+        return Err(LoginError::BadUrl(full));
+    }
+    let host = host.to_ascii_lowercase();
+    let valid_host = host.split('.').all(|label| {
+        !label.is_empty() && label.len() <= 63
+            && !label.starts_with('-') && !label.ends_with('-')
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    });
+    if !valid_host || !official_host(&host) {
         return Err(LoginError::BadUrl(full));
     }
     Ok(full)
+}
+
+fn official_host(host: &str) -> bool {
+    matches!(host, "account.xiaomi.com" | "sts.api.io.mi.com" | "api.io.mi.com")
+}
+
+fn redirect_url(current: &str, location: &str) -> Result<String, LoginError> {
+    let location = location.trim();
+    if location.is_empty() {
+        return Err(LoginError::BadUrl("跳转地址为空".into()));
+    }
+    if location.starts_with("//") || location.contains("://") {
+        return official_url(location);
+    }
+    let current = official_url(current)?;
+    let authority_end = current["https://".len()..].find(['/', '?', '#'])
+        .map_or(current.len(), |end| "https://".len() + end);
+    let origin = &current[..authority_end];
+    let next = if location.starts_with('/') {
+        format!("{origin}{location}")
+    } else if location.starts_with('?') {
+        format!("{}{location}", current.split(['?', '#']).next().unwrap_or(&current))
+    } else if location.starts_with('#') {
+        format!("{}{location}", current.split('#').next().unwrap_or(&current))
+    } else {
+        // Relative paths inherit the current URL's directory. The HTTP parser
+        // resolves dot segments after we have kept the authority unchanged.
+        if location.split('/').next().is_some_and(|segment| segment.contains(':')) {
+            return Err(LoginError::BadUrl("跳转地址包含不支持的协议".into()));
+        }
+        let path = current[authority_end..].split(['?', '#']).next().unwrap_or("");
+        let directory = path.rfind('/').map(|at| &path[..=at]).unwrap_or("/");
+        format!("{origin}{directory}{location}")
+    };
+    official_url(&next)
 }
 
 /// 极简 cookie 存储：只按域名字符串匹配保存 name=value。
 ///
 /// 之所以不用成熟实现：小米登录只需要把服务端下发的 cookie 原样回传，
 /// 而它偶尔会带不合 RFC 的属性（`looseMode` 要处理的就是这个）。
-/// 这里只取每段 Set-Cookie 的第一对 `name=value`，其余属性一律忽略。
+/// 属性宽松解析，但保留 Domain 的作用域；没有 Domain 时只发回原始主机。
 #[derive(Default)]
 pub struct CookieJar {
-    /// (域名后缀, name, value)
-    entries: Vec<(String, String, String)>,
+    /// (域名, 仅原始主机, name, value)
+    entries: Vec<(String, bool, String, crate::secret::SecretString)>,
 }
 
 impl CookieJar {
@@ -119,38 +164,61 @@ impl CookieJar {
     ///
     /// 返回本次响应中新出现的 `serviceToken`（登录流程要单独抓它，
     /// 因为它在跳转过程中下发，可能不在最终页面的域名下）。
-    pub fn absorb(&mut self, url: &str, set_cookies: &[String]) -> Option<String> {
+    pub fn absorb(&mut self, url: &str, set_cookies: &[String]) -> Option<crate::secret::SecretString> {
         let host = host_of(url);
         let mut service_token = None;
 
         for raw in set_cookies {
-            let pair = raw.split(';').next().unwrap_or("").trim();
+            let mut parts = raw.split(';');
+            let pair = parts.next().unwrap_or("").trim();
             let Some(eq) = pair.find('=') else { continue };
             let name = pair[..eq].trim().to_string();
             let value = pair[eq + 1..].trim().trim_matches('"').to_string();
-            if name.is_empty() {
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                || !value.bytes().all(|b| matches!(b, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)) {
                 continue;
             }
+            let mut domain = host.clone();
+            let mut host_only = true;
+            let mut valid_domain = true;
+            for attribute in parts {
+                let Some((key, value)) = attribute.trim().split_once('=') else { continue };
+                if key.trim().eq_ignore_ascii_case("domain") {
+                    let value = value.trim().trim_start_matches('.').to_ascii_lowercase();
+                    if !(value == "xiaomi.com" || value == "mi.com" || official_host(&value))
+                        || !(host == value || host.ends_with(&format!(".{value}")))
+                    {
+                        valid_domain = false;
+                        break;
+                    }
+                    // A broad Domain attribute must not widen a login cookie's
+                    // scope to another service, even on the same parent domain.
+                    domain = host.clone();
+                    host_only = true;
+                }
+            }
+            if !valid_domain { continue; }
             if name == "serviceToken" && !value.is_empty() {
-                service_token = Some(value.clone());
+                service_token = Some(value.clone().into());
             }
             // 同名的覆盖旧的
-            self.entries.retain(|(d, n, _)| !(d == &host && n == &name));
-            self.entries.push((host.clone(), name, value));
+            self.entries.retain(|(d, _, n, _)| !(d == &domain && n == &name));
+            self.entries.push((domain, host_only, name, value.into()));
         }
         service_token
     }
 
     /// 取某个 URL 的 cookie 串。
     ///
-    /// 匹配规则：cookie 的域名是 URL 域名的后缀（含相等），
+    /// 显式 Domain 匹配后缀，无 Domain 只匹配原始主机，
     /// 这样 `account.xiaomi.com` 下发的 cookie 在 `sts.api.io.mi.com` 上不会误发。
     pub fn cookie_string(&self, url: &str) -> String {
+        if official_url(url).is_err() { return String::new(); }
         let host = host_of(url);
         self.entries
             .iter()
-            .filter(|(d, _, _)| host == *d || host.ends_with(&format!(".{d}")))
-            .map(|(_, n, v)| format!("{n}={v}"))
+            .filter(|(d, host_only, _, _)| host == *d || (!host_only && host.ends_with(&format!(".{d}"))))
+            .map(|(_, _, n, v)| format!("{n}={}", v.as_str()))
             .collect::<Vec<_>>()
             .join("; ")
     }
@@ -159,8 +227,8 @@ impl CookieJar {
     pub fn get(&self, name: &str) -> Option<&str> {
         self.entries
             .iter()
-            .find(|(_, n, _)| n == name)
-            .map(|(_, _, v)| v.as_str())
+            .find(|(_, _, n, _)| n == name)
+            .map(|(_, _, _, v)| v.as_str())
     }
 }
 
@@ -193,8 +261,8 @@ pub struct Challenge {
 #[derive(Debug, Clone)]
 pub struct LoginResult {
     pub user_id: String,
-    pub ssecurity: String,
-    pub service_token: String,
+    pub ssecurity: crate::secret::SecretString,
+    pub service_token: crate::secret::SecretString,
 }
 
 impl LoginResult {
@@ -219,14 +287,19 @@ pub struct CloudDevice {
     pub model: String,
     pub did: String,
     pub localip: Option<String>,
-    pub token: Option<String>,
+    pub token: Option<crate::secret::SecretString>,
     pub online: bool,
 }
 
 impl CloudDevice {
     /// 从设备列表的一条记录里取字段（字段名与米家云一致）。
     pub fn from_json(v: &Value) -> Option<Self> {
-        let did = v.get("did").and_then(Value::as_str)?.to_string();
+        let did = match v.get("did")? {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.as_u64()?.to_string(),
+            _ => return None,
+        };
+        if !crate::credentials::valid_did(&did) { return None; }
         Some(Self {
             name: v.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
             model: v.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -234,26 +307,29 @@ impl CloudDevice {
             localip: v
                 .get("localip")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
+                .filter(|s| crate::miio::local_address(s).is_ok())
                 .map(str::to_string),
             token: v
                 .get("token")
                 .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .filter(|s| crate::miio::parse_token(s).is_ok())
+                .map(crate::secret::SecretString::from),
             online: v.get("isOnline").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 
-    /// 看起来像空调（与 v1 的判定一致：型号或名字里含空调特征）。
+    /// 优先按型号类别识别空调，仅在缺少型号时使用名称。
     pub fn looks_like_ac(&self) -> bool {
-        let m = self.model.to_ascii_lowercase();
-        m.contains("aircondition") || m.contains("airc.") || self.name.contains("空调")
+        let model = self.model.trim().to_ascii_lowercase();
+        matches!(model.split('.').nth(1), Some("airc" | "aircondition" | "airconditioner"))
+            || (model.is_empty() && self.name.contains("空调"))
     }
 
-    /// 是米家智能温湿度计 3。
+    /// 按温湿度传感器型号识别，支持用户重命名的温湿度计。
     pub fn is_thermometer(&self) -> bool {
-        self.model == "miaomiaoce.sensor_ht.t9" || self.name.contains("温湿度计")
+        let model = self.model.trim().to_ascii_lowercase();
+        model.split('.').nth(1) == Some("sensor_ht")
+            || (model.is_empty() && self.name.contains("温湿度计"))
     }
 }
 
@@ -261,7 +337,8 @@ impl CloudDevice {
 pub struct LoginSession {
     jar: CookieJar,
     agent: ureq::Agent,
-    service_token: Option<String>,
+    service_token: Option<crate::secret::SecretString>,
+    config_error: Option<String>,
 }
 
 impl LoginSession {
@@ -275,19 +352,23 @@ impl LoginSession {
                 .unwrap_or(15000),
         );
         let mut builder = ureq::AgentBuilder::new()
+            .tls_config(crate::tls::connector())
             .timeout(timeout)
             .redirects(0) // 手动处理跳转，才能逐跳收集 cookie
             .user_agent("MiHome/6.0.0 (Android)");
+        let mut config_error = None;
         if let Some(p) = proxy.as_deref().filter(|p| !p.trim().is_empty()) {
-            if let Ok(px) = ureq::Proxy::new(p) {
-                builder = builder.proxy(px);
+            match ureq::Proxy::new(p) {
+                Ok(px) => builder = builder.proxy(px),
+                Err(_) => config_error = Some("代理配置无效，请检查 MIAC_PROXY".into()),
             }
         }
-        Self { jar: CookieJar::new(), agent: builder.build(), service_token: None }
+        Self { jar: CookieJar::new(), agent: builder.build(), service_token: None, config_error }
     }
 
     /// 发起一次请求并跟随跳转（每跳收集 Set-Cookie），返回最终响应体文本与最终 URL。
     pub fn request(&mut self, url: &str) -> Result<(String, String), LoginError> {
+        if let Some(error) = &self.config_error { return Err(LoginError::Other(error.clone())); }
         let mut current = official_url(url)?;
 
         for _ in 0..10 {
@@ -298,7 +379,7 @@ impl LoginSession {
             }
             let resp = req
                 .call()
-                .map_err(|e| LoginError::Transport(e.to_string()))?;
+                .map_err(|_| LoginError::Transport("网络连接失败，请检查网络和代理配置".into()))?;
 
             // 收集 cookie（逐跳都要收）
             let set_cookies: Vec<String> = resp
@@ -315,15 +396,15 @@ impl LoginSession {
                 let Some(loc) = resp.header("location") else {
                     return Err(LoginError::Parse("登录跳转缺少地址".into()));
                 };
-                current = official_url(loc)?;
+                current = redirect_url(&current, loc)?;
                 continue;
             }
             if !(200..300).contains(&status) {
                 return Err(LoginError::Other(format!("小米登录服务 HTTP {status}")));
             }
-            let text = resp
-                .into_string()
+            let bytes = crate::io_limits::read(resp.into_reader(), crate::io_limits::HTTP_BYTES)
                 .map_err(|e| LoginError::Transport(format!("读取响应失败：{e}")))?;
+            let text = String::from_utf8(bytes).map_err(|_| LoginError::Parse("响应不是 UTF-8".into()))?;
             return Ok((text, current));
         }
         Err(LoginError::Parse("小米登录跳转次数过多".into()))
@@ -331,7 +412,9 @@ impl LoginSession {
 
     /// 取原始字节（下载二维码图片用）。
     pub fn get_bytes(&mut self, url: &str, limit: usize) -> Result<Vec<u8>, LoginError> {
-        let url = official_url(url)?;
+        if let Some(error) = &self.config_error { return Err(LoginError::Other(error.clone())); }
+        let mut url = official_url(url)?;
+        for _ in 0..10 {
         let cookie = self.jar.cookie_string(&url);
         let mut req = self.agent.get(&url);
         if !cookie.is_empty() {
@@ -339,21 +422,22 @@ impl LoginSession {
         }
         let resp = req
             .call()
-            .map_err(|e| LoginError::Transport(e.to_string()))?;
+            .map_err(|_| LoginError::Transport("网络连接失败，请检查网络和代理配置".into()))?;
         let set_cookies: Vec<String> = resp
             .all("set-cookie")
             .into_iter()
             .map(str::to_string)
             .collect();
         self.jar.absorb(&url, &set_cookies);
-
-        let mut buf = Vec::new();
-        use std::io::Read;
-        resp.into_reader()
-            .take(limit as u64)
-            .read_to_end(&mut buf)
-            .map_err(|e| LoginError::Transport(format!("下载二维码失败：{e}")))?;
-        Ok(buf)
+        if (300..400).contains(&resp.status()) {
+            let location = resp.header("location").ok_or_else(|| LoginError::Parse("二维码跳转缺少地址".into()))?;
+            url = redirect_url(&url, location)?;
+            continue;
+        }
+        return crate::io_limits::read(resp.into_reader(), limit)
+            .map_err(|e| LoginError::Transport(format!("下载二维码失败：{e}")));
+        }
+        Err(LoginError::Parse("二维码跳转次数过多".into()))
     }
 
     /// 生成扫码挑战（拿到二维码图片与轮询地址）。
@@ -428,7 +512,15 @@ impl LoginSession {
             let (text, _) = match self.request(&challenge.poll_url) {
                 Ok(v) => v,
                 // 轮询超时是常态（长轮询），继续下一轮
-                Err(LoginError::Transport(_)) => continue,
+                Err(LoginError::Transport(_)) => {
+                    // Short slices keep Cancel responsive even when the network
+                    // fails immediately rather than using the long-poll timeout.
+                    for _ in 0..10 {
+                        if !tick() { return Err(LoginError::Cancelled); }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             let data: Value = parse_xiaomi_json(&text)?;
@@ -437,10 +529,12 @@ impl LoginSession {
 
             // userId 可能是 JSON 字符串或数字；location 齐全才算用户确认了。
             let Some(location) = location else {
-                return Err(LoginError::Other(format!(
-                    "扫码未完成或已失效（code={}），请重新生成二维码",
-                    data.get("code").and_then(Value::as_i64).unwrap_or(0)
-                )));
+                let code = data.get("code").and_then(Value::as_i64).unwrap_or(0);
+                if code == 0 {
+                    std::thread::sleep(Duration::from_millis(300));
+                    continue;
+                }
+                return Err(LoginError::Other(format!("扫码轮询失败（code={code}），请重新生成二维码")));
             };
 
             // 用 location 换 serviceToken
@@ -448,7 +542,7 @@ impl LoginSession {
             let token = self
                 .service_token
                 .clone()
-                .or_else(|| self.jar.get("serviceToken").map(str::to_string))
+                .or_else(|| self.jar.get("serviceToken").map(crate::secret::SecretString::from))
                 .ok_or_else(|| {
                     LoginError::Other("扫码已确认，但小米未返回米家云令牌".into())
                 })?;
@@ -480,8 +574,8 @@ fn login_result_from_payload(data: &Value, service_token: &str) -> Result<LoginR
 
     Ok(LoginResult {
         user_id,
-        ssecurity: ssecurity.to_string(),
-        service_token: service_token.to_string(),
+        ssecurity: ssecurity.into(),
+        service_token: service_token.into(),
     })
 }
 
@@ -492,7 +586,7 @@ pub fn parse_xiaomi_json(text: &str) -> Result<Value, LoginError> {
         .map_err(|e| LoginError::Parse(format!("返回了非 JSON 内容：{e}")))
 }
 
-/// 用已有会话拉设备列表。
+/// 用已有会话读取空调与温湿度计，不向登录界面传递其他设备。
 pub fn fetch_devices(
     session: &crate::cloud::CloudSession,
     proxy: Option<String>,
@@ -501,7 +595,47 @@ pub fn fetch_devices(
     let list = client
         .device_list()
         .map_err(|e| LoginError::Other(format!("米家云设备列表读取失败：{e}")))?;
-    Ok(list.iter().filter_map(CloudDevice::from_json).collect())
+    let invalid = list.iter().filter(|record| CloudDevice::from_json(record).is_none()).count();
+    if invalid > 0 {
+        return Err(LoginError::Parse(format!("设备列表含 {invalid} 条无效设备标识，请刷新后重试")));
+    }
+    Ok(login_devices_from_json(&list))
+}
+
+fn login_devices_from_json(list: &[Value]) -> Vec<CloudDevice> {
+    list.iter()
+        .filter_map(CloudDevice::from_json)
+        .filter(|device| device.looks_like_ac() || device.is_thermometer())
+        .collect()
+}
+
+/// Validate a selected model before atomically committing the whole login.
+pub fn save_credentials(
+    creds: &crate::credentials::Credentials, session: &CloudSession,
+    devices: &[CloudDevice], idx: usize,
+) -> Result<(String, Option<String>), String> {
+    save_credentials_if(creds, session, devices, idx, || true)
+}
+
+pub fn save_credentials_if(
+    creds: &crate::credentials::Credentials, session: &CloudSession,
+    devices: &[CloudDevice], idx: usize, allow_commit: impl Fn() -> bool,
+) -> Result<(String, Option<String>), String> {
+    use crate::credentials::{DeviceInfo, ThermometerInfo};
+    let ac = devices.get(idx).ok_or("所选设备不在本次登录的设备列表里")?;
+    if !ac.looks_like_ac() { return Err("请选择空调，温湿度计会自动关联".into()); }
+    crate::profile::load(&ac.model, creds.primary_dir(), None)
+        .map_err(|e| format!("所选设备没有可安全使用的空调规格：{e}"))?;
+    let device = DeviceInfo { name: Some(ac.name.clone()), model: Some(ac.model.clone()),
+        did: ac.did.clone(), localip: ac.localip.clone(), token: ac.token.clone(),
+        saved_at: Some(now_iso8601()) };
+    let thermometer = devices.iter().find(|d| d.is_thermometer()).map(|d| ThermometerInfo {
+        name: Some(d.name.clone()), model: Some(d.model.clone()), did: d.did.clone(),
+        saved_at: Some(now_iso8601()),
+    });
+    creds.write_login_if(session, &device, thermometer.as_ref(), allow_commit)
+        .map_err(|e| format!("保存登录状态失败，原有登录保持有效：{e}"))?;
+    Ok((ac.name.clone(), thermometer.and_then(|t| t.name)))
 }
 
 /// ISO8601 时间戳（与 v1 的 `new Date().toISOString()` 同格式）。
@@ -510,7 +644,11 @@ pub fn now_iso8601() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (y, mo, d) = crate::controller::ymd_from_unix(secs as i64);
+    iso8601_at(secs)
+}
+
+fn iso8601_at(secs: u64) -> String {
+    let (y, mo, d) = crate::controller::ymd_from_unix_utc(secs as i64);
     let day = secs % 86400;
     format!(
         "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}.000Z",
@@ -523,6 +661,20 @@ pub fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_timestamp_keeps_the_utc_date_across_taipei_midnight() {
+        assert_eq!(iso8601_at(57_600), "1970-01-01T16:00:00.000Z");
+        assert_eq!(iso8601_at(86_399), "1970-01-01T23:59:59.000Z");
+        assert_eq!(iso8601_at(86_400), "1970-01-02T00:00:00.000Z");
+    }
+
+    #[test]
+    fn login_rejects_unrelated_official_subdomains_and_nonstandard_ports() {
+        for url in ["https://shop.mi.com/x", "https://arbitrary.xiaomi.com/x", "https://account.xiaomi.com:444/x", "https://account.xiaomi.com:80/x"] {
+            assert!(official_url(url).is_err(), "{url}");
+        }
+    }
 
     #[test]
     fn official_url_accepts_xiaomi_only() {
@@ -544,6 +696,50 @@ mod tests {
         assert!(official_url("http://account.xiaomi.com/x").is_err());
         // 带 userinfo 不允许
         assert!(official_url("https://user:pass@account.xiaomi.com/x").is_err());
+    }
+
+    #[test]
+    fn official_url_rejects_ambiguous_authorities() {
+        for input in [
+            "https://evil.example\\.xiaomi.com/pass",
+            "https://account.xiaomi.com:abc/pass",
+            "https://account.xiaomi.com:443:80/pass",
+            "https://account.xiaomi.com\n/pass",
+        ] {
+            assert!(official_url(input).is_err(), "ambiguous login URL accepted: {input:?}");
+        }
+        assert!(official_url("https://account.xiaomi.com:443/pass").is_ok());
+    }
+
+    #[test]
+    fn relative_redirects_keep_the_response_host_and_path() {
+        let current = "https://sts.api.io.mi.com/sts/login?sign=old";
+        assert_eq!(redirect_url(current, "/next").unwrap(), "https://sts.api.io.mi.com/next");
+        assert_eq!(redirect_url(current, "next").unwrap(), "https://sts.api.io.mi.com/sts/next");
+        assert_eq!(redirect_url(current, "?sign=new").unwrap(), "https://sts.api.io.mi.com/sts/login?sign=new");
+        assert!(redirect_url(current, "//evil.example/pass").is_err());
+    }
+
+    #[test]
+    fn host_only_cookies_are_not_sent_to_subdomains() {
+        let mut jar = CookieJar::new();
+        jar.absorb("https://account.xiaomi.com/", &["hostOnly=SECRET; Path=/".into()]);
+        assert_eq!(jar.cookie_string("https://account.xiaomi.com/pass"), "hostOnly=SECRET");
+        assert!(jar.cookie_string("https://child.account.xiaomi.com/").is_empty());
+    }
+
+    #[test]
+    fn explicit_cookie_domains_are_respected_and_checked() {
+        let mut jar = CookieJar::new();
+        jar.absorb("https://account.xiaomi.com/", &[
+            "shared=SECRET; Domain=.xiaomi.com; Path=/; weird==attr".into(),
+            "foreign=SECRET; Domain=mi.com".into(),
+        ]);
+        assert_eq!(jar.cookie_string("https://account.xiaomi.com/"), "shared=SECRET");
+        assert!(jar.cookie_string("https://www.xiaomi.com/").is_empty());
+        assert!(jar.cookie_string("https://sts.api.io.mi.com/").is_empty());
+        assert!(jar.cookie_string("https://mi.com/").is_empty());
+        assert_eq!(jar.get("foreign"), None);
     }
 
     #[test]
@@ -644,6 +840,40 @@ mod tests {
 
         // 缺 did 的记录直接丢弃
         assert!(CloudDevice::from_json(&serde_json::json!({"name":"x"})).is_none());
+    }
+
+    #[test]
+    fn login_list_keeps_only_air_conditioners_and_thermometers() {
+        let list = serde_json::json!([
+            {"did":"router", "name":"Xiaomi_Zimo", "model":"xiaomi.router.r4"},
+            {"did":"ac", "name":"客厅", "model":"xiaomi.airc.h53h00"},
+            {"did":"band", "name":"小米手环9 Pro", "model":"hmpace.watch.v1"},
+            {"did":"rice", "name":"电饭煲", "model":"chunmi.cooker.normal1"},
+            {"did":"fan", "name":"空调伴侣风扇", "model":"zhimi.fan.v1"},
+            {"did":"thermo", "name":"卧室读数", "model":"miaomiaoce.sensor_ht.t9"},
+            {"did":"scale", "name":"温湿度计旁的体脂秤", "model":"xiaomi.scales.s400"},
+            {"did":"ac2", "name":"书房", "model":"zhimi.aircondition.v1"}
+        ]);
+        let devices = login_devices_from_json(list.as_array().unwrap());
+        assert_eq!(devices.iter().map(|d| d.did.as_str()).collect::<Vec<_>>(),
+            vec!["ac", "thermo", "ac2"]);
+        assert!(devices[1].is_thermometer(), "重命名后的温湿度计也应保留");
+    }
+
+    #[test]
+    fn login_list_handles_empty_accounts_and_missing_models() {
+        assert!(login_devices_from_json(&[]).is_empty());
+        let list = serde_json::json!([
+            {"did":"ac", "name":"卧室空调"},
+            {"did":"thermo", "name":"温湿度计"},
+            {"did":"other", "name":"电饭煲"},
+            {"name":"空调", "model":"xiaomi.airc.h53h00"}
+        ]);
+        assert_eq!(login_devices_from_json(list.as_array().unwrap()).len(), 2);
+        for model in crate::profile::bundled_specs().as_object().unwrap().keys() {
+            let d = CloudDevice::from_json(&serde_json::json!({"did":"ac", "model":model})).unwrap();
+            assert!(d.looks_like_ac(), "内置空调型号不应被过滤：{model}");
+        }
     }
 
     #[test]

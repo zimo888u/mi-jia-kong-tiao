@@ -1,0 +1,122 @@
+import { Theme } from "../theme.slint";
+import { Card } from "../common.slint";
+
+component ThemeChoice inherits Rectangle {
+    in property <int> kind;
+    in property <string> label;
+    in property <string> detail;
+    in property <bool> active;
+    callback clicked();
+    property <color> sample-bg: kind == 4 ? #000000 : kind == 3 ? #fff5fa : kind == 1 ? #17231e : kind == 2 ? #f5f5f7 : #f5f7f3;
+    property <color> sample-panel: kind == 4 ? #101012 : kind == 1 ? #25362d : #ffffff;
+    property <color> sample-sidebar: kind == 4 ? #000000 : kind == 3 ? #f7ecf4 : kind == 1 ? #1b2a22 : kind == 2 ? #e9e9ef : #eff3ec;
+    property <color> sample-accent: kind == 4 ? #bcd9ae : kind == 1 ? #a9c68c : kind == 2 ? #007aff : #365f43;
+    property <color> sample-line: kind == 4 ? #44444c : kind == 1 ? #47604d : kind == 2 ? #dedee5 : #d5dfce;
+
+    height: 166px;
+    min-width: 180px;
+    horizontal-stretch: 1;
+    forward-focus: choice-focus;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-checkable: true;
+    accessible-checked: active;
+    accessible-action-default => { root.clicked(); }
+    border-radius: 10px;
+    background: choice-touch.has-hover ? Theme.bg-soft : Theme.panel;
+    border-width: active || choice-focus.has-focus ? 2px : 1px;
+    border-color: active || choice-focus.has-focus ? Theme.accent : Theme.line;
+
+    // Small native preview of the actual palette, kept crisp at every DPI.
+    Rectangle {
+        x: 12px; y: 12px; width: parent.width - 24px; height: 86px;
+        border-radius: 6px; background: root.sample-bg;
+        border-width: 1px; border-color: root.sample-line;
+        Rectangle {
+            x: 1px; y: 1px; width: 42px; height: parent.height - 2px;
+            border-top-left-radius: 5px; border-bottom-left-radius: 5px;
+            background: root.sample-sidebar;
+            Rectangle { x: 8px; y: 12px; width: 25px; height: 4px; border-radius: 2px; background: root.sample-accent; }
+            Rectangle { x: 6px; y: 28px; width: 30px; height: 10px; border-radius: 3px; background: root.kind == 2 ? root.sample-accent : root.sample-line; }
+            Rectangle { x: 8px; y: 46px; width: 23px; height: 3px; border-radius: 1px; background: root.sample-line; }
+            Rectangle { x: 8px; y: 57px; width: 23px; height: 3px; border-radius: 1px; background: root.sample-line; }
+        }
+        Rectangle {
+            x: 52px; y: 10px; width: parent.width - 64px; height: 6px;
+            border-radius: 2px; background: root.sample-line;
+        }
+        Rectangle {
+            x: 52px; y: 25px; width: parent.width - 64px; height: 50px;
+            border-radius: 5px; background: root.sample-panel;
+            border-width: 1px; border-color: root.sample-line;
+            Text {
+                text: "26°"; color: root.sample-accent; font-size: 25px; font-weight: 400;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+        if root.kind == 3 || root.kind == 4 : Image {
+            x: 6px; y: 42px; width: 32px; height: 42px;
+            source: Theme.image-for(6, self.width / 1phx, self.height / 1phx);
+            image-fit: fill; accessible-role: none;
+        }
+        if root.kind == 3 || root.kind == 4 : Image {
+            x: parent.width - 35px; y: 30px; width: 24px; height: 44px;
+            source: Theme.image-for(7, self.width / 1phx, self.height / 1phx);
+            image-fit: fill; opacity: 0.45; accessible-role: none;
+        }
+    }
+    Text {
+        x: 14px; y: 109px; width: parent.width - 52px; height: 22px;
+        text: root.label; color: Theme.text; font-size: 14px; font-weight: 600;
+        vertical-alignment: center;
+    }
+    Text {
+        x: 14px; y: 137px; width: parent.width - 28px; height: 15px;
+        text: root.detail; color: Theme.text-mute; font-size: Theme.font-xs;
+    }
+    if root.active : Rectangle {
+        x: parent.width - 32px; y: 112px; width: 18px; height: 18px;
+        border-radius: 9px; background: Theme.accent;
+        Path {
+            x: 3px; y: 3px; width: 12px; height: 12px;
+            viewbox-width: 12; viewbox-height: 12; fit: preserve;
+            commands: "M 2 6 L 4.5 8.5 L 10 3";
+            stroke: Theme.on-accent; stroke-width: 1.5px;
+            stroke-line-cap: round; stroke-line-join: round;
+        }
+    }
+    choice-focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+    choice-touch := TouchArea { mouse-cursor: pointer; clicked => { choice-focus.focus(); root.clicked(); } }
+}
+
+export component AppearancePage inherits VerticalLayout {
+    in property <int> theme-index: 0;
+    callback set-theme(int);
+    spacing: Theme.gap;
+
+    Card {
+        title: "软件主题";
+        Text { text: "选择外观"; color: Theme.text-dim; font-size: Theme.font-sm; }
+        HorizontalLayout {
+            spacing: 16px;
+            ThemeChoice { kind: 0; label: "浅色"; detail: "清新鼠尾草绿"; active: root.theme-index == 0; clicked => { root.set-theme(0); } }
+            ThemeChoice { kind: 1; label: "深色"; detail: "柔和深色背景"; active: root.theme-index == 1; clicked => { root.set-theme(1); } }
+            ThemeChoice { kind: 2; label: "macOS"; detail: "银灰界面 · 系统蓝"; active: root.theme-index == 2; clicked => { root.set-theme(2); } }
+        }
+        HorizontalLayout {
+            spacing: 16px;
+            ThemeChoice { kind: 3; label: "丛雨·亮色"; detail: "千恋万花 · 柔和亮色"; active: root.theme-index == 3; clicked => { root.set-theme(3); } }
+            ThemeChoice { kind: 4; label: "丛雨·暗色"; detail: "纯黑背景 · 丛雨立绘"; active: root.theme-index == 4; clicked => { root.set-theme(4); } }
+            Rectangle { min-width: 180px; horizontal-stretch: 1; }
+        }
+        Text { text: "主题应用到所有页面，偏好会自动保存。"; color: Theme.text-mute; font-size: Theme.font-xs; wrap: word-wrap; }
+    }
+}

@@ -14,6 +14,8 @@ pub mod crypto;
 pub mod demo;
 pub mod dpapi;
 pub mod login;
+pub mod io_limits;
+pub mod secret;
 pub mod migration;
 pub mod miio;
 pub mod miot;
@@ -21,6 +23,8 @@ pub mod profile;
 pub mod settings;
 pub mod tls;
 pub mod worker;
+#[cfg(test)]
+mod remediation_tests;
 
 /// 通信通道策略，对应设置页的三选一。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

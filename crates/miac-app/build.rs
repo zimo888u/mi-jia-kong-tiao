@@ -40,7 +40,16 @@ fn embed_windows_icon() {
             .find(|rc| rc.is_file())
     }
 
-    let rc = find_rc().expect("未找到 Windows SDK 的 rc.exe，无法嵌入应用图标");
+    println!("cargo:rerun-if-env-changed=MIAC_SKIP_WINDOWS_ICON");
+    println!("cargo:rerun-if-env-changed=WindowsSdkDir");
+    if std::env::var_os("MIAC_SKIP_WINDOWS_ICON").is_some() {
+        println!("cargo:warning=MIAC_SKIP_WINDOWS_ICON: building without the optional Windows icon");
+        return;
+    }
+    let Some(rc) = find_rc() else {
+        println!("cargo:warning=Windows SDK rc.exe not found; building without the optional Windows icon");
+        return;
+    };
     let manifest_dir = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let assets = manifest_dir.join("assets");
     let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("app-icon.res");
@@ -73,6 +82,9 @@ fn main() {
 
     println!("cargo:rerun-if-changed=ui/main.slint");
     println!("cargo:rerun-if-changed=ui/theme.slint");
+    println!("cargo:rerun-if-changed=ui/senren.slint");
+    println!("cargo:rerun-if-changed=assets/senren/murasame.png");
+    println!("cargo:rerun-if-changed=assets/senren/character-atlas.png");
     println!("cargo:rerun-if-changed=ui/common.slint");
     println!("cargo:rerun-if-changed=ui/dial-math.slint");
     println!("cargo:rerun-if-changed=ui/toast.slint");
@@ -81,4 +93,5 @@ fn main() {
     println!("cargo:rerun-if-changed=ui/pages/diag.slint");
     println!("cargo:rerun-if-changed=ui/pages/debug.slint");
     println!("cargo:rerun-if-changed=ui/pages/settings.slint");
+    println!("cargo:rerun-if-changed=ui/pages/appearance.slint");
 }

@@ -1,0 +1,48 @@
+// Artwork is filtered and cached at each widget's physical pixel size.
+import { Theme } from "theme.slint";
+
+export component CharacterIcon inherits Image {
+    in property <int> kind: 0;
+    width: 36px; height: 36px;
+    source: Theme.image-for(root.kind, self.width / 1phx, self.height / 1phx);
+    image-fit: fill;
+    accessible-role: none;
+}
+
+component Blossom inherits Path {
+    width: 42px; height: 42px;
+    viewbox-width: 40; viewbox-height: 40; fit: preserve;
+    fill: #dbb2ce;
+    commands: "M 20 21 C 5 16 15 2 20 13 C 25 2 35 16 20 21 Z M 20 21 C 18 5 34 7 25 16 C 37 15 36 31 20 21 Z M 20 21 C 34 14 37 30 25 26 C 31 37 15 40 20 21 Z M 20 21 C 29 35 13 40 15 27 C 5 35 0 20 20 21 Z M 20 21 C 7 32 1 16 14 17 C 3 11 15 2 20 21 Z";
+    accessible-role: none;
+}
+
+export component SenrenBackdrop inherits Rectangle {
+    clip: true;
+    background: Theme.senren-dark ? #000000 : @linear-gradient(135deg, #fff5fa 0%, #f7f3fc 48%, #edf7f1 100%);
+    // Character stays in the background's sidebar gutter on every page.
+    // At minimum window size she fits between navigation and the footer.
+    Image {
+        x: 20px; width: 180px;
+        height: min(240px, max(170px, root.height - 500px));
+        y: parent.height - self.height - 140px;
+        source: Theme.image-for(6, self.width / 1phx, self.height / 1phx);
+        image-fit: fill;
+        accessible-role: none;
+    }
+    // Keep the supplied standing artwork behind functional content on the right.
+    Image {
+        height: min(520px, parent.height - Theme.topbar-h - 2 * Theme.pad);
+        width: self.height * 281 / 515;
+        x: parent.width - self.width - Theme.pad;
+        y: parent.height - self.height - Theme.pad;
+        source: Theme.image-for(7, self.width / 1phx, self.height / 1phx);
+        image-fit: fill;
+        opacity: 0.95;
+        accessible-role: none;
+    }
+    Blossom { x: parent.width - 86px; y: 18px; opacity: 0.3; }
+    Blossom { x: parent.width - 118px; y: parent.height - 70px; width: 54px; height: 54px; opacity: 0.22; }
+    Blossom { x: 14px; y: parent.height - 165px; width: 28px; height: 28px; opacity: 0.35; }
+    Blossom { x: 178px; y: parent.height - 390px; width: 22px; height: 22px; opacity: 0.25; }
+}

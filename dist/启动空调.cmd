@@ -1,6 +1,7 @@
 @echo off
-rem Ã×¼Ò¿Õµ÷ v2£¨Rust + Slint Ô­Éú°æ£©Æô¶¯½Å±¾
-rem µ¥½ø³ÌÔ­ÉúÓ¦ÓÃ£¬²»ĞèÒª Electron / Chromium / Node.js¡£
-rem ½ø³ÌÃû±£³Ö miac-app£¬±ãÓÚÔÚÈÎÎñ¹ÜÀíÆ÷ÀïÓëĞÂ/¾É°æ±¾Çø·Ö¡£
+chcp 65001 >nul
+rem ç±³å®¶ç©ºè°ƒ v2ï¼ˆRust + Slint åŸç”Ÿç‰ˆï¼‰å¯åŠ¨è„šæœ¬
+rem å•è¿›ç¨‹åŸç”Ÿåº”ç”¨ï¼Œä¸éœ€è¦ Electron / Chromium / Node.jsã€‚
+rem è¿›ç¨‹åä¿æŒ miac-appï¼Œä¾¿äºåœ¨ä»»åŠ¡ç®¡ç†å™¨é‡Œä¸æ–°/æ—§ç‰ˆæœ¬åŒºåˆ†ã€‚
 cd /d "%~dp0"
 start "" "miac-app.exe"

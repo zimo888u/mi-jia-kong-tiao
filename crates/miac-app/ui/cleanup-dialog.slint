@@ -1,0 +1,43 @@
+import { Theme } from "theme.slint";
+import { FlatButton } from "common.slint";
+
+export component CleanupDialog inherits Rectangle {
+    callback confirm();
+    callback cancel();
+    background: Theme.overlay;
+    TouchArea { }
+    Rectangle {
+        width: 480px;
+        height: 280px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: Theme.radius;
+        background: Theme.dialog-panel;
+        border-width: 1px;
+        border-color: Theme.line;
+        VerticalLayout {
+            padding: 28px;
+            spacing: 16px;
+            Text { text: "一键删除凭证"; color: Theme.text; font-size: Theme.font-xl; font-weight: 600; }
+            Text {
+                text: "将删除本软件专属目录中的登录凭证、设备配置、设置、日志和缓存，清理本软件的注册表数据并取消开机自启动。";
+                color: Theme.text-dim;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+            Text {
+                text: "程序将退出完成清理；重新打开后需扫码登录。\n删除不可恢复，空调的运行状态不受影响。";
+                color: Theme.red;
+                font-size: Theme.font-sm;
+                wrap: word-wrap;
+            }
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                spacing: 12px;
+                Rectangle { horizontal-stretch: 1; }
+                FlatButton { label: "取消"; min-w: 88px; max-width: 88px; ghost: true; clicked => { root.cancel(); } }
+                FlatButton { label: "确认删除"; min-w: 120px; max-width: 120px; danger: true; clicked => { root.confirm(); } }
+            }
+        }
+    }
+}

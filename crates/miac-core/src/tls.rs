@@ -19,14 +19,18 @@ use rustls::ClientConfig;
 /// 不读系统证书存储，因此在证书存储损坏的机器上也能正常工作，
 /// 代价是不认企业自签的内网 CA（本项目只访问小米云，可以接受）。
 pub fn client_config() -> Arc<ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(roots)
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(root_store())
         .with_no_client_auth();
+    config.resumption = rustls::client::Resumption::disabled();
 
     Arc::new(config)
+}
+
+fn root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
 }
 
 /// 包装成 ureq 需要的连接器。
@@ -40,9 +44,10 @@ mod tests {
 
     #[test]
     fn config_has_roots_and_builds() {
-        // 能构建出来即说明 ring provider 已装好、根证书已加载
-        let cfg = client_config();
-        // 根证书不为空（webpki-roots 打包了 Mozilla 根证书集）
-        assert!(cfg.alpn_protocols.len() <= 8, "配置可构建且可读取");
+        let roots = root_store();
+        assert!(!roots.is_empty());
+        assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
+        let _ = rustls::ClientConnection::new(client_config(),
+            "api.io.mi.com".try_into().unwrap()).unwrap();
     }
 }

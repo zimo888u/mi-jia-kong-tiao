@@ -11,6 +11,11 @@
 device.json
 cloud-session.json
 thermometer.json
+login-state.json
+login-qr*.png
+login-qr*.jpg
+/skills/miac-control/scripts/*.exe
+/skills/miac-control/scripts/*.pdb
 credentials.json
 *.token
 *.secret
@@ -21,3 +26,7 @@ credentials.json
 .vscode/
 .DS_Store
 Thumbs.db
+__pycache__/
+
+# Cargo registry installation markers in vendored source
+/vendor/**/.cargo-ok

@@ -1,4 +1,4 @@
-// Sage desktop theme — shared by all five native pages.
+// Shared palette and metrics for all six native pages.
 export global Dark {
     out property <color> bg:          #17231e;
     out property <color> bg-soft:     #203027;
@@ -47,50 +47,133 @@ export global Light {
     out property <color> overlay:     rgba(20, 20, 24, 0.36);
 }
 
+// macOS-inspired silver surfaces, system blue, and quiet separators.
+export global Macos {
+    out property <color> bg:          #f5f5f7;
+    out property <color> bg-soft:     #f2f2f7;
+    out property <color> panel:       #ffffff;
+    out property <color> panel-hi:    #eaf3ff;
+    out property <color> line:        #d2d2d7;
+    out property <color> line-soft:   #e5e5ea;
+    out property <color> text:        #1d1d1f;
+    out property <color> text-dim:    #55555b;
+    out property <color> text-mute:   #73737a;
+    out property <color> accent:      #007aff;
+    out property <color> accent-deep: #0062cc;
+    out property <color> warm:        #a05a00;
+    out property <color> green:       #228343;
+    out property <color> red:         #d52b25;
+    out property <color> amber:       #a05a00;
+    out property <color> on-accent:   #ffffff;
+    out property <brush> sidebar:    @linear-gradient(180deg, #f0f0f4 0%, #e9e9ef 100%);
+    out property <brush> nav-active: #006ee6;
+    out property <brush> brand-mark: @linear-gradient(180deg, #2990ff 0%, #007aff 100%);
+    out property <brush> dial-track: #e9e9ef;
+    out property <color> overlay:    rgba(30, 30, 36, 0.28);
+}
+
+export global Senren {
+    out property <color> bg:          #faf7fb;
+    out property <color> bg-soft:     #f7f3fa;
+    out property <color> panel:       rgba(255, 255, 255, 0.78);
+    out property <color> panel-hi:    #f0eaf6;
+    out property <color> line:        #d5c7df;
+    out property <color> line-soft:   #e6ddeb;
+    out property <color> text:        #42374f;
+    out property <color> text-dim:    #6b5879;
+    out property <color> text-mute:   #85708d;
+    out property <color> accent:      #446f60;
+    out property <color> accent-deep: #315a4b;
+    out property <color> warm:        #a0662f;
+    out property <color> green:       #426e51;
+    out property <color> red:         #a83e61;
+    out property <color> amber:       #956329;
+    out property <color> on-accent:   #ffffff;
+    out property <brush> sidebar:    transparent;
+    out property <brush> nav-active: #e6f0e8;
+    out property <brush> brand-mark:  #bf86a6;
+    out property <brush> dial-track: #eee3f0;
+    out property <color> overlay:    rgba(48, 34, 62, 0.32);
+}
+
+export global SenrenDark {
+    out property <color> bg:          #000000;
+    out property <color> bg-soft:     #121214;
+    out property <color> panel:       rgba(16, 16, 18, 0.76);
+    out property <color> panel-hi:    #242429;
+    out property <color> line:        #44444c;
+    out property <color> line-soft:   #2d2d34;
+    out property <color> text:        #f5f3f7;
+    out property <color> text-dim:    #d1cad8;
+    out property <color> text-mute:   #ada3b8;
+    out property <color> accent:      #bcd9ae;
+    out property <color> accent-deep: #a4c496;
+    out property <color> warm:        #e1bd8b;
+    out property <color> green:       #bcd9ae;
+    out property <color> red:         #ef96b0;
+    out property <color> amber:       #e1bd8b;
+    out property <color> on-accent:   #152015;
+    out property <brush> sidebar:    transparent;
+    out property <brush> nav-active: #1d2620;
+    out property <brush> brand-mark: #ba94b2;
+    out property <brush> dial-track: #303038;
+    out property <color> overlay:    rgba(0, 0, 0, 0.76);
+}
+
 export global Theme {
-    in-out property <bool> dark: false;
+    in-out property <int> selected: 0; // 0 sage light, 1 sage dark, 2 macOS, 3 Senren light, 4 Senren dark
+    in-out property <int> page-icon: 0;
+    pure callback image-for(int, float, float) -> image;
+    out property <bool> dark: selected == 1 || selected == 4;
+    out property <bool> macos: selected == 2;
+    out property <bool> senren: selected == 3 || selected == 4;
+    out property <bool> senren-dark: selected == 4;
+    out property <bool> compact: macos || senren;
 
-    out property <color> bg:          dark ? Dark.bg          : Light.bg;
-    out property <color> bg-soft:     dark ? Dark.bg-soft     : Light.bg-soft;
-    out property <color> panel:       dark ? Dark.panel       : Light.panel;
-    out property <color> panel-hi:    dark ? Dark.panel-hi    : Light.panel-hi;
-    out property <color> line:        dark ? Dark.line        : Light.line;
-    out property <color> line-soft:   dark ? Dark.line-soft   : Light.line-soft;
-    out property <color> text:        dark ? Dark.text        : Light.text;
-    out property <color> text-dim:    dark ? Dark.text-dim    : Light.text-dim;
-    out property <color> text-mute:   dark ? Dark.text-mute   : Light.text-mute;
-    out property <color> accent:      dark ? Dark.accent      : Light.accent;
-    out property <color> accent-deep: dark ? Dark.accent-deep : Light.accent-deep;
-    out property <color> warm:        dark ? Dark.warm        : Light.warm;
-    out property <color> green:       dark ? Dark.green       : Light.green;
-    out property <color> red:         dark ? Dark.red         : Light.red;
-    out property <color> amber:       dark ? Dark.amber        : Light.amber;
-    out property <color> on-accent:   dark ? Dark.on-accent   : Light.on-accent;
-    out property <brush> sidebar:     dark ? Dark.sidebar     : Light.sidebar;
-    out property <brush> nav-active:  dark ? Dark.nav-active  : Light.nav-active;
-    out property <brush> brand-mark:  dark ? Dark.brand-mark  : Light.brand-mark;
-    out property <brush> dial-track:  dark ? Dark.dial-track  : Light.dial-track;
-    out property <color> overlay:     dark ? Dark.overlay     : Light.overlay;
+    out property <color> bg:          senren-dark ? SenrenDark.bg : senren ? Senren.bg : macos ? Macos.bg          : dark ? Dark.bg          : Light.bg;
+    out property <color> bg-soft:     senren-dark ? SenrenDark.bg-soft : senren ? Senren.bg-soft : macos ? Macos.bg-soft     : dark ? Dark.bg-soft     : Light.bg-soft;
+    out property <color> panel:       senren-dark ? SenrenDark.panel : senren ? Senren.panel : macos ? Macos.panel       : dark ? Dark.panel       : Light.panel;
+    out property <color> dialog-panel: senren-dark ? #0c0c0e : senren ? #fffafd : panel;
+    out property <color> panel-hi:    senren-dark ? SenrenDark.panel-hi : senren ? Senren.panel-hi : macos ? Macos.panel-hi    : dark ? Dark.panel-hi    : Light.panel-hi;
+    out property <color> line:        senren-dark ? SenrenDark.line : senren ? Senren.line : macos ? Macos.line        : dark ? Dark.line        : Light.line;
+    out property <color> line-soft:   senren-dark ? SenrenDark.line-soft : senren ? Senren.line-soft : macos ? Macos.line-soft   : dark ? Dark.line-soft   : Light.line-soft;
+    out property <color> text:        senren-dark ? SenrenDark.text : senren ? Senren.text : macos ? Macos.text        : dark ? Dark.text        : Light.text;
+    out property <color> text-dim:    senren-dark ? SenrenDark.text-dim : senren ? Senren.text-dim : macos ? Macos.text-dim    : dark ? Dark.text-dim    : Light.text-dim;
+    out property <color> text-mute:   senren-dark ? SenrenDark.text-mute : senren ? Senren.text-mute : macos ? Macos.text-mute   : dark ? Dark.text-mute   : Light.text-mute;
+    out property <color> accent:      senren-dark ? SenrenDark.accent : senren ? Senren.accent : macos ? Macos.accent      : dark ? Dark.accent      : Light.accent;
+    out property <color> accent-deep: senren-dark ? SenrenDark.accent-deep : senren ? Senren.accent-deep : macos ? Macos.accent-deep : dark ? Dark.accent-deep : Light.accent-deep;
+    out property <color> warm:        senren-dark ? SenrenDark.warm : senren ? Senren.warm : macos ? Macos.warm        : dark ? Dark.warm        : Light.warm;
+    out property <color> green:       senren-dark ? SenrenDark.green : senren ? Senren.green : macos ? Macos.green       : dark ? Dark.green       : Light.green;
+    out property <color> red:         senren-dark ? SenrenDark.red : senren ? Senren.red : macos ? Macos.red         : dark ? Dark.red         : Light.red;
+    out property <color> amber:       senren-dark ? SenrenDark.amber : senren ? Senren.amber : macos ? Macos.amber       : dark ? Dark.amber       : Light.amber;
+    out property <color> on-accent:   senren-dark ? SenrenDark.on-accent : senren ? Senren.on-accent : macos ? Macos.on-accent   : dark ? Dark.on-accent   : Light.on-accent;
+    out property <brush> sidebar:    senren-dark ? SenrenDark.sidebar : senren ? Senren.sidebar : macos ? Macos.sidebar     : dark ? Dark.sidebar     : Light.sidebar;
+    out property <brush> nav-active: senren-dark ? SenrenDark.nav-active : senren ? Senren.nav-active : macos ? Macos.nav-active  : dark ? Dark.nav-active  : Light.nav-active;
+    out property <brush> brand-mark: senren-dark ? SenrenDark.brand-mark : senren ? Senren.brand-mark : macos ? Macos.brand-mark  : dark ? Dark.brand-mark  : Light.brand-mark;
+    out property <brush> dial-track: senren-dark ? SenrenDark.dial-track : senren ? Senren.dial-track : macos ? Macos.dial-track  : dark ? Dark.dial-track  : Light.dial-track;
+    out property <color> overlay:    senren-dark ? SenrenDark.overlay : senren ? Senren.overlay : macos ? Macos.overlay     : dark ? Dark.overlay     : Light.overlay;
 
-    out property <color> sage-panel: dark ? #344732 : #e8eedf;
-    out property <color> dial-fill: dark ? #a9c68c : #84aa6d;
-    out property <color> nav-text: dark ? #eef4e9 : #284e3e;
-    out property <color> energy-bg: #2e4a3c;
-    out property <color> energy-text: #f0f5e9;
-    out property <color> energy-muted: #bdcdb5;
+    out property <color> sage-panel: senren-dark ? rgba(20, 20, 24, 0.82) : senren ? rgba(250, 235, 245, 0.82) : macos ? #edf3fc : dark ? #344732 : #e8eedf;
+    out property <color> dial-fill: senren-dark ? #bcd9ae : senren ? #87b19a : macos ? #007aff : dark ? #a9c68c : #84aa6d;
+    out property <color> nav-text: senren-dark ? #f5f3f7 : senren ? #42374f : macos ? #ffffff : dark ? #eef4e9 : #284e3e;
+    out property <color> energy-bg: senren-dark ? rgba(22, 22, 24, 0.82) : senren ? rgba(234, 242, 236, 0.82) : macos ? #e8f2ff : #2e4a3c;
+    out property <color> energy-text: senren-dark ? #f5f3f7 : senren ? #42374f : macos ? #1d1d1f : #f0f5e9;
+    out property <color> energy-muted: senren-dark ? #d1cad8 : senren ? #6b5879 : macos ? #55555b : #bdcdb5;
+    out property <brush> control-active: macos ? #006ee6 : accent;
+    out property <brush> control-idle: macos ? #ffffff : bg-soft;
 
     // 一套统一的间距和圆角，保证卡片、侧栏、选项的边缘能对齐。
-    out property <length> radius:     14px;
-    out property <length> radius-sm:  10px;
+    out property <length> radius:     senren ? 18px : macos ? 12px : 14px;
+    out property <length> radius-sm:  senren ? 12px : macos ? 7px : 10px;
     out property <length> sidebar-w:  220px;
-    out property <length> topbar-h:   116px;
-    out property <length> pad:        32px;
-    out property <length> gap:        20px;
+    out property <length> topbar-h:   senren ? 108px : macos ? 84px : 116px;
+    out property <length> pad:        senren ? 28px : macos ? 24px : 32px;
+    out property <length> gap:        senren ? 18px : macos ? 16px : 20px;
 
     out property <length> font-xs:    11px;
     out property <length> font-sm:    12px;
     out property <length> font-md:    13px;
-    out property <length> font-lg:    18px;
+    out property <length> font-lg:    macos ? 16px : 18px;
     out property <length> font-xl:    20px;
     out property <length> font-2xl:   28px;
     out property <length> font-3xl:   64px;

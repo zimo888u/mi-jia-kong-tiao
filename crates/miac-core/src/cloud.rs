@@ -26,6 +26,8 @@
 //! 完全绕开操作系统的证书存储。
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
@@ -41,33 +43,53 @@ type HmacSha256 = Hmac<Sha256>;
 /// 云接口对 User-Agent 敏感，照抄参考实现的机型段。
 const USERAGENT_MODEL: &str = "ONEPLUS A3010";
 
+pub const SESSION_EXPIRED_MESSAGE: &str = "米家云登录已过期，请在设置中重新扫码登录。";
+
 /// 各国家/地区的云入口主机名。
 ///
 /// 与参考实现一致：中国区**不带**地区前缀，其它地区是 `<country>.`。
 pub fn api_host(country: &str) -> String {
     let c = country.trim().to_lowercase();
-    if c.is_empty() || c == "cn" {
+    if c.is_empty() || c == "cn" || !valid_country_code(&c) {
         "https://api.io.mi.com/app".to_string()
     } else {
         format!("https://{c}.api.io.mi.com/app")
     }
 }
 
+fn valid_country_code(country: &str) -> bool {
+    let country = country.trim();
+    country.is_empty() || (country.len() <= 63
+        && !country.starts_with('-') && !country.ends_with('-')
+        && country.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
+fn cookie_value(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 16384 && value.bytes().all(|b| {
+        matches!(b, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e)
+    })
+}
+
+fn result_array(response: &Value) -> Result<Vec<Value>, CloudError> {
+    response.get("result").and_then(Value::as_array).cloned()
+        .ok_or_else(|| CloudError::Parse("result 应为数组".into()))
+}
+
 /// 云端会话（对应 v1 的 cloud-session.json）。
 ///
 /// 字段名与 JSON 完全一致，保证 v1 → v2 直接复用已有凭据文件。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct CloudSession {
     /// 小米账号 ID（数字，存成字符串与 v1 保持一致）
     pub username: String,
     /// 用于签名的主密钥（base64）
-    pub ssecurity: String,
+    pub ssecurity: crate::secret::SecretString,
     /// 用户 uid
     #[serde(rename = "userId")]
     pub user_id: String,
     /// 服务票据
     #[serde(rename = "serviceToken")]
-    pub service_token: String,
+    pub service_token: crate::secret::SecretString,
     /// 国家/地区代码（可缺省）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country: Option<String>,
@@ -86,6 +108,7 @@ impl CloudSession {
             && !self.ssecurity.trim().is_empty()
             && !self.user_id.trim().is_empty()
             && !self.service_token.trim().is_empty()
+            && cookie_value(&self.user_id) && cookie_value(&self.service_token)
     }
 
     pub fn country_code(&self) -> &str {
@@ -101,8 +124,12 @@ impl CloudSession {
 pub enum CloudError {
     /// 会话不完整
     NoSession,
+    /// 小米的 HTTP 426 也可能表示 SERVICETOKEN_EXPIRED，而不是协议升级。
+    SessionExpired,
     /// 传输层失败
     Transport(String),
+    /// HTTP 拒绝响应（只保留状态码和业务码，不记录响应里的凭据）。
+    Http { status: u16, code: Option<i64>, message: String },
     /// 服务端返回了非 0 的 code
     Api { code: i64, message: String },
     /// 响应无法解析
@@ -113,7 +140,18 @@ impl std::fmt::Display for CloudError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CloudError::NoSession => write!(f, "云端会话不可用，请重新登录米家账号。"),
+            CloudError::SessionExpired => write!(f, "{SESSION_EXPIRED_MESSAGE}"),
             CloudError::Transport(m) => write!(f, "云端请求失败：{m}"),
+            CloudError::Http { status, code, message } => {
+                write!(f, "云端 HTTP {status}")?;
+                if let Some(code) = code { write!(f, "（code={code}）")?; }
+                if !message.is_empty() { write!(f, " {message}")?; }
+                match status {
+                    401 | 403 => write!(f, "：登录会话失效或无访问权限，请重新登录米家账号。"),
+                    429 => write!(f, "：请求过于频繁，请稍后再试。"),
+                    _ => Ok(()),
+                }
+            }
             CloudError::Api { code, message } => {
                 write!(f, "云端返回错误 code={code} {message}")
             }
@@ -124,6 +162,19 @@ impl std::fmt::Display for CloudError {
 
 impl std::error::Error for CloudError {}
 
+impl CloudError {
+    pub fn is_session_expired(&self) -> bool {
+        matches!(self, Self::SessionExpired)
+    }
+}
+
+fn response_session_expired(status: u16, value: &Value) -> bool {
+    let message = value.get("message").or_else(|| value.get("msg"))
+        .and_then(Value::as_str).unwrap_or("").trim();
+    message.eq_ignore_ascii_case("SERVICETOKEN_EXPIRED")
+        || (status == 401 && message.eq_ignore_ascii_case("auth error"))
+}
+
 /// 小米云客户端。
 pub struct CloudClient {
     session: CloudSession,
@@ -133,6 +184,8 @@ pub struct CloudClient {
     client_id: String,
     timeout: Duration,
     agent: ureq::Agent,
+    session_expired: AtomicBool,
+    config_error: Option<String>,
 }
 
 impl CloudClient {
@@ -151,19 +204,21 @@ impl CloudClient {
         // deviceId 必须是稳定值：每次请求都变的话服务端会认为会话异常。
         let client_id = derive_client_id(&session.user_id);
 
-        let mut builder = ureq::AgentBuilder::new().timeout(timeout).user_agent(&format!(
+        let mut builder = ureq::AgentBuilder::new().tls_config(crate::tls::connector())
+            .redirects(0).timeout(timeout).user_agent(&format!(
             "Android-7.1.1-1.0.0-{USERAGENT_MODEL}-136-{}",
             &client_id[..client_id.len().min(8)]
         ));
 
+        let mut config_error = None;
         if let Some(p) = proxy.as_deref().filter(|p| !p.trim().is_empty()) {
             match ureq::Proxy::new(p) {
                 Ok(px) => builder = builder.proxy(px),
-                Err(e) => eprintln!("[云端] 代理 {p} 无效：{e}"),
+                Err(_) => config_error = Some("代理配置无效，请检查 MIAC_PROXY".into()),
             }
         }
 
-        Self { session, proxy, client_id, timeout, agent: builder.build() }
+        Self { session, proxy, client_id, timeout, agent: builder.build(), session_expired: AtomicBool::new(false), config_error }
     }
 
     pub fn session(&self) -> &CloudSession {
@@ -175,7 +230,7 @@ impl CloudClient {
     }
 
     pub fn proxy_label(&self) -> &str {
-        self.proxy.as_deref().unwrap_or("直连")
+        if self.proxy.is_some() { "已配置代理" } else { "直连" }
     }
 
     pub fn timeout(&self) -> Duration {
@@ -240,8 +295,8 @@ impl CloudClient {
             "sdkVersion=accountsdk-18.8.15".to_string(),
             format!("deviceId={}", self.client_id),
             format!("userId={}", self.session.user_id),
-            format!("yetAnotherServiceToken={}", self.session.service_token),
-            format!("serviceToken={}", self.session.service_token),
+            format!("yetAnotherServiceToken={}", self.session.service_token.as_str()),
+            format!("serviceToken={}", self.session.service_token.as_str()),
             "locale=zh_CN".to_string(),
             "channel=MI_APP_STORE".to_string(),
         ]
@@ -252,11 +307,21 @@ impl CloudClient {
     ///
     /// `path` 以 `/` 开头，例如 `/home/rpc/{did}`。
     pub fn post(&self, path: &str, body: &Value) -> Result<Value, CloudError> {
+        if !valid_country_code(self.session.country_code()) {
+            return Err(CloudError::Parse("云端国家/地区代码不合法".into()));
+        }
+        let url = format!("{}{}", api_host(self.session.country_code()), path);
+        self.post_at(&url, path, body)
+    }
+
+    fn post_at(&self, url: &str, path: &str, body: &Value) -> Result<Value, CloudError> {
+        if let Some(error) = &self.config_error { return Err(CloudError::Transport(error.clone())); }
         if !self.session.ready() {
             return Err(CloudError::NoSession);
         }
-
-        let url = format!("{}{}", api_host(self.session.country_code()), path);
+        if self.session_expired.load(Ordering::Relaxed) {
+            return Err(CloudError::SessionExpired);
+        }
         let data = body.to_string();
 
         // 参与签名的「参数」只有 data（_nonce / signature 自身不参与）
@@ -277,37 +342,65 @@ impl CloudClient {
 
         let resp = self
             .agent
-            .post(&url)
+            .post(url)
             .set("Content-Type", "application/x-www-form-urlencoded")
             .set("x-xiaomi-protocal-flag-cli", "PROTOCAL-HTTP2")
             .set("mishop-client-id", "180100041079")
             .set("Cookie", &self.cookie_header())
             .send_string(&form)
-            .map_err(|e| CloudError::Transport(e.to_string()))?;
+            .map_err(|e| match e {
+                ureq::Error::Status(status, response) => {
+                    // 错误页不可信，限长且不把原文写入日志。
+                    let mut bytes = Vec::new();
+                    let _ = response.into_reader().take(65536).read_to_end(&mut bytes);
+                    let value = serde_json::from_slice::<Value>(&bytes).ok();
+                    if value.as_ref().is_some_and(|v| response_session_expired(status, v)) {
+                        self.session_expired.store(true, Ordering::Relaxed);
+                        return CloudError::SessionExpired;
+                    }
+                    let code = value.as_ref().and_then(|v| v.get("code").and_then(Value::as_i64));
+                    let message = value.as_ref().map(|value| self.error_message(value)).unwrap_or_default();
+                    CloudError::Http { status, code, message }
+                }
+                ureq::Error::Transport(_) => CloudError::Transport("网络连接失败，请检查网络和代理配置".into()),
+            })?;
 
-        let text = resp
-            .into_string()
+        if !(200..300).contains(&resp.status()) {
+            return Err(CloudError::Http { status: resp.status(), code: None, message: "云端接口不接受重定向".into() });
+        }
+        let bytes = crate::io_limits::read(resp.into_reader(), crate::io_limits::HTTP_BYTES)
             .map_err(|e| CloudError::Transport(format!("读取响应失败：{e}")))?;
+        let text = String::from_utf8(bytes).map_err(|_| CloudError::Parse("响应不是 UTF-8".into()))?;
 
         // 登录类接口会带 `&&&START&&&` 前缀，顺手剥掉
         let text = text.strip_prefix("&&&START&&&").unwrap_or(&text).to_string();
 
         let value: Value = serde_json::from_str(&text).map_err(|e| {
-            CloudError::Parse(format!("{e}；原文前 200 字：{}", truncate(&text, 200)))
+            CloudError::Parse(e.to_string())
         })?;
+
+        if response_session_expired(200, &value) {
+            self.session_expired.store(true, Ordering::Relaxed);
+            return Err(CloudError::SessionExpired);
+        }
 
         // 统一的 code 检查（0 或缺省都算成功）
         if let Some(code) = value.get("code").and_then(Value::as_i64) {
             if code != 0 {
-                let message = value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
+                let message = self.error_message(&value);
                 return Err(CloudError::Api { code, message });
             }
         }
         Ok(value)
+    }
+
+    fn error_message(&self, value: &Value) -> String {
+        let mut message = value.get("message").or_else(|| value.get("msg"))
+            .and_then(Value::as_str).unwrap_or("").to_string();
+        for secret in [self.session.ssecurity.as_str(), self.session.service_token.as_str(), self.session.user_id.as_str(), self.session.username.as_str()] {
+            if !secret.is_empty() { message = message.replace(secret, "[已隐藏]"); }
+        }
+        truncate(&message, 160)
     }
 
     /// 云端 MIoT RPC：`/home/rpc/{did}`。
@@ -315,15 +408,12 @@ impl CloudClient {
     /// 注意：请求体是 `{method, params}`——**不带 id**，
     /// 与局域网 miIO 的报文格式不同（参考实现也是如此）。
     pub fn miio_call(&self, did: &str, method: &str, params: &Value) -> Result<Value, CloudError> {
+        if !crate::credentials::valid_did(did) { return Err(CloudError::Parse("设备标识无效".into())); }
         let body = json!({ "method": method, "params": params });
         let resp = self.post(&format!("/home/rpc/{did}"), &body)?;
         if let Some(err) = resp.get("error") {
             let code = err.get("code").and_then(Value::as_i64).unwrap_or(-1);
-            let message = err
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let message = self.error_message(err);
             return Err(CloudError::Api { code, message });
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
@@ -347,10 +437,7 @@ impl CloudClient {
             "limit": limit,
         });
         let resp = self.post("/v2/user/statistics", &body)?;
-        Ok(match resp.get("result") {
-            Some(Value::Array(a)) => a.clone(),
-            _ => Vec::new(),
-        })
+        result_array(&resp)
     }
 
     /// 温湿度计历史数据：`/user/get_user_device_data`。
@@ -372,10 +459,7 @@ impl CloudClient {
             "limit": limit,
         });
         let resp = self.post("/user/get_user_device_data", &body)?;
-        Ok(match resp.get("result") {
-            Some(Value::Array(a)) => a.clone(),
-            _ => Vec::new(),
-        })
+        result_array(&resp)
     }
 
     /// 温湿度计 MIoT 直读：`/miotspec/prop/get`。
@@ -386,10 +470,7 @@ impl CloudClient {
             .collect();
         let body = json!({ "params": params });
         let resp = self.post("/miotspec/prop/get", &body)?;
-        Ok(match resp.get("result") {
-            Some(Value::Array(a)) => a.clone(),
-            _ => Vec::new(),
-        })
+        result_array(&resp)
     }
 
     /// 取设备列表（登录后选设备用）。
@@ -398,15 +479,15 @@ impl CloudClient {
             "/home/device_list",
             &json!({ "getVirtualModel": false, "getHuamiDevices": 0 }),
         )?;
-        Ok(match resp.get("result") {
+        match resp.get("result") {
             Some(Value::Object(o)) => o
                 .get("list")
                 .and_then(Value::as_array)
                 .cloned()
-                .unwrap_or_default(),
-            Some(Value::Array(a)) => a.clone(),
-            _ => Vec::new(),
-        })
+                .ok_or_else(|| CloudError::Parse("设备列表缺少 list 数组".into())),
+            Some(Value::Array(a)) => Ok(a.clone()),
+            _ => Err(CloudError::Parse("设备列表 result 格式异常".into())),
+        }
     }
 }
 
@@ -510,6 +591,122 @@ pub fn empty_session_map() -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn test_client() -> CloudClient {
+        let mut client = CloudClient::new(CloudSession {
+            username: "test-user".into(), ssecurity: STANDARD.encode(b"0123456789abcdef").into(),
+            user_id: "test-id".into(), service_token: "test-token".into(),
+            ..Default::default()
+        }, None);
+        client.agent = ureq::AgentBuilder::new().redirects(0).try_proxy_from_env(false)
+            .timeout(Duration::from_secs(3)).build();
+        client
+    }
+
+    // 本地假服务器：不使用真实凭据，也不向设备发送控制指令。
+    fn mock_response(status: u16, body: impl Into<String>) -> (String, std::thread::JoinHandle<()>) {
+        let body = body.into();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/app/v2/user/statistics", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0; 1024];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap().trim().parse().unwrap();
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn oversized_success_and_redirects_are_rejected() {
+        let (url, server) = mock_response(200, format!("{{\"code\":0,\"result\":\"{}\"}}", "x".repeat(crate::io_limits::HTTP_BYTES + 1024)));
+        assert!(test_client().post_at(&url, "/test", &json!({})).unwrap_err().to_string().contains("大小"));
+        server.join().unwrap();
+        let (url, server) = mock_response(302, "");
+        assert!(matches!(test_client().post_at(&url, "/test", &json!({})), Err(CloudError::Http { status:302, .. })));
+        server.join().unwrap();
+        assert!(result_array(&json!({"result":null})).is_err());
+        assert!(result_array(&json!({"result":[]})).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expired_426_is_login_error_and_stops_subsequent_network_requests() {
+        let (url, server) = mock_response(426, r#"{"code":0,"message":"SERVICETOKEN_EXPIRED"}"#);
+        let client = test_client();
+        let error = client.post_at(&url, "/v2/user/statistics", &json!({})).unwrap_err();
+        assert!(error.is_session_expired());
+        assert_eq!(error.to_string(), SESSION_EXPIRED_MESSAGE);
+        server.join().unwrap();
+        // 即使地址不可用，也必须立即返回过期，不再联网。
+        assert!(client.post_at("http://127.0.0.1:1", "/miotspec/prop/get", &json!({}))
+            .unwrap_err().is_session_expired());
+        assert!(!test_client().session_expired.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn expired_body_with_http_200_is_not_a_success() {
+        let (url, server) = mock_response(200, r#"{"code":0,"message":"SERVICETOKEN_EXPIRED"}"#);
+        assert!(test_client().post_at(&url, "/v2/user/statistics", &json!({}))
+            .unwrap_err().is_session_expired());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unrelated_426_and_permission_denial_are_not_assumed_expired() {
+        assert!(!response_session_expired(426, &json!({"code": 0, "message": "Upgrade required"})));
+        assert!(!response_session_expired(403, &json!({"message": "permission denied"})));
+        assert!(response_session_expired(401, &json!({"message": "auth error"})));
+    }
+
+    #[test]
+    fn ordinary_cloud_success_is_still_parsed() {
+        let (url, server) = mock_response(200, r#"{"code":0,"result":[{"value":"1.5"}]}"#);
+        let client = test_client();
+        let value = client.post_at(&url, "/v2/user/statistics", &json!({})).unwrap();
+        assert_eq!(value["result"][0]["value"], "1.5");
+        assert!(!client.session_expired.load(Ordering::Relaxed));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_error_message_does_not_leak_session_secrets() {
+        let (url, server) = mock_response(403, r#"{"code":-1,"message":"test-token test-id MDEyMzQ1Njc4OWFiY2RlZg=="}"#);
+        let error = test_client().post_at(&url, "/v2/user/statistics", &json!({})).unwrap_err().to_string();
+        assert!(!error.contains("test-token"));
+        assert!(!error.contains("test-id"));
+        assert!(!error.contains("MDEyMzQ1Njc4OWFiY2RlZg=="));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn api_error_message_does_not_leak_session_secrets() {
+        let (url, server) = mock_response(200, r#"{"code":-1,"message":"test-token test-id MDEyMzQ1Njc4OWFiY2RlZg=="}"#);
+        let error = test_client().post_at(&url, "/v2/user/statistics", &json!({})).unwrap_err().to_string();
+        assert!(!error.contains("test-token"));
+        assert!(!error.contains("test-id"));
+        assert!(!error.contains("MDEyMzQ1Njc4OWFiY2RlZg=="));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_country_cannot_change_the_api_authority() {
+        for country in ["cn.api.io.mi.com@evil.example/", "cn/", "cn:443", "cn\\", "cn?", "cn#"] {
+            assert_eq!(api_host(country), "https://api.io.mi.com/app");
+        }
+    }
 
     #[test]
     fn session_ready_requires_four_fields() {
@@ -567,7 +764,7 @@ mod tests {
         let ssecurity_b64 = STANDARD.encode(b"0123456789abcdef");
         let session = CloudSession {
             username: "u".into(),
-            ssecurity: ssecurity_b64,
+            ssecurity: ssecurity_b64.into(),
             user_id: "1".into(),
             service_token: "t".into(),
             country: Some("cn".into()),

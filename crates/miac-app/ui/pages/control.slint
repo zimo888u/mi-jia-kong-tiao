@@ -4,8 +4,8 @@ import { DialMath } from "../dial-math.slint";
 
 export struct ControlChoice { value: int, label: string }
 
-// Geometry uses degrees, matching Slint's trigonometric API. The ring consists
-// of small overlapping circles, so the software renderer needs no SVG assets.
+// Continuous antialiased paths keep the ring smooth in the software renderer.
+// Use the same exact endpoint for the progress arc and its indicator.
 component TempDial inherits Rectangle {
     in property <float> value: 26;
     in property <float> temp-min: 16;
@@ -14,33 +14,64 @@ component TempDial inherits Rectangle {
     callback adjusted(float);
     width: 300px; height: 300px;
     background: transparent;
+    private property <float> progress: DialMath.ratio(root.value, root.temp-min, root.temp-max);
+    private property <float> end-angle: -225 + root.progress * 270;
+    private property <float> end-x: 150 + DialMath.point-x(root.end-angle, 126);
+    private property <float> end-y: 150 + DialMath.point-y(root.end-angle, 126);
     Rectangle { x: 36px; y: 36px; width: 228px; height: 228px; border-radius: 114px; background: Theme.bg-soft; }
-    for i in 181 : Rectangle {
-        width: 12px; height: 12px; border-radius: 6px;
-        x: 144px + DialMath.point-x((DialMath.tick-angle(i, 181) - 90), 126) * 1px;
-        y: 144px + DialMath.point-y((DialMath.tick-angle(i, 181) - 90), 126) * 1px;
-        background: i <= round(DialMath.ratio(root.value, root.temp-min, root.temp-max) * 180) ? Theme.dial-fill : Theme.dial-track;
+    Path {
+        width: 300px; height: 300px;
+        viewbox-width: 300; viewbox-height: 300;
+        // Preserve coordinates: automatic fitting otherwise subtracts the
+        // stroke width and shrinks the ring away from its indicator.
+        fit: preserve;
+        fill: transparent;
+        stroke: Theme.dial-track; stroke-width: 12px;
+        stroke-line-cap: round; stroke-line-join: round;
+        anti-alias: true;
+        MoveTo { x: 150 + DialMath.point-x(-225, 126); y: 150 + DialMath.point-y(-225, 126); }
+        ArcTo {
+            radius-x: 126; radius-y: 126;
+            x: 150 + DialMath.point-x(45, 126); y: 150 + DialMath.point-y(45, 126);
+            sweep: true; large-arc: true;
+        }
     }
-    Rectangle {
-        width: 20px; height: 20px; border-radius: 10px;
-        x: 140px + DialMath.point-x((DialMath.tick-angle(round(DialMath.ratio(root.value, root.temp-min, root.temp-max) * 180), 181) - 90), 126) * 1px;
-        y: 140px + DialMath.point-y((DialMath.tick-angle(round(DialMath.ratio(root.value, root.temp-min, root.temp-max) * 180), 181) - 90), 126) * 1px;
-        background: Theme.accent; border-width: 3px; border-color: Theme.panel;
+    Path {
+        visible: root.progress > 0;
+        width: 300px; height: 300px;
+        viewbox-width: 300; viewbox-height: 300;
+        fit: preserve;
+        fill: transparent;
+        stroke: Theme.dial-fill; stroke-width: 12px;
+        stroke-line-cap: round; stroke-line-join: round;
+        anti-alias: true;
+        MoveTo { x: 150 + DialMath.point-x(-225, 126); y: 150 + DialMath.point-y(-225, 126); }
+        ArcTo {
+            radius-x: 126; radius-y: 126;
+            x: root.end-x; y: root.end-y;
+            sweep: true; large-arc: root.progress > (2.0 / 3.0);
+        }
+    }
+    Path {
+        width: 300px; height: 300px;
+        viewbox-width: 300; viewbox-height: 300;
+        fit: preserve;
+        fill: Theme.accent; stroke: Theme.panel; stroke-width: 3px;
+        anti-alias: true;
+        MoveTo { x: root.end-x + 8.5; y: root.end-y; }
+        ArcTo { radius-x: 8.5; radius-y: 8.5; x: root.end-x - 8.5; y: root.end-y; sweep: true; }
+        ArcTo { radius-x: 8.5; radius-y: 8.5; x: root.end-x + 8.5; y: root.end-y; sweep: true; }
+        Close { }
     }
     VerticalLayout {
         x: 44px; y: 86px; width: 212px; height: 126px;
         alignment: center; spacing: 6px;
         Text { text: "设定温度"; color: Theme.text-mute; font-size: 12px; horizontal-alignment: center; }
-        Text { text: root.value + "°"; color: Theme.accent; font-size: 64px; font-weight: 400; horizontal-alignment: center; }
-        Text { text: "拖动或滚轮调节 · 每档 " + root.temp-step + "°C"; color: Theme.text-mute; font-size: 10px; horizontal-alignment: center; }
+        Text { text: root.value + "°"; color: Theme.accent; font-size: Theme.macos ? 58px : 64px; font-weight: Theme.macos ? 300 : 400; horizontal-alignment: center; }
+        Text { text: "滚轮调节 · 每档 " + root.temp-step + "°C"; color: Theme.text-mute; font-size: 10px; horizontal-alignment: center; }
     }
     dial-touch := TouchArea {
-        property <float> pressed-value: root.value;
-        mouse-cursor: pointer;
-        pointer-event(event) => {
-            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) { self.pressed-value = root.value; }
-        }
-        moved => { root.adjusted(max(root.temp-min, min(root.temp-max, root.temp-min + round((self.pressed-value - root.temp-min + (self.pressed-y - self.mouse-y) / 18px) / root.temp-step) * root.temp-step))); }
+        mouse-cursor: default;
         scroll-event(e) => {
             if e.delta-y > 0 { root.adjusted(min(root.temp-max, root.value + root.temp-step)); }
             else if e.delta-y < 0 { root.adjusted(max(root.temp-min, root.value - root.temp-step)); }

@@ -18,12 +18,29 @@ pub const FILE_SETTINGS: &str = "settings.json";
 /// 温度预设的档位数（与 v1 界面上的三个按钮一致）。
 pub const PRESET_SLOTS: usize = 3;
 
+/// Explicit appearance choice. Older settings still use the `dark` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeStyle {
+    Light,
+    Dark,
+    Macos,
+    Senren,
+    #[serde(rename = "senren-dark")]
+    SenrenDark,
+    // A theme from a newer version must not discard unrelated preferences.
+    #[serde(other)]
+    Unknown,
+}
+
 /// 应用设置。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     /// 明暗主题：true = 深色
     #[serde(default)]
     pub dark: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<ThemeStyle>,
     /// 三个温度预设（℃）
     #[serde(default = "default_presets")]
     pub presets: Vec<f64>,
@@ -72,6 +89,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             dark: false,
+            theme: None,
             presets: default_presets(),
             pending_temp: None,
             pending_temp_device: None,
@@ -87,6 +105,32 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// 0 浅色，1 深色，2 macOS，3 丛雨亮色，4 丛雨暗色；兼容旧偏好。
+    pub fn theme_index(&self) -> i32 {
+        match self.theme {
+            Some(ThemeStyle::Light) => 0,
+            Some(ThemeStyle::Dark) => 1,
+            Some(ThemeStyle::Macos) => 2,
+            Some(ThemeStyle::Senren) => 3,
+            Some(ThemeStyle::SenrenDark) => 4,
+            None | Some(ThemeStyle::Unknown) => i32::from(self.dark),
+        }
+    }
+
+    pub fn set_theme_index(&mut self, index: i32) -> bool {
+        let theme = match index {
+            0 => ThemeStyle::Light,
+            1 => ThemeStyle::Dark,
+            2 => ThemeStyle::Macos,
+            3 => ThemeStyle::Senren,
+            4 => ThemeStyle::SenrenDark,
+            _ => return false,
+        };
+        self.theme = Some(theme);
+        self.dark = matches!(theme, ThemeStyle::Dark | ThemeStyle::SenrenDark);
+        true
+    }
+
     /// 0 每次询问，1 收到托盘，2 直接退出。
     pub fn close_behavior(&self) -> i32 {
         if !self.remember_close_action { 0 } else if self.close_to_tray { 1 } else { 2 }
@@ -105,7 +149,19 @@ impl Settings {
 
     /// 读设置；文件不存在或坏掉时返回默认值（不报错，界面照常起）。
     pub fn load(creds: &Credentials) -> Self {
-        let mut s: Settings = creds.read_json(FILE_SETTINGS).unwrap_or_default();
+        let mut s = Settings::default();
+        if let Some(serde_json::Value::Object(fields)) = creds.read_json(FILE_SETTINGS) {
+            // Recover each preference independently from malformed siblings.
+            macro_rules! recover {
+                ($($field:ident),+ $(,)?) => { $(
+                    if let Some(value) = fields.get(stringify!($field)) {
+                        if let Ok(value) = serde_json::from_value(value.clone()) { s.$field = value; }
+                    }
+                )+ };
+            }
+            recover!(dark, theme, presets, pending_temp, pending_temp_device, transport,
+                auto_refresh, refresh_secs, close_to_tray, remember_close_action, migrated, encrypt_credentials);
+        }
         s.normalize();
         s
     }
@@ -117,6 +173,12 @@ impl Settings {
 
     /// 把不合法的值拉回合理范围，避免坏文件把界面搞崩。
     pub fn normalize(&mut self) {
+        if self.theme == Some(ThemeStyle::Unknown) {
+            self.theme = None;
+        }
+        if self.theme.is_some() {
+            self.dark = matches!(self.theme, Some(ThemeStyle::Dark | ThemeStyle::SenrenDark));
+        }
         if self.presets.len() != PRESET_SLOTS {
             self.presets = default_presets();
         }
@@ -216,7 +278,35 @@ mod tests {
                 &format!(r#"{{"dark":{dark}}}"#),
             ).unwrap();
             assert_eq!(settings.dark, dark);
+            assert_eq!(settings.theme_index(), i32::from(dark));
         }
+    }
+
+    #[test]
+    fn all_theme_choices_survive_restart_and_update_legacy_flag() {
+        let mut settings = Settings::default();
+        for theme in [3, 4, 2, 1, 0, 4, 3] {
+            assert!(settings.set_theme_index(theme));
+            let saved = serde_json::to_string(&settings).unwrap();
+            settings = serde_json::from_str(&saved).unwrap();
+            settings.normalize();
+            assert_eq!(settings.theme_index(), theme);
+            assert_eq!(settings.dark, matches!(theme, 1 | 4));
+            assert_eq!(settings.presets, vec![27.5, 27.0, 26.5]);
+        }
+        assert!(!settings.set_theme_index(99));
+        assert_eq!(settings.theme_index(), 3);
+    }
+
+    #[test]
+    fn unknown_themes_fall_back_without_losing_other_preferences() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{"theme":"future-theme","dark":true,"presets":[24.5,25.0,26.0]}"#,
+        ).unwrap();
+        settings.normalize();
+        assert_eq!(settings.theme_index(), 1);
+        assert_eq!(settings.theme, None);
+        assert_eq!(settings.presets, vec![24.5, 25.0, 26.0]);
     }
 
     #[test]

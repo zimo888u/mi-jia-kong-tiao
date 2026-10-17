@@ -22,6 +22,7 @@
 //! 相当于自动重连；成功一次就清零。这样拔网线 / 路由器重启后不用手动刷新。
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,15 @@ pub enum Command {
     Shutdown,
 }
 
+struct Envelope {
+    command: Command,
+    connection_id: Option<u64>,
+}
+
+fn is_device_write(command: &Command) -> bool {
+    matches!(command, Command::WriteProp { .. } | Command::RawWrite { .. } | Command::ApplyPreset(_))
+}
+
 /// 工作线程回给界面的事件。
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -86,15 +96,20 @@ pub enum Event {
     Wrote { name: String, ok: bool, error: Option<String> },
     /// 一次操作失败（界面用提示条显示）
     Failed { op: String, error: String },
+    /// 云端票据过期：每次登录周期只提示一次，不影响局域网控制。
+    CloudLoginRequired,
     /// DPAPI 凭据加密任务完成。只有所有现有凭据均成功写入密文才算成功。
     CredentialsEncrypted { ok: bool, error: Option<String> },
     /// 日志
     Log(String),
+    Stopped { reason: String },
 }
 
 /// 设备摘要（界面「设置」页展示，不含 token）。
 #[derive(Debug, Clone, Default)]
 pub struct DeviceSummary {
+    /// The UI must acknowledge this connection before sending bound writes.
+    pub connection_id: u64,
     pub profile: crate::profile::Profile,
     pub name: String,
     pub model: String,
@@ -110,16 +125,22 @@ pub struct DeviceSummary {
 
 /// 工作线程句柄：界面拿它发指令、收事件。
 pub struct Worker {
-    tx: Sender<Command>,
+    tx: Sender<Envelope>,
     rx: Receiver<Event>,
     handle: std::cell::RefCell<Option<thread::JoinHandle<()>>>,
+    stop: Arc<AtomicBool>,
+    disconnected_reported: std::cell::Cell<bool>,
+    acknowledged_connection: std::cell::Cell<Option<u64>>,
 }
 
 impl Worker {
     /// 起一个工作线程。
     pub fn spawn(creds: Credentials, settings: Settings) -> Self {
-        let (cmd_tx, cmd_rx) = channel::<Command>();
+        let (cmd_tx, cmd_rx) = channel::<Envelope>();
         let (evt_tx, evt_rx) = channel::<Event>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let startup_events = evt_tx.clone();
 
         let handle = thread::Builder::new()
             .name("miac-worker".into())
@@ -131,7 +152,7 @@ impl Worker {
                 // 事件通道随之断开，界面既不报错也不更新）。这里显式接住并打印。
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let mut w = WorkerLoop::new(creds, settings, evt_tx.clone());
-                    w.run(cmd_rx);
+                    w.run(cmd_rx, &thread_stop);
                 }));
                 if let Err(e) = result {
                     let msg = if let Some(s) = e.downcast_ref::<&str>() {
@@ -145,21 +166,40 @@ impl Worker {
                     let _ = evt_tx.send(Event::Log(format!("[工作线程] 已崩溃：{msg}")));
                 }
             })
-            .expect("无法启动工作线程");
+            ;
+        let handle = match handle {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                let _ = startup_events.send(Event::Log(format!("无法启动工作线程：{error}")));
+                None
+            }
+        };
 
-        Self { tx: cmd_tx, rx: evt_rx, handle: std::cell::RefCell::new(Some(handle)) }
+        Self { tx: cmd_tx, rx: evt_rx, handle: std::cell::RefCell::new(handle), stop,
+            disconnected_reported: std::cell::Cell::new(false), acknowledged_connection: std::cell::Cell::new(None) }
     }
 
     /// 发指令（忽略发送失败——线程已退出时说明程序正在关闭）。
     pub fn send(&self, cmd: Command) {
-        let _ = self.tx.send(cmd);
+        if self.stop.load(Ordering::SeqCst) { return; }
+        let connection_id = is_device_write(&cmd).then(|| self.acknowledged_connection.get()).flatten();
+        let _ = self.tx.send(Envelope { command: cmd, connection_id });
+    }
+
+    pub fn acknowledge_connection(&self, connection_id: u64) {
+        self.acknowledged_connection.set(Some(connection_id));
     }
 
     /// 非阻塞取一个事件。界面定时器里调用，绝不阻塞重绘。
     pub fn try_recv(&self) -> Option<Event> {
         match self.rx.try_recv() {
             Ok(e) => Some(e),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) if !self.disconnected_reported.replace(true)
+                && !self.stop.load(Ordering::SeqCst) => Some(Event::Stopped {
+                    reason: "后台控制通道已停止，请重启程序".into()
+                }),
+            Err(TryRecvError::Disconnected) => None,
         }
     }
 
@@ -180,9 +220,14 @@ impl Worker {
     /// 界面侧把 Worker 包在 `Rc` 里共享给多个回调，`Rc` 拿不到 `&mut`。
     /// 句柄本来就只在关闭时取一次，放进 RefCell 足够。
     pub fn shutdown(&self) {
-        let _ = self.tx.send(Command::Shutdown);
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.tx.send(Envelope { command: Command::Shutdown, connection_id: None });
         if let Some(h) = self.handle.borrow_mut().take() {
-            let _ = h.join();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while !h.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            if h.is_finished() { let _ = h.join(); }
         }
     }
 }
@@ -206,6 +251,8 @@ struct WorkerLoop {
     failures: u32,
     /// 上次重连尝试时间，避免疯狂重连
     last_reconnect: Instant,
+    cloud_login_required: bool,
+    connection_id: u64,
 }
 
 impl WorkerLoop {
@@ -217,6 +264,8 @@ impl WorkerLoop {
             ctrl: None,
             failures: 0,
             last_reconnect: Instant::now() - Duration::from_secs(60),
+            cloud_login_required: false,
+            connection_id: 0,
         }
     }
 
@@ -228,19 +277,33 @@ impl WorkerLoop {
         let _ = self.tx.send(Event::Log(msg));
     }
 
-    fn run(&mut self, rx: Receiver<Command>) {
+    fn run(&mut self, rx: Receiver<Envelope>, stop: &AtomicBool) {
         self.log("已启动");
         loop {
+            // Shutdown bypasses queued device commands. Only an already running
+            // blocking operation can finish; queued writes never run on exit.
+            if stop.load(Ordering::SeqCst) { break; }
             // 带超时的 recv：没有指令时定期做一次「自愈」（检查是否需要重连）
             match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(Command::Shutdown) => {
+                Ok(Envelope { command: Command::Shutdown, .. }) => {
                     self.log("收到退出指令");
                     if let Some(c) = self.ctrl.as_mut() {
                         c.dispose();
                     }
                     break;
                 }
-                Ok(cmd) => self.handle(cmd),
+                Ok(Envelope { command: cmd, connection_id }) => {
+                    if stop.load(Ordering::SeqCst) { break; }
+                    if is_device_write(&cmd) && connection_id != Some(self.connection_id) {
+                        let error = ControllerError("写入所属连接已变化，旧操作已取消，请等待连接就绪后重试".into());
+                        match cmd {
+                            Command::WriteProp { name, .. } => self.write_completed(name, Err(error)),
+                            _ => self.failed("控制写入", error),
+                        }
+                        continue;
+                    }
+                    self.handle(cmd)
+                },
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     self.maybe_reconnect();
                 }
@@ -287,16 +350,53 @@ impl WorkerLoop {
     }
 
     /// 确保控制器已初始化，返回当前通道。
+    ///
+    /// 每条设备指令执行前都核对底层连接的绑定身份。登录切换设备时，
+    /// 界面状态和 `Command::Init` 可能跨越同一个事件循环批次；如果仍复用
+    /// 旧 Controller，就会出现“新名称、旧 DID”的竞态。
     fn ensure(&mut self) -> Result<ActiveLink, ControllerError> {
+        let previously_connected = self.ctrl.is_some();
+        let current = match self.creds.read_device() {
+            Some(device) => device,
+            None => {
+                if let Some(c) = self.ctrl.as_mut() {
+                    c.dispose();
+                }
+                self.ctrl = None;
+                return Err(ControllerError(
+                    "设备凭据已切换或尚未保存，请重新选择空调后再操作。".into(),
+                ));
+            }
+        };
         if let Some(c) = self.ctrl.as_ref() {
             if let Some(link) = c.link {
-                return Ok(link);
+                if c.is_bound_to(&current) && c.credentials_current() {
+                    return Ok(link);
+                }
             }
         }
+        if let Some(c) = self.ctrl.as_mut() {
+            c.dispose();
+        }
+        self.ctrl = None;
         let mut c = Controller::new(self.creds.clone(), self.settings.transport());
         let link = c.init_transport()?;
         self.ctrl = Some(c);
+        self.connection_id = self.connection_id.wrapping_add(1).max(1);
+        if previously_connected {
+            let _ = self.tx.send(Event::Ready { link, device: self.device_summary() });
+        }
         Ok(link)
+    }
+
+    fn ensure_write(&mut self) -> Result<ActiveLink, ControllerError> {
+        // A queued click belongs to the connection the UI showed. Never move a
+        // stale write to a newly logged-in account/device as part of ensure().
+        let controller = self.ctrl.as_ref().ok_or_else(|| ControllerError("设备尚未连接，写入已取消".into()))?;
+        if !controller.credentials_current() {
+            return Err(ControllerError("设备或账号凭据已变化，写入已取消，请连接后重试".into()));
+        }
+        controller.link.ok_or_else(|| ControllerError("设备尚未连接，写入已取消".into()))
     }
 
     /// 设备信息摘要。
@@ -308,8 +408,15 @@ impl WorkerLoop {
             .read_thermometer()
             .is_some_and(|t| !t.did.trim().is_empty());
 
-        match self.creds.read_device() {
+        // Ready must describe the connection that was actually initialized.
+        // Login can replace device.json while profile loading is still running.
+        let device = match self.ctrl.as_ref() {
+            Some(controller) => controller.device().cloned(),
+            None => self.creds.read_device(),
+        };
+        match device {
             Some(d) => DeviceSummary {
+                connection_id: self.connection_id,
                 profile: self.ctrl.as_ref().map(|c| c.profile.clone()).unwrap_or_default(),
                 name: d.name.clone().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| d.model.clone().unwrap_or_else(|| "米家空调".into())),
                 model: d.model.clone().unwrap_or_default(),
@@ -335,8 +442,37 @@ impl WorkerLoop {
     fn note(&mut self, result: &Result<(), ControllerError>) {
         match result {
             Ok(()) => self.failures = 0,
+            Err(e) if e.requires_cloud_login() => {
+                self.failures = 0;
+                self.require_cloud_login();
+            }
             Err(_) => self.failures = self.failures.saturating_add(1),
         }
+    }
+
+    fn require_cloud_login(&mut self) {
+        if !self.cloud_login_required {
+            self.cloud_login_required = true;
+            let _ = self.tx.send(Event::CloudLoginRequired);
+        }
+    }
+
+    fn failed(&mut self, op: impl Into<String>, error: ControllerError) {
+        if error.requires_cloud_login() {
+            self.require_cloud_login();
+        }
+        let _ = self.tx.send(Event::Failed { op: op.into(), error: error.to_string() });
+    }
+
+    fn write_completed(&mut self, name: String, result: Result<(), ControllerError>) {
+        if result.as_ref().is_err_and(ControllerError::requires_cloud_login) {
+            self.require_cloud_login();
+        }
+        let _ = self.tx.send(Event::Wrote {
+            name,
+            ok: result.is_ok(),
+            error: result.err().map(|error| error.to_string()),
+        });
     }
 
     fn handle(&mut self, cmd: Command) {
@@ -344,6 +480,8 @@ impl WorkerLoop {
             Command::Shutdown => unreachable!("run() 里已单独处理"),
 
             Command::Init | Command::SetTransport(_) => {
+                // Init 在启动/保存新登录凭据后发送；只切换通道不恢复过期云请求。
+                if matches!(cmd, Command::Init) { self.cloud_login_required = false; }
                 if let Command::SetTransport(t) = cmd {
                     self.settings.transport = t.to_index();
                 }
@@ -379,7 +517,7 @@ impl WorkerLoop {
                     }
                     Err(e) => {
                         self.note(&Err(e.clone()));
-                        let _ = self.tx.send(Event::Failed { op: "读状态".into(), error: e.to_string() });
+                        self.failed("读状态", e);
                     }
                 }
             }
@@ -395,22 +533,25 @@ impl WorkerLoop {
                     }
                     Err(e) => {
                         self.note(&Err(e.clone()));
-                        let _ = self
-                            .tx
-                            .send(Event::Failed { op: "读诊断".into(), error: e.to_string() });
+                        self.failed("读诊断", e);
                     }
                 }
             }
 
             Command::Thermometer => {
+                if self.cloud_login_required { return; }
                 // 温湿度计失败不影响空调控制，所以不参与重连计数
                 if self.ensure().is_ok() {
                     let t = self.ctrl.as_mut().expect("有控制器").read_thermometer();
+                    if t.reason.as_deref() == Some(crate::cloud::SESSION_EXPIRED_MESSAGE) {
+                        self.require_cloud_login();
+                    }
                     let _ = self.tx.send(Event::Thermometer(t));
                 }
             }
 
             Command::PowerStats => {
+                if self.cloud_login_required { return; }
                 let r = self
                     .ensure()
                     .and_then(|_| self.ctrl.as_mut().expect("有控制器").power_stats());
@@ -420,10 +561,11 @@ impl WorkerLoop {
                         let _ = self.tx.send(Event::PowerStats(Box::new(p)));
                     }
                     Err(e) => {
-                        let _ = self.tx.send(Event::Failed {
-                            op: "读电量统计".into(),
-                            error: e.to_string(),
-                        });
+                        if e.requires_cloud_login() {
+                            self.require_cloud_login();
+                            return;
+                        }
+                        self.failed("读电量统计", e);
                     }
                 }
             }
@@ -437,41 +579,30 @@ impl WorkerLoop {
                         let _ = self.tx.send(Event::Maintenance { values, cleaning });
                     }
                     Err(e) => {
-                        let _ = self.tx.send(Event::Failed {
-                            op: "读维护状态".into(),
-                            error: e.to_string(),
-                        });
+                        self.failed("读维护状态", e);
                     }
                 }
             }
 
             Command::WriteProp { name, value } => {
                 let r = self
-                    .ensure()
+                    .ensure_write()
                     .and_then(|_| self.ctrl.as_mut().expect("有控制器").write_prop(&name, value));
-                let ok = r.is_ok();
                 // A rejected value or a device business error is not evidence
                 // that the transport is down. Reads drive reconnection counts.
-                let _ = self.tx.send(Event::Wrote {
-                    name,
-                    ok,
-                    error: r.err().map(|e| e.to_string()),
-                });
+                self.write_completed(name, r);
             }
 
             Command::RawWrite { siid, piid, value } => {
                 let r = self
-                    .ensure()
+                    .ensure_write()
                     .and_then(|_| self.ctrl.as_mut().expect("有控制器").raw_write(siid, piid, value));
                 match r {
                     Ok(v) => {
                         let _ = self.tx.send(Event::RawValue { siid, piid, value: v });
                     }
                     Err(e) => {
-                        let _ = self.tx.send(Event::Failed {
-                            op: format!("写 {siid}.{piid}"),
-                            error: e.to_string(),
-                        });
+                        self.failed(format!("写 {siid}.{piid}"), e);
                     }
                 }
             }
@@ -485,17 +616,20 @@ impl WorkerLoop {
                         let _ = self.tx.send(Event::RawValue { siid, piid, value: v });
                     }
                     Err(e) => {
-                        let _ = self.tx.send(Event::Failed {
-                            op: format!("读 {siid}.{piid}"),
-                            error: e.to_string(),
-                        });
+                        self.failed(format!("读 {siid}.{piid}"), e);
                     }
                 }
             }
 
             Command::ApplyPreset(t) => {
+                // Validate the input before touching/rebuilding the channel.
+                // Invalid UI input is not evidence of a stale connection.
+                if !t.is_finite() {
+                    self.failed("应用温度预设", ControllerError("温度必须是有限数值".into()));
+                    return;
+                }
                 let r = self
-                    .ensure()
+                    .ensure_write()
                     .and_then(|_| self.ctrl.as_mut().expect("有控制器").apply_temp_preset(t));
                 match r {
                     Ok((turned_on, temp)) => {
@@ -506,18 +640,12 @@ impl WorkerLoop {
                             format!("[预设] 已设为 {temp:.1} ℃")
                         };
                         self.log(msg);
-                        let _ = self.tx.send(Event::Wrote {
-                            name: "targetTemp".into(),
-                            ok: true,
-                            error: None,
-                        });
+                        self.write_completed("targetTemp".into(), Ok(()));
                     }
                     Err(e) => {
-                        self.note(&Err(e.clone()));
-                        let _ = self.tx.send(Event::Failed {
-                            op: "应用温度预设".into(),
-                            error: e.to_string(),
-                        });
+                        // This can be validation or device-side rejection after
+                        // a successful power read; it does not prove a disconnect.
+                        self.failed("应用温度预设", e);
                     }
                 }
             }
@@ -549,6 +677,205 @@ impl WorkerLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disconnected_event_channel_reports_stopped_exactly_once() {
+        let (tx, _commands) = channel();
+        let (events, rx) = channel(); drop(events);
+        let worker = Worker { tx, rx, handle: std::cell::RefCell::new(None),
+            stop: Arc::new(AtomicBool::new(false)), disconnected_reported: std::cell::Cell::new(false), acknowledged_connection: std::cell::Cell::new(None) };
+        assert!(matches!(worker.try_recv(), Some(Event::Stopped { .. })));
+        assert!(worker.try_recv().is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_queued_work_before_any_command_is_handled() {
+        let (commands, rx) = channel();
+        commands.send(Envelope { command:Command::Init, connection_id:None }).unwrap();
+        commands.send(Envelope { command:Command::WriteProp { name:"on".into(), value:Value::Bool(true) }, connection_id:Some(1) }).unwrap();
+        let (events, result) = channel();
+        let mut worker = WorkerLoop::new(Credentials::isolated(std::env::temp_dir().join("unused-stopped-worker")), Settings::default(), events);
+        worker.run(rx, &AtomicBool::new(true));
+        assert!(result.try_iter().all(|event| matches!(event, Event::Log(_))));
+        assert!(worker.ctrl.is_none());
+    }
+
+    #[test]
+    fn dequeuing_ready_does_not_rebind_writes_before_the_ui_accepts_it() {
+        let (tx, commands) = channel();
+        let (events, rx) = channel();
+        let worker = Worker { tx, rx, handle: std::cell::RefCell::new(None),
+            stop: Arc::new(AtomicBool::new(false)), disconnected_reported: std::cell::Cell::new(false),
+            acknowledged_connection: std::cell::Cell::new(Some(1)) };
+        events.send(Event::Ready { link:ActiveLink::Cloud,
+            device:DeviceSummary { connection_id:2, ..Default::default() } }).unwrap();
+        assert!(matches!(worker.try_recv(), Some(Event::Ready { .. })));
+        worker.send(Command::WriteProp { name:"on".into(), value:Value::Bool(true) });
+        assert_eq!(commands.recv().unwrap().connection_id, Some(1));
+        worker.acknowledge_connection(2);
+        worker.send(Command::WriteProp { name:"on".into(), value:Value::Bool(true) });
+        assert_eq!(commands.recv().unwrap().connection_id, Some(2));
+    }
+
+    #[test]
+    fn a_queued_write_is_cancelled_after_the_worker_rebuilds_its_connection() {
+        let (commands, rx) = channel();
+        commands.send(Envelope { command:Command::WriteProp { name:"on".into(), value:Value::Bool(true) }, connection_id:Some(1) }).unwrap();
+        drop(commands);
+        let (events, results) = channel();
+        let mut worker = WorkerLoop::new(Credentials::isolated(std::env::temp_dir().join("unused-bound-command")), Settings::default(), events);
+        worker.connection_id = 2;
+        worker.run(rx, &AtomicBool::new(false));
+        assert!(results.try_iter().any(|event| matches!(event,
+            Event::Wrote { ok:false, error:Some(error), .. } if error.contains("旧操作已取消"))));
+    }
+
+    #[test]
+    fn ensure_rebuilds_an_old_channel_after_device_credentials_switch_without_init() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("miac-device-switch-ensure-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let device_path = directory.join(crate::credentials::FILE_DEVICE);
+        let old_device = crate::credentials::DeviceInfo {
+            name: Some("old fixture".into()), model: Some(crate::miot::EXPECT_MODEL.into()), did: "1".into(),
+            localip: Some("127.0.0.1".into()), token: Some("11111111111111111111111111111111".into()),
+            ..Default::default()
+        };
+        std::fs::write(&device_path, serde_json::to_vec(&old_device).unwrap()).unwrap();
+
+        let creds = Credentials::isolated(&directory);
+        let mut worker = WorkerLoop::new(creds.clone(), Settings::default(), channel().0);
+        let mut old_controller = Controller::new(creds, Transport::Local);
+        assert_eq!(old_controller.init_transport().unwrap(), ActiveLink::Local);
+        assert!(old_controller.is_bound_to(&old_device));
+        worker.ctrl = Some(old_controller);
+
+        let new_device = crate::credentials::DeviceInfo {
+            name: Some("new fixture".into()), model: Some(crate::miot::EXPECT_MODEL.into()), did: "2".into(),
+            localip: Some("127.0.0.2".into()), token: Some("22222222222222222222222222222222".into()),
+            ..Default::default()
+        };
+        std::fs::write(&device_path, serde_json::to_vec(&new_device).unwrap()).unwrap();
+
+        assert_eq!(worker.ensure().unwrap(), ActiveLink::Local);
+        let controller = worker.ctrl.as_ref().unwrap();
+        assert_eq!(controller.device().unwrap().did, "2");
+        assert!(controller.is_bound_to(&new_device));
+        assert!(!controller.is_bound_to(&old_device));
+
+        std::fs::remove_file(&device_path).unwrap();
+        assert!(worker.ensure().is_err(), "missing switched credentials must not reuse the old channel");
+        assert!(worker.ctrl.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn ready_summary_uses_the_connected_device_when_disk_credentials_change() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("miac-ready-summary-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let device_path = directory.join(crate::credentials::FILE_DEVICE);
+        let old_device = crate::credentials::DeviceInfo {
+            name: Some("old fixture".into()), model: Some(crate::miot::EXPECT_MODEL.into()), did: "1".into(),
+            localip: Some("127.0.0.1".into()), token: Some("00000000000000000000000000000000".into()),
+            ..Default::default()
+        };
+        std::fs::write(&device_path, serde_json::to_vec(&old_device).unwrap()).unwrap();
+        let creds = Credentials::isolated(&directory);
+        let mut controller = Controller::new(creds.clone(), Transport::Local);
+        // init_transport constructs the loopback socket but sends no packets.
+        assert_eq!(controller.init_transport().unwrap(), ActiveLink::Local);
+        let (tx, _rx) = channel();
+        let mut worker = WorkerLoop::new(creds, Settings::default(), tx);
+        worker.ctrl = Some(controller);
+
+        let new_device = crate::credentials::DeviceInfo {
+            name: Some("new fixture".into()), model: Some("xiaomi.aircondition.ma7".into()), did: "2".into(),
+            localip: Some("127.0.0.2".into()), ..old_device
+        };
+        std::fs::write(&device_path, serde_json::to_vec(&new_device).unwrap()).unwrap();
+        let summary = worker.device_summary();
+        assert_eq!(summary.did, "1", "Ready must identify the device of the actual controller");
+        assert_eq!(summary.name, "old fixture");
+        assert_eq!(summary.model, crate::miot::EXPECT_MODEL);
+        assert_eq!(summary.profile.model, summary.model);
+        assert_eq!(summary.localip.as_deref(), Some("127.0.0.1"));
+
+        std::fs::remove_file(&device_path).unwrap();
+        assert_eq!(worker.device_summary().did, "1", "a missing disk file must not erase the connected device");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_temperature_preset_does_not_trigger_reconnection() {
+        let creds = Credentials::isolated(std::env::temp_dir().join("miac-invalid-preset-worker-test"));
+        let (tx, rx) = channel();
+        let mut worker = WorkerLoop::new(creds.clone(), Settings::default(), tx);
+        let mut controller = Controller::new(creds, Transport::Local);
+        controller.profile = crate::profile::Profile::legacy();
+        controller.link = Some(ActiveLink::Local);
+        worker.ctrl = Some(controller);
+
+        for _ in 0..3 {
+            worker.handle(Command::ApplyPreset(f64::NAN));
+            assert!(matches!(rx.try_recv(), Ok(Event::Failed { .. })));
+        }
+        assert_eq!(worker.failures, 0, "invalid write values must not be counted as transport failures");
+        assert_eq!(worker.ctrl.as_ref().unwrap().link, Some(ActiveLink::Local));
+    }
+
+    #[test]
+    fn expired_failures_notify_login_before_the_consumer_discards_the_error() {
+        let creds = Credentials::isolated(std::env::temp_dir().join("miac-expired-result-worker-test"));
+        let (tx, rx) = channel();
+        let mut worker = WorkerLoop::new(creds, Settings::default(), tx);
+        worker.failures = 2;
+
+        worker.failed("读维护状态", crate::cloud::CloudError::SessionExpired.into());
+        assert!(matches!(rx.try_recv(), Ok(Event::CloudLoginRequired)));
+        assert!(matches!(rx.try_recv(), Ok(Event::Failed { op, error })
+            if op == "读维护状态" && error == crate::cloud::SESSION_EXPIRED_MESSAGE));
+        worker.failed("读 2.1", crate::cloud::CloudError::SessionExpired.into());
+        assert!(matches!(rx.try_recv(), Ok(Event::Failed { op, .. }) if op == "读 2.1"));
+        assert!(rx.try_recv().is_err(), "one login prompt per login cycle");
+        assert_eq!(worker.failures, 2);
+    }
+
+    #[test]
+    fn expired_write_notifies_login_and_keeps_the_failed_write_result() {
+        let creds = Credentials::isolated(std::env::temp_dir().join("miac-expired-write-worker-test"));
+        let (tx, rx) = channel();
+        let mut worker = WorkerLoop::new(creds, Settings::default(), tx);
+
+        worker.write_completed("mode".into(), Err(crate::cloud::CloudError::SessionExpired.into()));
+        assert!(matches!(rx.try_recv(), Ok(Event::CloudLoginRequired)));
+        assert!(matches!(rx.try_recv(), Ok(Event::Wrote { name, ok: false, error: Some(error) })
+            if name == "mode" && error == crate::cloud::SESSION_EXPIRED_MESSAGE));
+        worker.write_completed("mode".into(), Err(ControllerError("device rejected value".into())));
+        assert!(matches!(rx.try_recv(), Ok(Event::Wrote { ok: false, .. })));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(worker.failures, 0);
+    }
+
+    #[test]
+    fn expired_session_notifies_once_and_suppresses_only_cloud_supplementary_reads() {
+        let creds = Credentials::isolated(std::env::temp_dir().join("miac-expired-worker-test"));
+        let (tx, rx) = channel();
+        let mut worker = WorkerLoop::new(creds.clone(), Settings::default(), tx);
+        let mut controller = Controller::new(creds, Transport::Auto);
+        controller.link = Some(ActiveLink::Local);
+        worker.ctrl = Some(controller);
+        worker.note(&Err(crate::cloud::CloudError::SessionExpired.into()));
+        assert!(matches!(rx.try_recv(), Ok(Event::CloudLoginRequired)));
+        worker.require_cloud_login();
+        worker.handle(Command::PowerStats);
+        worker.handle(Command::Thermometer);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(worker.failures, 0);
+        assert_eq!(worker.ctrl.as_ref().unwrap().link, Some(ActiveLink::Local));
+        worker.handle(Command::Init);
+        assert!(!worker.cloud_login_required);
+    }
 
     #[test]
     fn init_discards_old_device_connection_after_credentials_change() {

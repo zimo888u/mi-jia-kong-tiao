@@ -24,15 +24,15 @@ impl SingleInstance {
     fn acquire_named(name: &str) -> std::io::Result<Option<Self>> {
         let wide = |suffix: &str| format!("{name}.{suffix}").encode_utf16().chain([0]).collect::<Vec<_>>();
         unsafe {
-            // Create the event first: even a duplicate launched during startup
-            // can leave a signal for the first instance's future UI timer.
-            let activate = CreateEventW(std::ptr::null(), 0, 0, wide("activate").as_ptr());
-            if activate.is_null() { return Err(std::io::Error::last_os_error()); }
-            let activate = Handle(activate);
             let mutex = CreateMutexW(std::ptr::null(), 0, wide("instance").as_ptr());
             if mutex.is_null() { return Err(std::io::Error::last_os_error()); }
             let exists = GetLastError() == ERROR_ALREADY_EXISTS;
-            let instance = Self { _mutex: Handle(mutex), activate };
+            let mutex = Handle(mutex);
+            // Either process may create the latched event after primary ownership
+            // is decided. CreateEvent never resets an existing signal.
+            let activate = CreateEventW(std::ptr::null(), 0, 0, wide("activate").as_ptr());
+            if activate.is_null() { return Err(std::io::Error::last_os_error()); }
+            let instance = Self { _mutex: mutex, activate: Handle(activate) };
             if exists {
                 if SetEvent(instance.activate.0) == 0 {
                     return Err(std::io::Error::last_os_error());

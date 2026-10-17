@@ -1,5 +1,5 @@
 //! Model-specific MIoT capabilities. Never reuse property addresses across models.
-use std::{collections::{BTreeMap, BTreeSet}, io::Read, path::Path, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use crate::miot;
@@ -49,6 +49,12 @@ fn exact_integral_float(value: &Value) -> Option<f64> {
         .then_some(number)
 }
 
+fn property_range(prop: &Value) -> Option<[f64; 3]> {
+    let values = prop["value-range"].as_array()?;
+    let range = [values.first()?.as_f64()?, values.get(1)?.as_f64()?, values.get(2)?.as_f64()?];
+    (range.iter().all(|n| n.is_finite()) && range[0] < range[1] && range[2] > 0.0).then_some(range)
+}
+
 impl Profile {
     fn without_unverified_mode(mut self, ambiguous_catalog_revisions: bool) -> Self {
         // Public revisions of these models assign different numbers to Cool,
@@ -62,13 +68,25 @@ impl Profile {
 
     pub fn legacy() -> Self {
         let mut profile = Self { model: miot::EXPECT_MODEL.into(), description: "米家空调".into(), spec_status: "legacy".into(), ..Self::default() };
+        let spec = &bundled_specs()[miot::EXPECT_MODEL];
         for &(name, (siid, piid)) in miot::PROPS {
             let boolean = ["on", "eco", "heater", "dryer", "sleep", "favoriteOn", "horizontalSwing", "verticalSwing", "windSensation", "buzzer", "light"].contains(&name);
-            let choices = match name { "mode" => miot::MODE_NAME, "fanLevel" => miot::FAN_NAME, _ => &[] };
+            // Keep the verified addresses and Chinese labels, while enforcing
+            // the numeric contract published for this exact bundled model.
+            let published = spec["services"].as_array().into_iter().flatten()
+                .find(|service| service["iid"].as_u64() == Some(siid as u64))
+                .and_then(|service| service["properties"].as_array())
+                .and_then(|properties| properties.iter().find(|prop| prop["iid"].as_u64() == Some(piid as u64)));
+            let choices = match name {
+                "mode" => miot::MODE_NAME, "fanLevel" => miot::FAN_NAME,
+                "windDirection" => miot::WIND_NAME, "verticalPos" | "horizontalPos" => miot::POS_NAME,
+                "lightBright" => miot::BRIGHT_NAME, "coolingEffect" | "heatingEffect" => miot::EFFECT_NAME,
+                _ => &[],
+            };
             profile.properties.insert(name.into(), Property {
                 siid, piid, readable: true, writable: ["on", "mode", "targetTemp", "eco", "heater", "dryer", "sleep", "favoriteOn", "fanLevel", "horizontalSwing", "verticalSwing", "windDirection", "windSensation", "verticalPos", "horizontalPos", "buzzer", "light", "lightBright", "coolingEffect", "heatingEffect", "fanPercent"].contains(&name),
-                format: if boolean { "bool" } else { "float" }.into(),
-                range: (name == "targetTemp").then_some([16.0,31.0,0.5]),
+                format: published.and_then(|prop| prop["format"].as_str()).unwrap_or(if boolean { "bool" } else { "float" }).into(),
+                range: published.and_then(property_range).or_else(|| (name == "targetTemp").then_some([16.0,31.0,0.5])),
                 choices: choices.iter().map(|(v,n)| (*v, (*n).into())).collect(),
             });
         }
@@ -106,17 +124,17 @@ impl Profile {
                 let access = |mode: &str| prop["access"].as_array().is_some_and(|a| a.iter().any(|v| v.as_str() == Some(mode)));
                 let format = prop["format"].as_str().unwrap_or("").to_string();
                 if ["on", "eco", "heater", "dryer", "sleep", "horizontalSwing", "verticalSwing", "light", "buzzer"].contains(&name) && format != "bool" { continue; }
-                let range = prop["value-range"].as_array().and_then(|a| {
-                    let r = [a.first()?.as_f64()?, a.get(1)?.as_f64()?, a.get(2)?.as_f64()?];
-                    (r.iter().all(|n| n.is_finite()) && r[0] < r[1] && r[2] > 0.0).then_some(r)
-                });
+                let range = property_range(prop);
                 let mut choices: Vec<_> = prop["value-list"].as_array().into_iter().flatten().filter_map(|c| {
                     Some((c["value"].as_i64()?, label(c["description"].as_str().unwrap_or(""))))
                 }).collect();
                 if choices.is_empty() && name == "fanLevel" {
                     if let Some([min, max, step]) = range {
                         if (max-min)/step <= 20.0 && step.fract() == 0.0 && min.fract() == 0.0 {
-                            choices = (0..=((max-min)/step) as i64).map(|i| { let v = min as i64 + i * step as i64; (v, v.to_string()) }).collect();
+                            choices = (0..=((max-min)/step) as i64).map(|i| {
+                                let v = min as i64 + i * step as i64;
+                                (v, if v == 0 { "自动".into() } else { v.to_string() })
+                            }).collect();
                         }
                     }
                 }
@@ -198,8 +216,7 @@ fn label(name: &str) -> String {
 
 fn fetch(agent: &ureq::Agent, url: &str) -> Result<Value,String> {
     let response = agent.get(url).call().map_err(|e| e.to_string())?;
-    let mut data = Vec::new();
-    response.into_reader().take(32*1024*1024).read_to_end(&mut data).map_err(|e| e.to_string())?;
+    let data = crate::io_limits::read(response.into_reader(), crate::io_limits::SPEC_BYTES).map_err(|e| e.to_string())?;
     serde_json::from_slice(&data).map_err(|e| e.to_string())
 }
 
@@ -234,7 +251,7 @@ pub fn load(model: &str, directory: &Path, proxy: Option<&str>) -> Result<Profil
         if let Ok(profile) = Profile::parse(model, spec) { return Ok(profile.without_unverified_mode(false)); }
     }
     let cache = directory.join("miot-spec-cache").join(format!("{model}.json"));
-    if let Ok(data) = std::fs::read(&cache) {
+    if let Ok(data) = crate::io_limits::read_file(&cache, crate::io_limits::SPEC_BYTES) {
         if let Ok(spec) = serde_json::from_slice::<Value>(&data) {
             if spec["model"].as_str() == Some(model) {
                 if let Ok(profile) = Profile::parse(model, &spec["spec"]) {
@@ -246,9 +263,9 @@ pub fn load(model: &str, directory: &Path, proxy: Option<&str>) -> Result<Profil
             }
         }
     }
-    let mut builder = ureq::AgentBuilder::new().tls_config(crate::tls::connector()).timeout(Duration::from_secs(30));
+    let mut builder = ureq::AgentBuilder::new().tls_config(crate::tls::connector()).redirects(0).timeout(Duration::from_secs(30));
     let configured_proxy = proxy.map(str::to_owned).or_else(|| std::env::var("MIAC_PROXY").ok());
-    if let Some(proxy) = configured_proxy.as_deref() { builder = builder.proxy(ureq::Proxy::new(proxy).map_err(|e| e.to_string())?); }
+    if let Some(proxy) = configured_proxy.as_deref().filter(|p| !p.is_empty()) { builder = builder.proxy(ureq::Proxy::new(proxy).map_err(|_| "代理配置无效".to_string())?); }
     let agent = builder.build();
     let index = fetch(&agent,"https://miot-spec.org/miot-spec-v2/instances?status=all")?;
     let (selected, ambiguous_revisions) = select_catalog_spec(&index, model)
@@ -275,6 +292,32 @@ pub fn bundled_specs() -> &'static Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_profile_rejects_values_outside_the_published_numeric_contract() {
+        let profile = Profile::legacy();
+        for (name, invalid) in [
+            ("lightBright", json!(3.5)), ("lightBright", json!(3)),
+            ("windDirection", json!(-1)), ("windDirection", json!(5)),
+            ("verticalPos", json!(6)), ("horizontalPos", json!(0.5)),
+            ("coolingEffect", json!(0)), ("heatingEffect", json!(6)),
+            ("fanPercent", json!(102)), ("fanPercent", json!(50.5)),
+        ] {
+            assert!(profile.validate(name, &invalid).is_err(), "accepted {name}={invalid}");
+        }
+        for (name, valid) in [
+            ("lightBright", json!(2)), ("windDirection", json!(4)),
+            ("verticalPos", json!(5)), ("horizontalPos", json!(0)),
+            ("coolingEffect", json!(1)), ("heatingEffect", json!(5)),
+            ("fanPercent", json!(101)),
+        ] {
+            assert_eq!(profile.validate(name, &valid).unwrap(), valid);
+        }
+        assert_eq!(profile.properties["fanPercent"].format, "uint8");
+        assert_eq!(profile.properties["clean"].format, "string");
+        assert_eq!(profile.properties["faultValue"].format, "int16");
+        assert_eq!(profile.properties["mode"].choices, miot::MODE_NAME.iter().map(|(v,n)| (*v, (*n).into())).collect::<Vec<_>>());
+    }
 
     #[test]
     fn official_model_fixtures_have_independent_addresses_and_enums() {
@@ -381,6 +424,7 @@ mod tests {
         let mut profile = Profile::legacy();
         let property = profile.properties.get_mut("fanPercent").unwrap();
         property.format = "uint64".into();
+        property.range = None;
         let exact = json!(9_007_199_254_740_993u64);
         assert_eq!(profile.validate("fanPercent", &exact).unwrap(), exact);
         assert_eq!(profile.validate("fanPercent", &json!(u64::MAX)).unwrap(), json!(u64::MAX));

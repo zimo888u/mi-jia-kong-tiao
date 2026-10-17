@@ -2,7 +2,7 @@
 // ui/pages/diag.slint —— 运行诊断页
 //
 // 对应 index.html 的 <section data-view="diag">：
-//   机器诊断九宫格 / 温湿度计 / 自清洁·维护 / 故障标志 13.1
+//   机器诊断九宫格 / 温湿度计 / 自清洁·维护 / 当前型号故障标志
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Theme } from "../theme.slint";
@@ -52,9 +52,11 @@ export component DiagPage inherits VerticalLayout {
     in property <string> clean-text: "—";
     in property <string> examine-text: "—";
     in property <string> run-text: "—";
+    in property <string> fault-addr: "—";
     in property <string> fault-badge: "—";
     in property <string> fault-text: "读取中…";
     in property <bool> fault-clear: true;
+    in property <bool> fault-known: false;
 
     spacing: Theme.gap;
 
@@ -128,7 +130,7 @@ export component DiagPage inherits VerticalLayout {
 
     // ── 故障标志 ──────────────────────────────────────────────
     Card {
-        title: "故障标志 13.1";
+        title: "故障标志 " + root.fault-addr;
         Rectangle {
             height: 34px;
             background: transparent;
@@ -138,12 +140,12 @@ export component DiagPage inherits VerticalLayout {
                     width: max(64px, badge-text.preferred-width + 24px);
                     height: 30px;
                     border-radius: 15px;
-                    background: root.fault-clear ? Theme.green.with-alpha(0.16) : Theme.red.with-alpha(0.16);
+                    background: !root.fault-known ? Theme.text-mute.with-alpha(0.12) : root.fault-clear ? Theme.green.with-alpha(0.16) : Theme.red.with-alpha(0.16);
                     border-width: 0px;
-                    border-color: root.fault-clear ? Theme.green : Theme.red;
+                    border-color: !root.fault-known ? Theme.text-mute : root.fault-clear ? Theme.green : Theme.red;
                     badge-text := Text {
                         text: root.fault-badge;
-                        color: root.fault-clear ? Theme.green : Theme.red;
+                        color: !root.fault-known ? Theme.text-mute : root.fault-clear ? Theme.green : Theme.red;
                         font-size: Theme.font-md;
                         font-weight: 600;
                         horizontal-alignment: center;

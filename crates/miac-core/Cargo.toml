@@ -20,6 +20,7 @@ md-5 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+zeroize = "1.9"
 
 # ── JSON ─────────────────────────────────────────────────────
 # device.json / cloud-session.json / thermometer.json 必须与 v1 完全兼容
@@ -32,7 +33,7 @@ hmac = "0.12"
 # 本机 Windows schannel 凭据存储不可用（SEC_E_NO_CREDENTIALS），
 # 任何走 schannel 的客户端都连不上（curl / winget 都栽在这上面）。
 ureq = { version = "2", default-features = false, features = ["tls", "json", "gzip"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
 
 [target.'cfg(windows)'.dependencies]
@@ -45,6 +46,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Time",
     "Win32_System_Threading",
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

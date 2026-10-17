@@ -30,6 +30,12 @@ use crate::miot;
 #[derive(Debug, Clone)]
 pub struct ControllerError(pub String);
 
+impl ControllerError {
+    pub fn requires_cloud_login(&self) -> bool {
+        self.0.contains(cloud::SESSION_EXPIRED_MESSAGE)
+    }
+}
+
 impl std::fmt::Display for ControllerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -173,6 +179,28 @@ pub struct PowerStats {
     pub months: Vec<(u32, f64, i64)>,
 }
 
+pub fn profile_fault_value(profile: &crate::profile::Profile, values: &[(&str, PropValue)]) -> Option<i64> {
+    let name = if profile.model == miot::EXPECT_MODEL { "faultValue" } else { "fault" };
+    if !profile.properties.contains_key(name) { return None; }
+    match values.iter().find(|(key, _)| *key == name)?.1.clone() {
+        PropValue::Ok(Value::String(s)) => s.split(',').next()?.trim().parse().ok(),
+        PropValue::Ok(value) => value.as_i64(),
+        _ => None,
+    }
+}
+
+pub fn profile_fault_info(profile: &crate::profile::Profile, values: &[(&str, PropValue)]) -> miot::FaultInfo {
+    let name = if profile.model == miot::EXPECT_MODEL { "faultValue" } else { "fault" };
+    if !profile.properties.contains_key(name) {
+        return miot::FaultInfo { clear: false, text: "该型号未提供故障读数".into(), badge: None };
+    }
+    let value = profile_fault_value(profile, values);
+    if profile.model == miot::EXPECT_MODEL { return miot::fault_info(value); }
+    miot::FaultInfo { clear: value == Some(0), text: match value {
+        Some(0) => "无故障".into(), Some(n) => format!("故障代码 {n}"), None => "故障读数不可用".into()
+    }, badge: None }
+}
+
 /// 空调控制器。
 pub struct Controller {
     pub profile: crate::profile::Profile,
@@ -184,6 +212,7 @@ pub struct Controller {
     device: Option<DeviceInfo>,
     local: Option<MiioDevice>,
     cloud: Option<CloudClient>,
+    login_state: Option<crate::credentials::LoginState>,
     /// 代理（云端用）
     pub proxy: Option<String>,
 }
@@ -199,6 +228,7 @@ impl Controller {
             device: None,
             local: None,
             cloud: None,
+            login_state: None,
             proxy,
         }
     }
@@ -208,12 +238,35 @@ impl Controller {
         self.device.as_ref()
     }
 
+    /// 当前底层连接是否仍绑定到这组设备凭据。
+    ///
+    /// did、型号、局域网地址或 token 任一变化都必须重建连接；仅名称和
+    /// savedAt 变化不影响控制寻址，可以沿用现有通道。
+    pub fn is_bound_to(&self, candidate: &DeviceInfo) -> bool {
+        fn normalized(value: Option<&str>) -> Option<&str> {
+            value.map(str::trim).filter(|value| !value.is_empty())
+        }
+
+        self.device.as_ref().is_some_and(|bound| {
+            bound.did.trim() == candidate.did.trim()
+                && normalized(bound.model.as_deref()) == normalized(candidate.model.as_deref())
+                && normalized(bound.localip.as_deref()) == normalized(candidate.localip.as_deref())
+                && normalized(bound.token.as_deref()) == normalized(candidate.token.as_deref())
+        })
+    }
+
     pub fn thermometer_device(&self) -> Option<ThermometerInfo> {
-        self.creds.read_thermometer()
+        self.login_state.clone().or_else(|| self.creds.read_login()).map(|state| state.thermometer)
+            .filter(|sensor| !sensor.did.is_empty())
     }
 
     pub fn has_cloud_session(&self) -> bool {
-        self.creds.read_session().is_some_and(|s| s.ready())
+        self.login_state.as_ref().is_some_and(|state| state.session.ready())
+    }
+
+    pub fn credentials_current(&self) -> bool {
+        self.login_state.as_ref().zip(self.creds.read_login().as_ref())
+            .is_some_and(|(bound, current)| bound == current)
     }
 
     /// 选择并初始化通道。
@@ -223,10 +276,16 @@ impl Controller {
     ///   - `prefer = local` → 强制局域网（缺 localip/token 直接报错）
     ///   - `prefer = auto`  → 有 localip+token 走局域网，否则云端
     pub fn init_transport(&mut self) -> Result<ActiveLink, ControllerError> {
-        let dev = self
-            .creds
-            .read_device()
+        // Credentials may now describe another device or account. A failed
+        // reload must not leave an old connection available for later writes.
+        self.dispose();
+        self.device = None;
+        self.profile = crate::profile::Profile::default();
+        let state = self.creds.read_login()
             .ok_or_else(|| ControllerError("还没有设备信息，请先登录米家账号完成设备设置。".into()))?;
+        let dev = state.device.clone();
+        dev.validate().map_err(|e| ControllerError(e.into()))?;
+        self.login_state = Some(state);
         self.device = Some(dev.clone());
         self.profile = crate::profile::load(dev.model.as_deref().unwrap_or(""), self.creds.primary_dir(), self.proxy.as_deref())
             .map_err(|e| ControllerError(format!("读取该型号的 MIoT 规格失败：{e}")))?;
@@ -252,7 +311,7 @@ impl Controller {
             }
         }
 
-        Ok(self.link.expect("init_transport 结束时一定有链路"))
+        self.link.ok_or_else(|| ControllerError("控制通道未初始化".into()))
     }
 
     fn init_local(&mut self, dev: &DeviceInfo) -> Result<(), ControllerError> {
@@ -267,9 +326,7 @@ impl Controller {
     }
 
     fn use_cloud(&mut self) -> Result<(), ControllerError> {
-        let session = self
-            .creds
-            .read_session()
+        let session = self.login_state.as_ref().map(|state| state.session.clone())
             .ok_or_else(|| ControllerError("云端会话不可用（cloud-session.json 缺失），请重新登录米家账号。".into()))?;
         if !session.ready() {
             return Err(ControllerError(
@@ -295,7 +352,7 @@ impl Controller {
             let local_result = self
                 .local
                 .as_mut()
-                .expect("local 链路下一定有连接")
+                .ok_or_else(|| ControllerError("局域网连接已失效，请重新连接".into()))?
                 .rpc(method, params.clone());
             match local_result {
                 Ok(value) => return Ok(value),
@@ -316,9 +373,9 @@ impl Controller {
                     // 本地 UDP 超时后应尝试云端，而不是永久重连同一个失效 IP。
                     if self.prefer != crate::Transport::Local && self.has_cloud_session() {
                         eprintln!("[通道] 局域网失败（{local_error}），自动尝试云端。");
-                        self.local = None;
                         if self.use_cloud().is_ok() {
-                            let cloud = self.cloud.as_ref().expect("云端已初始化");
+                            self.local = None;
+                            let cloud = self.cloud.as_ref().ok_or_else(|| ControllerError("云端连接未就绪".into()))?;
                             match cloud.miio_call(&did, method, &params) {
                                 Ok(value) => return Ok(value),
                                 Err(cloud_error) => {
@@ -394,32 +451,7 @@ impl Controller {
             .map(|(_, (siid, piid))| json!({ "did": did, "siid": siid, "piid": piid }))
             .collect();
         let arr = read_property_batches(&params, |batch| self.rpc("get_properties", Value::Array(batch.to_vec())))?;
-
-        let mut out = Vec::with_capacity(addrs.len());
-        for (name, (siid, piid)) in addrs.iter() {
-            // Match response addresses, not response order (cloud can reorder).
-            let v = match arr.iter().find(|item| item["siid"].as_u64() == Some(*siid as u64) && item["piid"].as_u64() == Some(*piid as u64)) {
-                None => PropValue::Missing,
-                Some(item) => match item.get("code").and_then(Value::as_i64) {
-                    Some(0) => PropValue::Ok(item.get("value").cloned().unwrap_or(Value::Null)),
-                    Some(code) => PropValue::Err(code),
-                    None => PropValue::Missing,
-                },
-            };
-            // 属性名来自 miot::PROPS（'static），这里用查找把生命周期接回去
-            let static_name = miot::PROPS
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(n, _)| *n)
-                .unwrap_or("unknown");
-            out.push((static_name, v));
-        }
-        for n in names {
-            if !out.iter().any(|(name,_)| name == n) {
-                if let Some((name,_)) = miot::PROPS.iter().find(|(name,_)| name == n) { out.push((*name,PropValue::Missing)); }
-            }
-        }
-        Ok(out)
+        Ok(property_read_results(&self.profile, names, &arr))
     }
 
     /// 读单个属性（原始 siid/piid）。
@@ -439,6 +471,9 @@ impl Controller {
         piid: u16,
         value: Value,
     ) -> Result<PropValue, ControllerError> {
+        if self.login_state.is_some() && !self.credentials_current() {
+            return Err(ControllerError("设备或账号凭据已变化，请重新连接后操作".into()));
+        }
         let did = self.device.as_ref().map(|d| d.did.clone()).unwrap_or_default();
         let res = self.rpc(
             "set_properties",
@@ -466,6 +501,7 @@ impl Controller {
     // ── 校验（与 v1 的 valid* 系列一致）────────────────────────
 
     /// 温度必须是 16~31、步长 0.5。
+    #[deprecated(note = "仅适用于旧 h53h00 规则；真实设备必须使用 profile.validate")]
     pub fn valid_temp(t: f64) -> Result<f64, ControllerError> {
         if !t.is_finite() || !(16.0..=31.0).contains(&t) || ((t * 2.0) - (t * 2.0).round()).abs() > 1e-9
         {
@@ -477,6 +513,7 @@ impl Controller {
     }
 
     /// 模式名/值 → 模式值。
+    #[deprecated(note = "仅适用于旧 h53h00 映射；真实设备必须按 profile 选择模式")]
     pub fn valid_mode(m: &Value) -> Result<i64, ControllerError> {
         let v = match m {
             Value::Number(n) => n.as_i64(),
@@ -493,6 +530,7 @@ impl Controller {
     }
 
     /// 风速：auto / 1~7 / max。
+    #[deprecated(note = "仅适用于旧 h53h00 映射；真实设备必须按 profile 选择风速")]
     pub fn valid_fan(level: &Value) -> Result<i64, ControllerError> {
         match level {
             Value::String(s) if s == "auto" => return Ok(0),
@@ -655,9 +693,7 @@ impl Controller {
 
     /// 状态快照：空调状态 + 故障解读。
     pub fn snapshot(&mut self) -> Result<Snapshot, ControllerError> {
-        let mut names = miot::STATUS_PROPS.to_vec();
-        // Preserve the original model's known-good property set.
-        if self.profile.model != miot::EXPECT_MODEL { names.push("fault"); }
+        let mut names = snapshot_property_names(&self.profile);
         // Read the safety-critical switch and temperature first. A vendor-only
         // diagnostic or energy property must not hide the actual power state.
         let mut status = self.read_props(&["on", "targetTemp"])?;
@@ -674,16 +710,9 @@ impl Controller {
                 }
             }
         }
-        let fault_value = status
-            .iter()
-            .find(|(n, _)| *n == "faultValue")
-            .and_then(|(_, v)| v.as_i64());
         Ok(Snapshot {
             link: self.link,
-            fault: if self.profile.model == miot::EXPECT_MODEL { miot::fault_info(fault_value) } else {
-                let value = status.iter().find(|(n,_)| *n == "fault").map(|(_,v)| v);
-                miot::FaultInfo { clear: value.and_then(PropValue::as_i64) == Some(0), text: value.map(PropValue::display).unwrap_or_else(|| "该型号未提供故障读数".into()), badge: None }
-            },
+            fault: profile_fault_info(&self.profile, &status),
             status,
         })
     }
@@ -714,13 +743,14 @@ impl Controller {
     /// 温湿度计 3 是蓝牙设备，没有可直接访问的局域网 IP；数据经蓝牙网关同步到
     /// 米家云后读取。失败时返回可显示的状态，不影响空调本地控制。
     pub fn read_thermometer(&mut self) -> ThermometerReading {
-        let Some(dev) = self.thermometer_device() else {
+        let state = self.login_state.clone().or_else(|| self.creds.read_login());
+        let Some(dev) = state.as_ref().map(|s| s.thermometer.clone()).filter(|t| !t.did.is_empty()) else {
             return ThermometerReading::unavailable("未配置");
         };
         if dev.did.trim().is_empty() {
             return ThermometerReading::unavailable("未配置");
         }
-        let Some(session) = self.creds.read_session().filter(|s| s.ready()) else {
+        let Some(session) = state.map(|s| s.session).filter(|s| s.ready()) else {
             return ThermometerReading::unavailable("需要登录米家云");
         };
 
@@ -733,7 +763,7 @@ impl Controller {
                 let mut temp = None;
                 let mut hum = None;
                 let mut battery = None;
-                let mut updated = 0i64;
+                let now = unix_now();
                 for item in &items {
                     let siid = item.get("siid").and_then(Value::as_i64).unwrap_or(-1);
                     let piid = item.get("piid").and_then(Value::as_i64).unwrap_or(-1);
@@ -741,7 +771,8 @@ impl Controller {
                     if code != 0 {
                         continue;
                     }
-                    updated = updated.max(item.get("updateTime").and_then(Value::as_i64).unwrap_or(0));
+                    if item.get("updateTime").and_then(Value::as_i64)
+                        .is_some_and(|time| !recent_sensor_time(time, now)) { continue; }
                     let v = item.get("value").and_then(Value::as_f64);
                     match (siid, piid) {
                         (3, 1001) => temp = v,
@@ -761,6 +792,9 @@ impl Controller {
                     };
                 }
             }
+            Err(e) if e.is_session_expired() => {
+                return ThermometerReading::unavailable(e.to_string());
+            }
             Err(_) => { /* 回退到历史上报 */ }
         }
 
@@ -770,15 +804,19 @@ impl Controller {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let read_last = |key: &str| -> Option<Value> {
+        let read_last = |key: &str| -> Result<Option<Value>, cloud::CloudError> {
             cloud
-                .device_data(&dev.did, key, now - 7 * 86400, now + 60, 1)
-                .ok()
-                .and_then(|v| v.into_iter().next())
+                .device_data(&dev.did, key, now - 600, now + 60, 1000)
+                .map(|records| latest_sensor_record(records, now))
         };
 
-        let temp_rec = read_last(miot::THERMOMETER_HISTORY_KEY_TEMPERATURE);
-        let hum_rec = read_last(miot::THERMOMETER_HISTORY_KEY_HUMIDITY);
+        let mut error = None;
+        let mut read_record = |key| match read_last(key) {
+            Ok(record) => record,
+            Err(e) => { error = Some(e); None }
+        };
+        let temp_rec = read_record(miot::THERMOMETER_HISTORY_KEY_TEMPERATURE);
+        let hum_rec = read_record(miot::THERMOMETER_HISTORY_KEY_HUMIDITY);
 
         let temp = temp_rec.as_ref().and_then(|r| cloud::record_number(r, "temperature"));
         let hum = hum_rec.as_ref().and_then(|r| cloud::record_number(r, "humidity"));
@@ -792,7 +830,8 @@ impl Controller {
                 battery: None,
                 reason: None,
             },
-            _ => ThermometerReading::unavailable("云端读取失败"),
+            _ => ThermometerReading::unavailable(error.map(|e| e.to_string())
+                .unwrap_or_else(|| "云端暂无有效温湿度数据".into())),
         }
     }
 
@@ -909,6 +948,22 @@ impl ThermometerAddrs for [(&str, (u16, u16))] {
 
 // A write may have reached the device even when its acknowledgement is lost.
 // Only idempotent reads may be attempted through a fallback link.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn recent_sensor_time(mut time: i64, now: i64) -> bool {
+    if time > 1_000_000_000_000 { time /= 1000; }
+    time >= now - 600 && time <= now + 60
+}
+
+fn latest_sensor_record(records: Vec<Value>, now: i64) -> Option<Value> {
+    records.into_iter().filter(|r| r.get("time").and_then(Value::as_i64)
+        .is_some_and(|time| recent_sensor_time(time, now)))
+        .max_by_key(|r| r.get("time").and_then(Value::as_i64).unwrap_or(0))
+}
+
 fn rpc_retry_safe(method: &str) -> bool {
     method == "get_properties"
 }
@@ -919,6 +974,42 @@ fn confirmed_power_state(status: &[(&str, PropValue)]) -> Result<bool, Controlle
         .find(|(name, _)| *name == "on")
         .and_then(|(_, value)| value.as_bool())
         .ok_or_else(|| ControllerError("未能读取空调开关状态，请检查设备连接或型号规格".into()))
+}
+
+fn snapshot_property_names(profile: &crate::profile::Profile) -> Vec<&'static str> {
+    let mut names = miot::STATUS_PROPS.to_vec();
+    // These controls are rendered from snapshot state too. Without their
+    // readback, toggles stay false and selected numeric values stay at zero.
+    for name in ["windSensation", "light", "buzzer", "verticalPos", "horizontalPos", "lightBright", "coolingEffect", "heatingEffect"] {
+        if profile.properties.get(name).is_some_and(|prop| prop.readable) {
+            names.push(name);
+        }
+    }
+    if profile.model != miot::EXPECT_MODEL { names.push("fault"); }
+    names
+}
+
+fn property_read_results(
+    profile: &crate::profile::Profile,
+    names: &[&str],
+    results: &[Value],
+) -> Vec<(&'static str, PropValue)> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let Some(&(static_name, _)) = miot::PROPS.iter().find(|(known, _)| known == name) else { continue };
+        // Unsupported properties occupy their requested slot too; otherwise
+        // the result order shifts and repeated missing properties disappear.
+        let item = profile.properties.get(*name).filter(|prop| prop.readable)
+            .and_then(|prop| results.iter().find(|item| item["siid"].as_u64() == Some(prop.siid as u64)
+                && item["piid"].as_u64() == Some(prop.piid as u64)));
+        let value = match item.and_then(|item| item.get("code").and_then(Value::as_i64)) {
+            Some(0) => PropValue::Ok(item.and_then(|item| item.get("value")).cloned().unwrap_or(Value::Null)),
+            Some(code) => PropValue::Err(code),
+            None => PropValue::Missing,
+        };
+        out.push((static_name, value));
+    }
+    out
 }
 
 // Keep packets small: MIoT firmware can time out on oversized property lists.
@@ -936,20 +1027,22 @@ fn read_property_batches(
         batch: &[Value],
         read: &mut impl FnMut(&[Value]) -> Result<Value, ControllerError>,
         values: &mut Vec<Value>,
-    ) -> bool {
-        if batch.len() < 2 { return false; }
+    ) -> Result<bool, ControllerError> {
+        if batch.len() < 2 { return Ok(false); }
         let (left, right) = batch.split_at(batch.len() / 2);
-        let left_result = read(left);
-        let right_result = read(right);
-        let left_ok = match left_result {
-            Ok(result) => { append(values, result); true }
-            Err(_) => recover(left, read, values),
-        };
-        let right_ok = match right_result {
-            Ok(result) => { append(values, result); true }
-            Err(_) => recover(right, read, values),
-        };
-        left_ok || right_ok
+        let mut any_success = false;
+        for half in [left, right] {
+            match read(half) {
+                Ok(result) => { append(values, result); any_success = true; }
+                Err(error) => {
+                    // Authentication expiry applies to the whole request,
+                    // including retries for an otherwise optional property.
+                    if error.requires_cloud_login() { return Err(error); }
+                    any_success |= recover(half, read, values)?;
+                }
+            }
+        }
+        Ok(any_success)
     }
     let mut values = Vec::new();
     let mut first_error = None;
@@ -958,8 +1051,9 @@ fn read_property_batches(
         match read(batch) {
             Ok(result) => { append(&mut values, result); any_success = true; }
             Err(error) => {
+                if error.requires_cloud_login() { return Err(error); }
                 if first_error.is_none() { first_error = Some(error); }
-                any_success |= recover(batch, &mut read, &mut values);
+                any_success |= recover(batch, &mut read, &mut values)?;
             }
         }
     }
@@ -1000,7 +1094,7 @@ pub fn ymd_from_unix(secs: i64) -> (i32, u32, u32) {
 }
 
 /// Unix 秒 → (年, 月, 日)，按 UTC。公开的 `ymd_from_unix` 在 Windows 上应使用本地日历。
-fn ymd_from_unix_utc(secs: i64) -> (i32, u32, u32) {
+pub(crate) fn ymd_from_unix_utc(secs: i64) -> (i32, u32, u32) {
     let days = secs.div_euclid(86400);
     // 民用历算法：以 1970-01-01 为起点
     let z = days + 719468;
@@ -1112,8 +1206,141 @@ pub fn first_weekday_of_month(y: i32, m: u32) -> u32 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_sensor_values_select_the_newest_recent_record() {
+        let now = 1_800_000_000;
+        let records = vec![json!({"time":now-20,"value":"old"}), json!({"time":now-2,"value":"new"}), json!({"time":now-10,"value":"middle"})];
+        assert_eq!(latest_sensor_record(records, now).unwrap()["value"], "new");
+        assert!(latest_sensor_record(vec![json!({"time":now-86400,"value":"stale"}), json!({"time":now+3600})], now).is_none());
+    }
+
+    fn isolated_test_dir(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let directory = std::env::temp_dir().join(format!("miac-{label}-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        directory
+    }
+
+    #[test]
+    fn failed_reinitialization_clears_the_previous_device_and_link() {
+        let directory = isolated_test_dir("controller-reinit-empty");
+        let mut controller = Controller::new(Credentials::isolated(&directory), crate::Transport::Local);
+        controller.device = Some(DeviceInfo { did: "1".into(), ..Default::default() });
+        controller.profile = crate::profile::Profile::legacy();
+        controller.link = Some(ActiveLink::Local);
+
+        assert!(controller.init_transport().is_err());
+        assert!(controller.link.is_none(), "failed initialization must invalidate the old link");
+        assert!(controller.device().is_none(), "failed initialization must invalidate the old device");
+        assert!(controller.profile.properties.is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reinitialization_connects_to_the_new_device_address() {
+        let directory = isolated_test_dir("controller-reinit-device");
+        let token = "00000000000000000000000000000000";
+        let new_device = DeviceInfo {
+            did: "2".into(), model: Some(miot::EXPECT_MODEL.into()),
+            token: Some(token.into()), localip: Some("127.0.0.2".into()), ..Default::default()
+        };
+        std::fs::write(directory.join(crate::credentials::FILE_DEVICE), serde_json::to_vec(&new_device).unwrap()).unwrap();
+        let mut controller = Controller::new(Credentials::isolated(&directory), crate::Transport::Local);
+        // Constructing a connection only binds a socket; this test sends no packets.
+        controller.local = Some(MiioDevice::connect("127.0.0.1", "1", token).unwrap());
+        controller.link = Some(ActiveLink::Local);
+
+        assert_eq!(controller.init_transport().unwrap(), ActiveLink::Local);
+        assert_eq!(controller.device().unwrap().did, "2");
+        assert_eq!(controller.local.as_ref().unwrap().addr().ip().to_string(), "127.0.0.2");
+        assert!(!controller.local.as_ref().unwrap().is_handshaked());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn property_batch_recovery_propagates_expired_session_without_more_reads() {
+        let params = vec![json!({"siid": 2, "piid": 1}), json!({"siid": 2, "piid": 2})];
+        let mut calls = 0;
+        let result = read_property_batches(&params, |batch| {
+            calls += 1;
+            if batch.len() == 2 { return Err(ControllerError("batch unavailable".into())); }
+            if batch[0]["piid"] == 1 { return Err(cloud::CloudError::SessionExpired.into()); }
+            Ok(json!([{"siid": 2, "piid": 2, "code": 0, "value": 2}]))
+        });
+
+        assert!(result.as_ref().is_err_and(ControllerError::requires_cloud_login));
+        assert_eq!(calls, 2, "stop after the first expired-session response");
+    }
+
+    #[test]
+    fn mixed_supported_property_reads_preserve_request_order_and_duplicates() {
+        let mut profile = crate::profile::Profile::legacy();
+        profile.properties.remove("mode");
+        let results = vec![
+            json!({"siid": 2, "piid": 4, "code": 0, "value": 26.5}),
+            json!({"siid": 2, "piid": 1, "code": 0, "value": true}),
+        ];
+        assert_eq!(property_read_results(&profile, &["mode", "on", "mode", "targetTemp"], &results), vec![
+            ("mode", PropValue::Missing), ("on", PropValue::Ok(json!(true))),
+            ("mode", PropValue::Missing), ("targetTemp", PropValue::Ok(json!(26.5))),
+        ]);
+    }
+
+    #[test]
+    fn snapshots_include_all_visible_control_values_in_bounded_reads() {
+        let profile = crate::profile::Profile::legacy();
+        let controls = [
+            ("windSensation", json!(true)), ("light", json!(true)), ("buzzer", json!(true)),
+            ("verticalPos", json!(4)), ("horizontalPos", json!(5)), ("lightBright", json!(2)),
+            ("coolingEffect", json!(4)), ("heatingEffect", json!(5)),
+        ];
+        let names = snapshot_property_names(&profile);
+        let params: Vec<_> = names.iter().filter_map(|name| profile.properties.get(*name)
+            .filter(|prop| prop.readable)
+            .map(|prop| json!({"siid": prop.siid, "piid": prop.piid}))).collect();
+        let mut sizes = Vec::new();
+        let results = read_property_batches(&params, |batch| {
+            sizes.push(batch.len());
+            Ok(Value::Array(batch.iter().rev().map(|request| {
+                let value = controls.iter().find(|(name, _)| {
+                    let prop = &profile.properties[*name];
+                    request["siid"] == prop.siid && request["piid"] == prop.piid
+                }).map(|(_, value)| value.clone()).unwrap_or(Value::Null);
+                json!({"siid": request["siid"], "piid": request["piid"], "code": 0, "value": value})
+            }).collect()))
+        }).unwrap();
+        let status = property_read_results(&profile, &names, &results);
+        for (name, expected) in controls {
+            assert_eq!(status.iter().find(|(known, _)| *known == name).map(|(_, value)| value),
+                Some(&PropValue::Ok(expected)), "missing snapshot control {name}");
+        }
+        assert!(sizes.iter().all(|size| *size <= 8));
+    }
+
+    #[test]
+    fn snapshots_add_only_supported_readable_control_properties() {
+        let mut profile = crate::profile::Profile::legacy();
+        profile.properties.remove("light");
+        profile.properties.get_mut("buzzer").unwrap().readable = false;
+        profile.properties.get_mut("windSensation").unwrap().writable = false;
+
+        let names = snapshot_property_names(&profile);
+        assert!(!names.contains(&"light"), "unsupported controls must not be requested");
+        assert!(!names.contains(&"buzzer"), "write-only controls must not be requested");
+        assert!(names.contains(&"windSensation"), "read-only control state must still be displayed");
+
+        let profile = crate::profile::Profile::parse("xiaomi.aircondition.ma7",
+            &crate::profile::bundled_specs()["xiaomi.aircondition.ma7"]).unwrap();
+        let names = snapshot_property_names(&profile);
+        for name in ["windSensation", "light", "buzzer", "verticalPos", "horizontalPos", "lightBright", "coolingEffect", "heatingEffect"] {
+            assert_eq!(names.contains(&name), profile.properties.get(name).is_some_and(|prop| prop.readable), "{name}");
+        }
+    }
 
     #[test]
     fn date_conversion_matches_known_dates() {

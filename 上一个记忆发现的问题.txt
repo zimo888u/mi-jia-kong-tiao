@@ -1,0 +1,251 @@
+上一个复核发现的 Bug 和漏洞
+生成日期：2026-10-15
+来源：只读独立安全审计（thread_id: 01a13b0c-8412-7920-828c-2ab770df9431）
+
+只读独立审计完成，本轮没有修复或改动源文件；现有 `git status` 清单保持不变。
+
+以下是按风险排序的高置信度问题。静态审计不能等同于形式化“全部漏洞”证明，第三方 vendored Slint 代码未逐行审计，仅做了依赖漏洞扫描。
+
+## 高风险
+
+### H1. `icacls` 使用 PATH 查找，存在本地程序劫持/执行风险
+
+`D:\空调v2\crates\miac-core\src\credentials.rs:471-486`
+
+```rust
+Command::new("icacls")
+```
+
+每次保存凭据或设置都可能调用它。Windows 对相对可执行文件名会经过应用目录、当前目录、系统目录和 `PATH` 搜索。如果工作目录或 `PATH` 中存在伪造的 `icacls.exe`，可能导致以当前用户权限执行攻击者程序。
+
+### H2. 登录凭据写入不是事务，失败后可能形成跨账号/跨设备混合状态
+
+`D:\空调v2\crates\miac-app\src\login_ui.rs:421-468`
+
+写入顺序是：
+
+1. `cloud-session.json`
+2. `device.json`
+3. `thermometer.json`
+
+单个文件写入虽然有临时文件替换，但三个文件没有整体回滚。例如：
+
+- 云会话写入成功、设备写入失败：新账号会话配旧空调。
+- 空调写入成功、温湿度计写入失败：新空调配旧账号温湿度计。
+- 只写入云会话后中止：会话、设备、传感器属于不同状态。
+
+这会导致错误设备控制、跨账号数据读取或登录状态混乱。
+
+### H3. “一键清理”会扫描并删除当前工作目录中的通用文件名
+
+`D:\空调v2\crates\miac-app\src\data_cleanup.rs:39-67`
+`D:\空调v2\crates\miac-app\src\data_cleanup.rs:123-129`
+
+`CleanupPlan::current()` 把凭据搜索目录也作为清理目录，其中包括：
+
+- 可执行文件目录
+- 当前工作目录
+- 项目目录及其构建目录
+
+随后会删除这些目录中的：
+
+- `settings.json`
+- `credentials.json`
+- `device.json`
+- `cloud-session.json`
+- `thermometer.json`
+- `miot-spec-cache`
+- 临时凭据文件
+- 部分 `.log`
+
+如果程序从用户资料目录、共享目录或包含无关 `settings.json` 的项目目录启动，可能删除不属于本软件的文件。
+
+### H4. 清理会删除通用注册表键 `Software\miac`
+
+`D:\空调v2\crates\miac-app\src\data_cleanup.rs:7-8`
+`D:\空调v2\crates\miac-app\src\data_cleanup.rs:291-298`
+
+```rust
+const REGISTRY_KEYS: [&str; 2] = [r"Software\米家空调", r"Software\miac"];
+```
+
+`Software\miac` 不是足够专有的命名空间。清理时会递归删除该键下的全部值和子键，可能影响其他也使用该键的程序。
+
+### H5. 当前工作目录可被当作凭据来源
+
+`D:\空调v2\crates\miac-core\src\credentials.rs:192-217`
+`D:\空调v2\crates\miac-core\src\credentials.rs:252-333`
+
+`Credentials::new()` 将当前工作目录加入凭据回退目录。若主目录没有凭据，程序可能读取工作目录中的 `device.json`、`cloud-session.json` 或 `thermometer.json`。
+
+这会造成凭据混淆：程序可能使用不属于当前用户的设备、账号或温湿度计。可执行文件目录也存在类似问题。
+
+## 中风险
+
+### M1. `savedAt` 时间戳在非 UTC 时区下错误
+
+`D:\空调v2\crates\miac-core\src\login.rs:585-597`
+
+```rust
+let (y, mo, d) = crate::controller::ymd_from_unix(secs as i64);
+let day = secs % 86400;
+format!("{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}.000Z", ...)
+```
+
+日期使用本地日历，但时分秒使用 UTC 秒数，最后却标记为 `Z`。在 Asia/Taipei 等非 UTC 时区，跨午夜附近会生成错误的 ISO 时间戳。
+
+### M2. 云端返回的 `did`、`localip`、`token` 缺少严格校验
+
+`D:\空调v2\crates\miac-core\src\login.rs:295-312`
+`D:\空调v2\crates\miac-core\src\cloud.rs:391-393`
+`D:\空调v2\crates\miac-core\src\miio.rs:137-150`
+
+设备列表中的字段几乎直接落盘和使用：
+
+- `did` 被直接插入云端路径 `/home/rpc/{did}`，包含 `/`、`?`、`#` 等字符时可能改变请求路径。
+- `localip` 会被解析为任意主机和端口，并向其发送 miIO 报文。
+- `token` 会被用于本地加密通信。
+
+恶意或异常设备数据可能导致请求路径注入、局域网探测、连接到错误主机或协议状态异常。
+
+### M3. 登录 URL 白名单和 Cookie 域范围过宽
+
+`D:\空调v2\crates\miac-core\src\login.rs:63-117`
+`D:\空调v2\crates\miac-core\src\login.rs:150-223`
+
+允许任意：
+
+- `*.xiaomi.com`
+- `*.mi.com`
+- 非标准端口
+
+Cookie 解析允许 `Domain=xiaomi.com` / `Domain=mi.com`，随后会向所有匹配子域发送。若某个官方子域存在内容注入、劫持或不受信任服务，登录 Cookie/`serviceToken` 可能被发送到该子域。
+
+### M4. 成功响应体没有大小上限
+
+`D:\空调v2\crates\miac-core\src\cloud.rs:352-355`
+`D:\空调v2\crates\miac-core\src\login.rs:394-397`
+
+成功响应使用 `into_string()` 直接读入内存。异常服务端、代理或中间设备返回超大响应时，可能造成内存耗尽。错误响应有 `65536` 字节限制，但成功响应没有。
+
+### M5. CLI 登录二维码使用固定文件名，会覆盖并删除当前目录文件
+
+`D:\空调v2\crates\miac-cli\src\main.rs:190-225`
+`D:\空调v2\crates\miac-cli\src\main.rs:305`
+
+固定写入：
+
+```text
+login-qr.png
+login-qr.jpg
+```
+
+会覆盖当前目录中同名文件；登录失败或成功后还会删除该路径。如果用户原本就有同名文件，会发生数据丢失。
+
+### M6. CLI 登录没有清除旧温湿度计
+
+`D:\空调v2\crates\miac-cli\src\main.rs:289-303`
+
+没有找到温湿度计时只打印“保留原有配置”，不会写入空标记。切换账号后可能继续使用上一个账号的温湿度计。
+
+### M7. Skill 写操作在读回失败或未验证时仍返回 `ok: true`
+
+`D:\空调v2\skills\miac-control\src\main.rs:165-180`
+
+`write_result` 固定返回：
+
+```json
+"ok": true
+```
+
+即使：
+
+- `verified=false`
+- `observed=null`
+- `readback_error` 非空
+
+调用方如果只检查 `ok`，会把“已下发但未确认”误判为“已成功生效”。
+
+### M8. 多个界面控制回调没有检查连接状态
+
+`D:\空调v2\crates\miac-app\src\main.rs:1277-1324`
+`D:\空调v2\crates\miac-app\src\main.rs:1387-1455`
+
+模式、风速、风感、定格位置、亮度、开关和效果等回调会在 `connected == false` 或设备切换期间继续发送控制命令。工作线程可能因此重新建立连接并执行用户未明确确认的写操作。
+
+### M9. 局域网握手响应没有完整性校验
+
+`D:\空调v2\crates\miac-core\src\miio.rs:346-387`
+
+握手响应只要是来自目标地址的 32 字节包，就会接受其中的设备 ID 和时间戳；该头没有 token 校验或 checksum 验证。局域网攻击者若能伪造 UDP 源地址，可能导致连接状态被污染或持续不可用。
+
+### M10. 代理配置可能把凭据写入错误日志
+
+`D:\空调v2\crates\miac-core\src\cloud.rs:199-203`
+
+```rust
+eprintln!("[云端] 代理 {p} 无效：{e}");
+```
+
+`MIAC_PROXY` 可能是：
+
+```text
+http://username:password@proxy:8080
+```
+
+错误日志可能泄露代理用户名和密码。
+
+### M11. 清理目录存在 TOCTOU/联接竞态
+
+`D:\空调v2\crates\miac-app\src\data_cleanup.rs:153-197`
+
+根目录先做 canonicalize 校验，随后再递归删除。校验和删除之间若目录被替换成联接/符号链接，递归删除可能进入非预期目录。已有测试覆盖静态联接，但没有覆盖竞态替换。
+
+### M12. 外部 HTTP、凭据和缓存文件读取缺少统一大小限制
+
+`D:\空调v2\crates\miac-core\src\credentials.rs:319-332`
+`D:\空调v2\crates\miac-core\src\profile.rs:251-253`
+
+凭据、设置和 MIoT 规格缓存通过 `fs::read` 全量读取。超大文件或指向超大文件的链接可能造成启动内存耗尽。
+
+## 低风险/待确认
+
+- `D:\空调v2\crates\miac-core\src\miio.rs:202`：`total_len` 直接截断为 `u16`，超大字符串属性可能生成长度溢出的 UDP 包。
+- `D:\空调v2\crates\miac-cli\src\main.rs:105-126`：CLI 状态页使用静态 `miot::prop_addr()`，非原机型会显示错误的 `siid.piid`。
+- `D:\空调v2\crates\miac-core\src\cloud.rs:277-288`：`userId`、`serviceToken` 未做 Cookie 值转义，异常凭据内容可能导致请求头异常或 Cookie 注入。
+- `D:\空调v2\crates\miac-app\src\autostart.rs:85-88`：`enabled()` 只检查 Run 值非空，不确认值确实指向本程序，可能误报自启动状态。
+- `D:\空调v2\crates\miac-core\src\cloud.rs:327-350`：`ureq` 默认跟随重定向；301/302 可能把 POST 改成 GET，307/308 对带 body 的请求也不保证正确重放，云端接口遇到重定向时可能出现协议行为错误。
+- `D:\空调v2\crates\miac-app\src\tray.rs:102-103`：`MAIN_HWND` 使用 `static mut`，当前调用看起来主要在 UI 线程，但没有编译期或运行期线程约束。
+
+## 依赖漏洞扫描
+
+我对锁定依赖执行了 OSV 批量查询，共查询 575 个包。
+
+当前构建图中发现：
+
+1. `rustls 0.23.45`
+   - [RUSTSEC-2026-0346](https://osv.dev/vulnerability/RUSTSEC-2026-0346)
+   - [RUSTSEC-2026-0347](https://osv.dev/vulnerability/RUSTSEC-2026-0347)
+   - [RUSTSEC-2026-0348](https://osv.dev/vulnerability/RUSTSEC-2026-0348)
+   - [RUSTSEC-2026-0349](https://osv.dev/vulnerability/RUSTSEC-2026-0349)
+
+其中：
+
+- `0346` 需要自定义 session store 被 `Debug` 输出；当前代码未见该路径。
+- `0347` 需要启用 ECH；当前配置未启用。
+- `0348` 需要 `brotli` feature；当前 feature 未启用。
+- `0349` 与默认 TLS session resumption 有关，当前 `ClientConfig::builder()` 使用 rustls 默认内存 session store，属于需要重点关注的实际暴露面。
+
+2. `ttf-parser 0.25.1`
+   - [RUSTSEC-2026-0192](https://osv.dev/vulnerability/RUSTSEC-2026-0192)
+   - 通过 winit/ab_glyph 进入构建图，已停止维护，属于供应链维护风险。
+
+3. `bincode 2.0.1`
+   - [RUSTSEC-2025-0141](https://osv.dev/vulnerability/RUSTSEC-2025-0141)
+   - 该 advisory 出现在 Cargo 元数据/锁文件中，但当前 `cargo tree` 未发现它进入实际构建图，暂不视为当前运行时暴露。
+
+## 验证边界
+
+- `cargo test --workspace --offline`：124 项通过。
+- `cargo clippy`、`cargo audit` 未安装，因此没有执行 Clippy/RustSec 官方扫描。
+- 本轮没有修改任何源文件、配置文件或依赖。

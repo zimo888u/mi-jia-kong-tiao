@@ -54,6 +54,8 @@ component CalCell inherits Rectangle {
     border-radius: 8px;
     background: day <= 0 ? transparent : energy-milli <= 0 ? Theme.bg-soft
         : Theme.dark ? Theme.accent.with-alpha(self.alpha)
+        : Theme.macos ? (self.t > 0.66 ? #2072cc : self.t > 0.33 ? #9dc4f4 : #e1edfc)
+        : Theme.senren ? (self.t > 0.66 ? #6f527b : self.t > 0.33 ? #c7b0d3 : #eee4f2)
         : self.t > 0.66 ? #65815a : self.t > 0.33 ? #a2b68d : #dce6d0;
     border-width: is-today ? 2px : 0px;
     border-color: is-today ? Theme.accent : Theme.line-soft;

@@ -7,7 +7,7 @@
 //   0 idle     还没开始（显示「开始扫码登录」按钮）
 //   1 loading  正在向小米申请二维码
 //   2 qr       二维码已就绪，等手机确认（显示二维码图片与倒计时）
-//   3 devices  已确认，列出账号下的设备让用户选
+//   3 devices  已确认，仅列出空调和温湿度计，让用户选择空调
 //   4 error    出错了，显示原因并可重试
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -19,6 +19,7 @@ export struct LoginDevice {
     model: string,
     did: string,
     detail: string,
+    selectable: bool,
 }
 
 export component LoginModal inherits Rectangle {
@@ -37,6 +38,24 @@ export component LoginModal inherits Rectangle {
     callback confirm();
 
     background: Theme.overlay;
+    forward-focus: modal-focus;
+    init => { modal-focus.focus(); }
+
+    // Keep the modal in charge of keyboard focus, including Tab navigation.
+    // Enter must never reach a previously focused property editor behind it.
+    modal-focus := FocusScope {
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.cancel(); }
+            accept
+        }
+        key-released(event) => { accept }
+    }
+    // The backdrop consumes both clicks and wheel events. Device-list scrolling
+    // still works because its Flickable is above this area in the input tree.
+    TouchArea {
+        clicked => { modal-focus.focus(); }
+        scroll-event(event) => { accept }
+    }
 
     // 居中卡片
     Rectangle {
@@ -45,7 +64,7 @@ export component LoginModal inherits Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         border-radius: Theme.radius;
-        background: Theme.panel;
+        background: Theme.dialog-panel;
         border-width: 1px;
         border-color: Theme.line;
 
@@ -104,18 +123,22 @@ export component LoginModal inherits Rectangle {
             if root.state == 2 : VerticalLayout {
                 spacing: 10px;
                 Rectangle {
-                    // 二维码是深色图案，底色必须给白色，否则深色主题下扫不出来
-                    background: #ffffff;
-                    border-radius: 12px;
-                    width: 260px;
                     height: 260px;
-                    Image {
-                        source: root.qr;
-                        width: parent.width - 20px;
-                        height: parent.height - 20px;
-                        x: 10px;
-                        y: 10px;
-                        image-fit: contain;
+                    Rectangle {
+                        // 在整行中居中二维码，深色主题也保留白色扫描背景。
+                        background: #ffffff;
+                        border-radius: 12px;
+                        width: 260px;
+                        height: 260px;
+                        x: (parent.width - self.width) / 2;
+                        Image {
+                            source: root.qr;
+                            width: parent.width - 20px;
+                            height: parent.height - 20px;
+                            x: 10px;
+                            y: 10px;
+                            image-fit: contain;
+                        }
                     }
                 }
                 Text {
@@ -143,32 +166,45 @@ export component LoginModal inherits Rectangle {
                     color: Theme.text-dim;
                     font-size: Theme.font-sm;
                 }
-                for i in 8 : Rectangle {
-                    visible: i < root.devices.length;
-                    height: 44px;
-                    border-radius: Theme.radius-sm;
-                    background: root.selected == i ? Theme.nav-active : Theme.bg-soft;
-                    border-width: 1px;
-                    border-color: root.selected == i ? Theme.accent : Theme.line-soft;
-                    HorizontalLayout {
-                        padding-left: 12px;
-                        padding-right: 12px;
+                device-list := Flickable {
+                    height: min(root.devices.length * 52px - 8px, min(352px, root.height - 320px));
+                    content-width: self.width;
+                    content-height: device-rows.preferred-height;
+                    interactive: true;
+                    device-rows := VerticalLayout {
+                        width: device-list.width;
                         spacing: 8px;
-                        Text {
-                            text: i < root.devices.length ? root.devices[i].name : "";
-                            color: Theme.text;
-                            font-size: Theme.font-md;
-                            vertical-alignment: center;
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text {
-                            text: i < root.devices.length ? root.devices[i].detail : "";
-                            color: Theme.text-mute;
-                            font-size: Theme.font-xs;
-                            vertical-alignment: center;
+                        for device[i] in root.devices : Rectangle {
+                            height: 44px;
+                            border-radius: Theme.radius-sm;
+                            background: root.selected == i ? Theme.nav-active : Theme.bg-soft;
+                            border-width: 1px;
+                            border-color: root.selected == i ? Theme.accent : Theme.line-soft;
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 8px;
+                                Text {
+                                    text: device.name;
+                                    color: Theme.text;
+                                    font-size: Theme.font-md;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                                Text {
+                                    text: device.detail;
+                                    color: Theme.text-mute;
+                                    font-size: Theme.font-xs;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            TouchArea {
+                                enabled: device.selectable;
+                                mouse-cursor: device.selectable ? pointer : default;
+                                clicked => { root.pick(i); }
+                            }
                         }
                     }
-                    TouchArea { mouse-cursor: pointer; clicked => { root.pick(i); } }
                 }
             }
 
@@ -197,7 +233,7 @@ export component LoginModal inherits Rectangle {
             HorizontalLayout {
                 spacing: 10px;
                 Rectangle { horizontal-stretch: 1; }
-                if root.state != 3 : Rectangle {
+                Rectangle {
                     width: 96px;
                     height: 34px;
                     border-radius: Theme.radius-sm;
@@ -205,7 +241,7 @@ export component LoginModal inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.line;
                     Text {
-                        text: "稍后再说";
+                        text: root.state == 3 ? "取消登录" : "稍后再说";
                         color: Theme.text-dim;
                         font-size: Theme.font-sm;
                         horizontal-alignment: center;
@@ -230,10 +266,13 @@ export component LoginModal inherits Rectangle {
                     retry-touch := TouchArea { mouse-cursor: pointer; clicked => { root.retry(); } }
                 }
                 if root.state == 3 : Rectangle {
+                    in property <bool> can-confirm: root.selected >= 0
+                        && root.selected < root.devices.length && root.devices[root.selected].selectable;
                     width: 110px;
                     height: 34px;
                     border-radius: Theme.radius-sm;
-                    background: confirm-touch.has-hover ? Theme.accent-deep : Theme.accent;
+                    background: !self.can-confirm ? Theme.text-mute
+                        : confirm-touch.has-hover ? Theme.accent-deep : Theme.accent;
                     Text {
                         text: "用这个设备";
                         color: Theme.on-accent;
@@ -242,7 +281,11 @@ export component LoginModal inherits Rectangle {
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
-                    confirm-touch := TouchArea { mouse-cursor: pointer; clicked => { root.confirm(); } }
+                    confirm-touch := TouchArea {
+                        enabled: parent.can-confirm;
+                        mouse-cursor: parent.can-confirm ? pointer : default;
+                        clicked => { root.confirm(); }
+                    }
                 }
             }
         }

@@ -279,8 +279,11 @@ pub fn fault_info(value: Option<i64>) -> FaultInfo {
     if value == 0 {
         return FaultInfo { clear: true, text: "无故障".into(), badge: None };
     }
+    if value == i64::MIN {
+        return FaultInfo { clear: false, text: "故障读数超出有效范围".into(), badge: None };
+    }
     let code = FAULT_NAME.iter()
-        .find(|(k, _)| *k == value.abs())
+        .find(|(k, _)| k.unsigned_abs() == value.unsigned_abs())
         .map(|(_, v)| *v)
         .unwrap_or("未知代码");
     if value < 0 {

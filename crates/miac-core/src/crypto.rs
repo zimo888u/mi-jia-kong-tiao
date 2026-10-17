@@ -74,6 +74,9 @@ pub fn cloud_signature(ssecurity: &[u8], nonce: &[u8]) -> String {
 ///
 /// KSA + PRGA，标准实现。
 pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    // RC4 has no definition for an empty key. Return no plaintext rather than
+    // indexing out of bounds or pretending the input was decrypted.
+    if key.is_empty() { return Vec::new(); }
     let mut s: [u8; 256] = [0; 256];
     for (i, v) in s.iter_mut().enumerate() {
         *v = i as u8;

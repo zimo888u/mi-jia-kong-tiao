@@ -1,36 +1,42 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// main.slint —— 主窗口：侧边栏 + 顶栏 + 五个页面
+// main.slint —— 主窗口：侧边栏 + 顶栏 + 六个页面
 //
 // 对应 Electron 版 app/renderer/index.html 的结构：
 //   .sidebar（品牌 / 导航 / 主题切换 / 通道指示）
 //   .main（.topbar 标题+自动刷新+刷新 / .scroll 各页面）
 //
-// 内存注意：五个页面用 if 按需实例化，同一时刻只构造一个页面的元素树，
+// 内存注意：六个页面用 if 按需实例化，同一时刻只构造一个页面的元素树，
 // 而不是五个都在内存里（旧版是 DOM 全量常驻）。第 1 阶段结束后用
 // 任务管理器核对 5 分钟驻留内存是否 < 45 MB。
 // ─────────────────────────────────────────────────────────────────────────────
 
+export { Theme } from "theme.slint";
 import { Theme } from "theme.slint";
+import { NavIcon } from "common.slint";
+import { CharacterIcon, SenrenBackdrop } from "senren.slint";
 import { ControlPage, ControlChoice } from "pages/control.slint";
 import { PowerPage } from "pages/power.slint";
 import { DiagPage } from "pages/diag.slint";
 import { DebugPage } from "pages/debug.slint";
 import { SettingsPage } from "pages/settings.slint";
+import { AppearancePage } from "pages/appearance.slint";
 import { ToastHost, ToastItem } from "toast.slint";
 import { LoginModal, LoginDevice } from "login.slint";
 import { CloseDialog } from "close-dialog.slint";
+import { CleanupDialog } from "cleanup-dialog.slint";
 
 // ── 导航项 ──────────────────────────────────────────────────────
 component NavItem inherits Rectangle {
     in property <string> label;
+    in property <int> icon-kind: 0;
     in property <bool> active: false;
     callback clicked;
 
-    height: 46px;
+    height: Theme.senren ? 40px : Theme.macos ? 38px : 46px;
     border-radius: Theme.radius-sm;
     background: active ? Theme.nav-active : (touch.has-hover ? Theme.panel : transparent);
 
-    if root.active : Rectangle {
+    if root.active && !Theme.compact : Rectangle {
         x: 0px;
         y: 12px;
         width: 3px;
@@ -39,10 +45,19 @@ component NavItem inherits Rectangle {
         background: Theme.accent;
     }
 
+    if Theme.macos : NavIcon {
+        x: 12px; y: (parent.height - self.height) / 2;
+        kind: root.icon-kind;
+        icon-color: root.active ? Theme.on-accent : Theme.accent;
+    }
+    if Theme.senren : CharacterIcon {
+        x: 10px; y: (parent.height - self.height) / 2;
+        kind: root.icon-kind;
+    }
     Text {
-        x: 20px; width: parent.width - 40px; height: parent.height;
+        x: Theme.senren ? 54px : Theme.macos ? 42px : 20px; width: parent.width - self.x - 12px; height: parent.height;
         text: root.label;
-        color: root.active ? Theme.nav-text : Theme.text-dim;
+        color: root.active ? Theme.nav-text : (Theme.compact ? Theme.text : Theme.text-dim);
         font-size: Theme.font-md;
         font-weight: root.active ? 600 : 400;
         vertical-alignment: center;
@@ -63,11 +78,13 @@ export component MainWindow inherits Window {
     min-width: 1160px;
     min-height: 720px;
     background: Theme.bg;
-    callback native-minimized(bool);
-    changed minimized => { root.native-minimized(root.minimized); }
+    default-font-family: Theme.senren ? "Microsoft YaHei UI" : Theme.macos ? "Segoe UI" : "";
 
     // ── 界面 ↔ 后台的契约（第 2 阶段由真实控制核心填充，现在喂假数据）──
-    in property <int> view: 0;                       // 0 控制台 1 电量 2 诊断 3 属性 4 设置
+    in property <int> view: 0;                       // 0 控制台 1 电量 2 诊断 3 属性 4 设置 5 主题
+    in property <bool> auto-start: false;
+    in property <bool> auto-start-pending: false;
+    callback set-auto-start(bool);
     in property <string> device-name: "米家空调";
     in property <string> transport-text: "局域网直连";
     in property <int> transport-state: 1;            // 0 未连接 1 正常 2 警告 3 错误
@@ -128,12 +145,11 @@ export component MainWindow inherits Window {
     callback confirm-close(bool, bool);
     callback set-close-behavior(int);
     callback exit-app();
-    in property <bool> dark-theme: false;
-    // theme.slint 的 Theme 是纯 global（没有 Window 上下文），
-    // Rust 侧拿不到 Theme::get(&ui)，所以在这里把两者绑起来：
-    // Rust 只设 dark-theme，所有颜色由 theme.slint 自己选。
-    init => { Theme.dark = root.dark-theme; }
-    changed dark-theme => { Theme.dark = root.dark-theme; }
+    in property <int> theme-index: 0;
+    // Theme is shared by every page and modal; Rust only sets this index.
+    init => { Theme.selected = root.theme-index; Theme.page-icon = root.view; }
+    changed theme-index => { Theme.selected = root.theme-index; }
+    changed view => { Theme.page-icon = root.view; }
     // 属性选择器可选的属性名（由 Rust 侧从 miot 属性表灌入）
     in property <[string]> prop-name-list: [];
 
@@ -158,6 +174,8 @@ export component MainWindow inherits Window {
     in property <string> last-error: "";
     callback dismiss-toast(int);
     callback encrypt-credentials();
+    in-out property <bool> cleanup-dialog-open: false;
+    callback confirm-cleanup();
 
     // ── 扫码登录（第 3 阶段）──────────────────────────────────
     /// 0 未开始 / 1 申请中 / 2 二维码就绪 / 3 选设备 / 4 出错
@@ -185,9 +203,11 @@ export component MainWindow inherits Window {
     in property <string> raw-out: "—";
     in property <int> selected-prop: 0;
     in property <[string]> all-props: [];
+    in property <string> fault-addr: "—";
     in property <string> fault-badge: "—";
     in property <string> fault-text: "读取中…";
     in property <bool> fault-clear: true;
+    in property <bool> fault-known: false;
     in property <[string]> diag-labels: [];
     in property <[string]> diag-values: [];
     in property <[string]> diag-units: [];
@@ -214,7 +234,7 @@ export component MainWindow inherits Window {
     callback toggle-power();
     callback toggle-auto-refresh(bool);
     callback refresh();
-    callback toggle-theme();
+    callback set-theme(int);
     callback set-mode(int);
     callback set-fan(int);
     callback set-wind(int);
@@ -231,6 +251,8 @@ export component MainWindow inherits Window {
     callback select-prop(int);
     callback export-log();
     callback clear-log();
+
+    if Theme.senren : SenrenBackdrop { width: root.width; height: root.height; }
 
     // ── 侧边栏 ──────────────────────────────────────────────
     // 必须显式给 height：Window 的子元素默认按布局分配高度，只写 width 时
@@ -249,24 +271,32 @@ export component MainWindow inherits Window {
         VerticalLayout {
             width: parent.width;
             height: parent.height;
-            padding: 24px;
-            spacing: 32px;
+            padding: Theme.compact ? 16px : 24px;
+            spacing: Theme.senren ? 20px : Theme.macos ? 24px : 32px;
 
             VerticalLayout {
-                height: 64px;
+                height: Theme.compact ? 56px : 64px;
                 spacing: 8px;
-                Text { text: "mi  /  米家空调"; color: Theme.text; font-size: 21px; font-weight: 700; }
-                Text { text: "让舒适，刚刚好。"; color: Theme.text-mute; font-size: Theme.font-sm; }
+                if !Theme.compact : Text { text: "mi  /  米家空调"; color: Theme.text; font-size: 21px; font-weight: 700; }
+                if Theme.compact : HorizontalLayout {
+                    height: 26px; spacing: 10px;
+                    if Theme.macos : NavIcon { kind: 0; }
+                    if Theme.senren : CharacterIcon { kind: 0; width: 28px; height: 28px; }
+                    Text { text: "米家空调"; color: Theme.text; font-size: 18px; font-weight: 600; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+                Text { text: Theme.senren ? "Ciallo～(∠・ω< )⌒★" : Theme.macos ? "设备与室内环境" : "让舒适，刚刚好。"; color: Theme.text-mute; font-size: Theme.font-sm; }
             }
 
             // 导航
             VerticalLayout {
                 spacing: 4px;
-                NavItem { label: "空调控制";    active: root.view == 0; clicked => { root.nav-to(0); } }
-                NavItem { label: "电量统计";  active: root.view == 1; clicked => { root.nav-to(1); } }
-                NavItem { label: "运行诊断";  active: root.view == 2; clicked => { root.nav-to(2); } }
-                NavItem { label: "高级属性"; active: root.view == 3; clicked => { root.nav-to(3); } }
-                NavItem { label: "软件设置";      active: root.view == 4; clicked => { root.nav-to(4); } }
+                NavItem { label: "空调控制"; icon-kind: 0; active: root.view == 0; clicked => { root.nav-to(0); } }
+                NavItem { label: "电量统计"; icon-kind: 1; active: root.view == 1; clicked => { root.nav-to(1); } }
+                NavItem { label: "运行诊断"; icon-kind: 2; active: root.view == 2; clicked => { root.nav-to(2); } }
+                NavItem { label: "高级属性"; icon-kind: 3; active: root.view == 3; clicked => { root.nav-to(3); } }
+                NavItem { label: "软件主题"; icon-kind: 5; active: root.view == 5; clicked => { root.nav-to(5); } }
+                NavItem { label: "软件设置"; icon-kind: 4; active: root.view == 4; clicked => { root.nav-to(4); } }
             }
 
             // 弹性空白，把页脚推到底部
@@ -317,24 +347,26 @@ export component MainWindow inherits Window {
             // 顶栏
             Rectangle {
                 height: Theme.topbar-h;
-                background: transparent;
-
+                background: Theme.macos ? Theme.panel : transparent;
+                if Theme.macos : Rectangle { y: parent.height - 1px; width: parent.width; height: 1px; background: Theme.line-soft; }
 
                 HorizontalLayout {
                 padding-left: Theme.pad;
                 padding-right: Theme.pad;
-                padding-top: 32px;
-                padding-bottom: 32px;
+                padding-top: Theme.senren ? 24px : Theme.macos ? 20px : 32px;
+                padding-bottom: Theme.senren ? 24px : Theme.macos ? 20px : 32px;
                 spacing: 12px;
                     VerticalLayout {
                         alignment: center;
                         spacing: 8px;
                         Text {
-                            text: root.view == 0 ? "舒适，从这一刻开始"
+                            text: Theme.compact ? (root.view == 0 ? "空调控制" : root.view == 1 ? "电量统计" : root.view == 2 ? "运行诊断" : root.view == 3 ? "高级属性" : root.view == 5 ? "软件主题" : "软件设置")
+                                : root.view == 0 ? "舒适，从这一刻开始"
                                 : root.view == 1 ? "每一度，都看得见"
                                 : root.view == 2 ? "设备状态，一目了然"
-                                : root.view == 3 ? "更多控制，尽在掌握" : "让设备，更懂你的习惯";
-                            color: Theme.text; font-size: 28px; font-weight: 700;
+                                : root.view == 3 ? "更多控制，尽在掌握"
+                                : root.view == 5 ? "软件主题" : "让设备，更懂你的习惯";
+                            color: Theme.text; font-size: Theme.compact ? 22px : 28px; font-weight: Theme.compact ? 600 : 700;
                         }
                         Text { text: "米家空调  /  " + root.device-name; color: Theme.text-mute; font-size: Theme.font-sm; }
                     }
@@ -516,9 +548,11 @@ export component MainWindow inherits Window {
                             clean-text: root.clean-text;
                             examine-text: root.examine-text;
                             run-text: root.run-text;
+                            fault-addr: root.fault-addr;
                             fault-badge: root.fault-badge;
                             fault-text: root.fault-text;
                             fault-clear: root.fault-clear;
+                            fault-known: root.fault-known;
                         }
                         if root.view == 3 : DebugPage {
                             extended-controls: root.extended-controls;
@@ -544,9 +578,10 @@ export component MainWindow inherits Window {
                             set-effect(w, l) => { root.set-effect(w, l); }
                         }
                         if root.view == 4 : SettingsPage {
-                            dark-theme: root.dark-theme;
+                            auto-start: root.auto-start;
+                            auto-start-pending: root.auto-start-pending;
                             close-behavior: root.close-behavior;
-                            toggle-theme() => { root.toggle-theme(); }
+                            set-auto-start(v) => { root.set-auto-start(v); }
                             set-close-behavior(v) => { root.set-close-behavior(v); }
                             transport-mode: root.transport-mode;
                             device-info-text: root.device-info-text;
@@ -563,6 +598,11 @@ export component MainWindow inherits Window {
                             export-log() => { root.export-log(); }
                             clear-log() => { root.clear-log(); }
                             encrypt-credentials() => { root.encrypt-credentials(); }
+                            delete-credentials() => { root.cleanup-dialog-open = true; }
+                        }
+                        if root.view == 5 : AppearancePage {
+                            theme-index: root.theme-index;
+                            set-theme(v) => { root.set-theme(v); }
                         }
                     }
                 }
@@ -572,7 +612,7 @@ export component MainWindow inherits Window {
         // ── 未连接遮罩 ────────────────────────────────────
         // 没有凭据（首次使用 / 换账号）时压在内容区上方，提示去登录。
         // 遮罩必须脱离主 VerticalLayout，否则会被排到页面最下面。
-        if !root.connected && root.not-ready-reason != "" && root.view != 4 : Rectangle {
+        if !root.connected && root.not-ready-reason != "" && root.view != 4 && root.view != 5 : Rectangle {
             y: Theme.topbar-h;
             width: parent.width;
             height: parent.height - Theme.topbar-h;
@@ -583,7 +623,7 @@ export component MainWindow inherits Window {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 border-radius: Theme.radius;
-                background: Theme.panel;
+                background: Theme.dialog-panel;
                 border-width: 1px;
                 border-color: Theme.line;
 
@@ -611,22 +651,25 @@ export component MainWindow inherits Window {
                         font-size: Theme.font-xs;
                         horizontal-alignment: center;
                         wrap: word-wrap;
-                        width: min(320px, parent.width);
                     }
-                    Rectangle {
+                    HorizontalLayout {
                         height: 38px;
-                        width: 180px;
-                        border-radius: Theme.radius-sm;
-                        background: login-btn.has-hover ? Theme.accent-deep : Theme.accent;
-                        Text {
-                            text: "扫码登录米家账号";
-                            color: Theme.on-accent;
-                            font-size: Theme.font-sm;
-                            font-weight: 600;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        alignment: center;
+                        Rectangle {
+                            height: 38px;
+                            width: 180px;
+                            border-radius: Theme.radius-sm;
+                            background: login-btn.has-hover ? Theme.accent-deep : Theme.accent;
+                            Text {
+                                text: "扫码登录米家账号";
+                                color: Theme.on-accent;
+                                font-size: Theme.font-sm;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            login-btn := TouchArea { mouse-cursor: pointer; clicked => { root.login-start(); } }
                         }
-                        login-btn := TouchArea { mouse-cursor: pointer; clicked => { root.login-start(); } }
                     }
                 }
             }
@@ -636,6 +679,8 @@ export component MainWindow inherits Window {
     // ── 扫码登录弹层 ────────────────────────────────────────────
     // 放在最外层、右下角提示之前：它要盖住整窗，但提示条仍需可见。
     if root.login-open : LoginModal {
+        width: parent.width;
+        height: parent.height;
         state: root.login-state;
         qr: root.login-qr;
         status: root.login-status;
@@ -675,5 +720,11 @@ export component MainWindow inherits Window {
         height: parent.height;
         confirm(to-tray, remember) => { root.confirm-close(to-tray, remember); }
         cancel() => { root.close-dialog-open = false; }
+    }
+    if root.cleanup-dialog-open : CleanupDialog {
+        width: parent.width;
+        height: parent.height;
+        confirm() => { root.confirm-cleanup(); }
+        cancel() => { root.cleanup-dialog-open = false; }
     }
 }

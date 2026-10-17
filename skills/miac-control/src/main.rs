@@ -168,9 +168,14 @@ fn write_result(ctrl: &mut Controller, property: &'static str, requested: Value,
         Ok(value) => (value, None),
         Err(error) => (None, Some(error)),
     };
+    write_confirmation(device(ctrl), property, requested, expected, observed, readback_error)
+}
+
+fn write_confirmation(device: Value, property: &str, requested: Value, expected: Value,
+    observed: Option<Value>, readback_error: Option<String>) -> Value {
     json!({
-        "ok": true,
-        "device": device(ctrl),
+        "ok": observed.as_ref() == Some(&expected),
+        "device": device,
         "property": property,
         "requested": requested,
         "acknowledged": true,
@@ -267,7 +272,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = parse(&args).and_then(|(action, transport)| run(action, transport));
     match result {
-        Ok(value) => println!("{value}"),
+        Ok(value) => {
+            println!("{value}");
+            if value.get("ok").and_then(Value::as_bool) != Some(true) { std::process::exit(2); }
+        },
         Err(error) => {
             println!("{}", json!({"ok":false,"error":error}));
             std::process::exit(1);
@@ -278,6 +286,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_acknowledgement_without_matching_readback_is_not_success() {
+        for (observed, error) in [(None, Some("read failed".into())), (None, None), (Some(json!(false)), None)] {
+            let value = write_confirmation(Value::Null, "on", json!(true), json!(true), observed, error);
+            assert_eq!(value["ok"], false);
+            assert_eq!(value["verified"], false);
+            assert_eq!(value["acknowledged"], true);
+        }
+        assert_eq!(write_confirmation(Value::Null, "on", json!(true), json!(true), Some(json!(true)), None)["ok"], true);
+    }
 
     fn command(input: &[&str]) -> Result<Action, String> {
         parse(&input.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()).map(|(action, _)| action)

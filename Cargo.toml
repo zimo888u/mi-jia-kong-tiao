@@ -28,6 +28,11 @@ license = "MIT"
 # 工作集里会多出 GL/D3D 驱动与交换链内存。这里只按需挑后端（见 miac-app）。
 slint = { version = "1.13", default-features = false }
 
+# Backport Slint's Windows OS-invalidated-region fix while keeping the rest of
+# the locked 1.18.0 stack. See vendor/i-slint-backend-winit/MIAC-PATCH.md.
+[patch.crates-io]
+i-slint-backend-winit = { path = "vendor/i-slint-backend-winit" }
+
 [profile.release]
 opt-level = "z"        # 体积优先，降低常驻代码页
 lto = true             # 跨 crate 内联 + 剔除死代码

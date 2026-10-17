@@ -36,7 +36,7 @@
 //! 本项目不引入 tokio。
 
 use std::io;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -48,6 +48,24 @@ pub const PORT: u16 = 54321;
 
 /// 默认超时（实测一次往返约 0.2–0.4 秒，给足余量）。
 pub const TIMEOUT: Duration = Duration::from_millis(3000);
+
+/// Credentials may only address a literal LAN IPv4 address at the miIO port.
+/// Never resolve names or accept arbitrary Internet endpoints from cloud data.
+pub fn local_address(host: &str) -> Result<SocketAddr, MiioError> {
+    let addr = if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        SocketAddr::from((ip, PORT))
+    } else {
+        host.parse::<SocketAddr>().map_err(|_| MiioError::Protocol("设备地址必须是局域网 IPv4".into()))?
+    };
+    let SocketAddr::V4(v4) = addr else { return Err(MiioError::Protocol("设备地址必须是局域网 IPv4".into())); };
+    let ip = v4.ip();
+    let test_endpoint = cfg!(test) && ip.is_loopback();
+    if !test_endpoint && (!(ip.is_private() || ip.is_link_local()) || addr.port() != PORT
+        || ip.octets()[3] == 255) {
+        return Err(MiioError::Protocol("设备地址必须是局域网单播 IPv4，端口为 54321".into()));
+    }
+    Ok(addr)
+}
 
 /// 握手前使用的哨兵值（设备 ID 与时间戳都用它）。
 const SENTINEL: u32 = 0xffff_ffff;
@@ -117,6 +135,8 @@ pub struct MiioDevice {
     /// 初始值取自 `device.json` 的 `did`，握手后会被设备回传的真实 ID 覆盖
     /// （两者通常一致，但以设备回传的为准）。
     device_id: u32,
+    expected_device_id: Option<u32>,
+    authenticated: bool,
     /// 是否已握手
     handshaked: bool,
     /// 设备回传的时间戳基准
@@ -129,6 +149,10 @@ pub struct MiioDevice {
     pub packets: u64,
 }
 
+impl Drop for MiioDevice {
+    fn drop(&mut self) { use zeroize::Zeroize; self.token.zeroize(); }
+}
+
 impl MiioDevice {
     /// 用 `ip`、`did`、32 位 hex `token` 建立连接对象。
     ///
@@ -137,17 +161,8 @@ impl MiioDevice {
     pub fn connect(host: &str, did: &str, token_hex: &str) -> Result<Self, MiioError> {
         let token = parse_token(token_hex)?;
 
-        // 允许 device.json 里存 "192.168.1.5" 或 "192.168.1.5:54321"
-        let target = if host.contains(':') {
-            host.to_string()
-        } else {
-            format!("{host}:{PORT}")
-        };
-
-        let addr = target
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| MiioError::Protocol(format!("无法解析设备地址 {target}")))?;
+        if !crate::credentials::valid_did(did) { return Err(MiioError::Protocol("设备标识无效".into())); }
+        let addr = local_address(host)?;
 
         let socket = UdpSocket::bind(("0.0.0.0", 0))?;
         socket.set_read_timeout(Some(TIMEOUT))?;
@@ -164,6 +179,8 @@ impl MiioDevice {
         Ok(Self {
             token,
             device_id,
+            expected_device_id: did.parse().ok(),
+            authenticated: false,
             handshaked: false,
             server_stamp: None,
             server_stamp_at: None,
@@ -183,6 +200,10 @@ impl MiioDevice {
         self.handshaked
     }
 
+    /// A hello header is not authenticated. Only a token-checked encrypted
+    /// response establishes this property; it must not be inferred from hello.
+    pub fn is_authenticated(&self) -> bool { self.authenticated }
+
     /// 当前用于加解密的密钥与 IV。
     ///
     /// 密钥 = MD5(token)；IV = MD5(key ‖ token)。
@@ -197,9 +218,14 @@ impl MiioDevice {
 
     /// 组一个包并发送。
     fn send_packet(&mut self, payload: &[u8]) -> Result<(), MiioError> {
+        // Include CBC padding, protocol header and the IPv4 UDP payload limit.
+        if payload.len() > 65_472 {
+            return Err(MiioError::Protocol("miIO 请求超过 UDP 报文上限".into()));
+        }
         let (key, iv) = self.key_iv();
         let encrypted = crypto::aes_cbc_encrypt(&key, &iv, payload);
-        let total_len = (32 + encrypted.len()) as u16;
+        let total_len = u16::try_from(32 + encrypted.len())
+            .map_err(|_| MiioError::Protocol("miIO 请求过长".into()))?;
 
         let mut header = Vec::with_capacity(16);
         header.extend_from_slice(&0x2131u16.to_be_bytes());
@@ -233,7 +259,7 @@ impl MiioDevice {
 
     /// 收一个包、解密并解析出 JSON。
     fn recv_packet(&mut self) -> Result<Value, MiioError> {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 65_535];
         let (n, from) = self.socket.recv_from(&mut buf)?;
         buf.truncate(n);
 
@@ -275,37 +301,19 @@ impl MiioDevice {
         if buf[16..32] != expected_checksum {
             return Err(MiioError::Protocol("响应校验和不匹配".into()));
         }
+        let response_id = u32::from_be_bytes(buf[8..12].try_into().unwrap_or_default());
+        if self.expected_device_id.is_some_and(|id| id != response_id) {
+            return Err(MiioError::Protocol("响应设备 ID 与所选设备不一致".into()));
+        }
+        self.authenticated = true;
 
         // 头里的设备 ID / 时间戳：以设备为准（握手后已经取过一次，这里兜底）
         self.update_header_fields(&buf);
 
         let (key, iv) = self.key_iv();
-        let plain = crypto::aes_cbc_decrypt(&key, &iv, &buf[32..]);
+        let plain = zeroize::Zeroizing::new(crypto::aes_cbc_decrypt(&key, &iv, &buf[32..]));
 
-        // JSON 从第一个 '{' 到最后一个 '}'（握手包前面 16 字节是 token）
-        let text = match plain.iter().position(|&b| b == b'{') {
-            Some(start) => {
-                let end = plain
-                    .iter()
-                    .rposition(|&b| b == b'}')
-                    .unwrap_or(plain.len().saturating_sub(1));
-                if end >= start {
-                    String::from_utf8_lossy(&plain[start..=end]).to_string()
-                } else {
-                    String::from_utf8_lossy(&plain).to_string()
-                }
-            }
-            None => String::from_utf8_lossy(&plain).to_string(),
-        };
-
-        // 去掉控制字符，容忍个别固件塞进来的杂字节
-        let cleaned: String = text
-            .chars()
-            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-            .collect();
-
-        serde_json::from_str(cleaned.trim())
-            .map_err(|e| MiioError::Json(format!("{e}；原文：{}", cleaned.trim())))
+        parse_response_json(&plain)
     }
 
     /// 首次通信前握手。
@@ -320,6 +328,7 @@ impl MiioDevice {
         if self.handshaked {
             return Ok(());
         }
+        self.authenticated = false;
 
         let hello = handshake_packet();
         let mut last_err = None;
@@ -345,16 +354,31 @@ impl MiioDevice {
     /// 只收握手响应的头（32 字节），取出设备 ID 与时间戳，不解析 JSON。
     fn recv_header_only(&mut self) -> Result<(), MiioError> {
         let mut buf = [0u8; 256];
-        let (n, _from) = self.socket.recv_from(&mut buf)?;
-        if n < 32 {
-            return Err(MiioError::Protocol(format!("握手响应过短：{n} 字节")));
+        let (n, from) = self.socket.recv_from(&mut buf)?;
+        if from != self.addr {
+            return Err(MiioError::Protocol(format!("握手响应来自非目标地址 {from}")));
+        }
+        if n != 32 {
+            return Err(MiioError::Protocol(format!("握手响应应为 32 字节，实际 {n} 字节")));
         }
         if u16::from_be_bytes([buf[0], buf[1]]) != 0x2131 {
             return Err(MiioError::Protocol("握手响应魔术字不对".into()));
         }
+        if u16::from_be_bytes([buf[2], buf[3]]) != 32 {
+            return Err(MiioError::Protocol("握手响应声明的长度不是 32 字节".into()));
+        }
 
         let header_device_id = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let header_stamp = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+
+        // miIO hello uses this field for a token/sentinel, not an authenticated
+        // checksum (see OpenMiHome's protocol documentation). Pin the numeric
+        // identity; never learn another device's identity from this header.
+        if self.expected_device_id.is_some_and(|expected| expected != header_device_id)
+            || header_device_id == 0 || header_device_id == SENTINEL
+            || header_stamp == 0 || header_stamp == SENTINEL {
+            return Err(MiioError::Protocol("握手设备标识不匹配或尚未就绪".into()));
+        }
 
         // 设备 ID：以设备回传为准（0 或哨兵说明它还没准备好，保留原值）
         if header_device_id != 0 && header_device_id != SENTINEL {
@@ -393,8 +417,23 @@ impl MiioDevice {
 
         // 设备可能先回无关的包（重复握手响应等），按 id 匹配，最多读取 6 个，
         // 保证陈旧包不会让等待无界增长。
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut rejected = None;
         for _ in 0..6 {
-            let resp = self.recv_packet()?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() { break; }
+            self.socket.set_read_timeout(Some(remaining))?;
+            let resp = match self.recv_packet() {
+                Ok(value) => value,
+                Err(error @ (MiioError::Protocol(_) | MiioError::Json(_))) => {
+                    rejected = Some(error); continue;
+                }
+                Err(MiioError::Io(e)) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                    self.handshaked = false;
+                    return Err(rejected.unwrap_or(MiioError::Io(e)));
+                }
+                Err(e) => return Err(e),
+            };
             let Some(rid) = resp.get("id").and_then(Value::as_i64) else {
                 continue;
             };
@@ -413,7 +452,8 @@ impl MiioDevice {
             return Ok(resp.get("result").cloned().unwrap_or(Value::Null));
         }
 
-        Err(MiioError::Protocol("没有收到匹配 id 的响应".into()))
+        self.handshaked = false;
+        Err(rejected.unwrap_or_else(|| MiioError::Protocol("没有收到匹配 id 的响应".into())))
     }
 
     /// 批量读属性：`[(siid, piid)]` → `[{code, value, …}]`。
@@ -450,6 +490,15 @@ impl MiioDevice {
     }
 }
 
+fn parse_response_json(plain: &[u8]) -> Result<Value, MiioError> {
+    let parse = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes)
+        .ok().filter(Value::is_object);
+    // Normal firmware returns JSON directly. Some older firmware prepends
+    // exactly 16 bytes; try that known boundary, never the first arbitrary '{'.
+    parse(plain).or_else(|| plain.get(16..).and_then(parse))
+        .ok_or_else(|| MiioError::Json("响应不是有效的 JSON 对象".into()))
+}
+
 /// 解析 32 位 hex token。
 pub fn parse_token(hex_str: &str) -> Result<Vec<u8>, MiioError> {
     let s = hex_str.trim();
@@ -459,10 +508,13 @@ pub fn parse_token(hex_str: &str) -> Result<Vec<u8>, MiioError> {
             s.len()
         )));
     }
+    if !s.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(MiioError::Protocol("token 含非 hex 字符".into()));
+    }
     let mut out = Vec::with_capacity(16);
     for i in (0..32).step_by(2) {
         let byte = u8::from_str_radix(&s[i..i + 2], 16)
-            .map_err(|_| MiioError::Protocol(format!("token 含非 hex 字符：{s}")))?;
+            .map_err(|_| MiioError::Protocol("token 含非 hex 字符".into()))?;
         out.push(byte);
     }
     Ok(out)
@@ -489,6 +541,22 @@ pub fn parse_device_id(did: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_parser_handles_a_brace_inside_the_optional_prefix() {
+        let mut response = b"{xx}0123456789ab".to_vec();
+        assert_eq!(response.len(), 16);
+        response.extend_from_slice(br#"{"id":2,"result":[]}"#);
+        assert_eq!(parse_response_json(&response).unwrap()["id"], 2);
+        assert!(parse_response_json(b"garbage{\"id\":2}").is_err());
+    }
+
+    #[test]
+    fn oversized_datagram_is_rejected_before_sending() {
+        let mut device = MiioDevice::connect("192.168.1.2", "42", "00112233445566778899aabbccddeeff").unwrap();
+        assert!(device.send_packet(&vec![b'x'; 65_473]).is_err());
+        assert_eq!(device.packets, 0);
+    }
     use serde_json::json;
     use std::net::UdpSocket;
     use std::thread;
@@ -561,7 +629,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut device = MiioDevice::connect(&addr.to_string(), "42", TEST_TOKEN).unwrap();
+        let mut device = MiioDevice::connect(&addr.to_string(), "287454020", TEST_TOKEN).unwrap();
         assert_eq!(device.rpc("get_properties", json!([])).unwrap(), json!([]));
         assert_eq!(device.server_stamp, Some(2_000));
         worker.join().unwrap();
@@ -610,7 +678,7 @@ mod tests {
             }
         });
 
-        let mut device = MiioDevice::connect(&addr.to_string(), "42", TEST_TOKEN).unwrap();
+        let mut device = MiioDevice::connect(&addr.to_string(), "1432778632", TEST_TOKEN).unwrap();
         assert_eq!(
             device.rpc("get_properties", json!([])).unwrap(),
             json!([{"code": 0}])
@@ -644,7 +712,7 @@ mod tests {
             server.send_to(&response, peer).unwrap();
         });
 
-        let mut device = MiioDevice::connect(&addr.to_string(), "42", TEST_TOKEN).unwrap();
+        let mut device = MiioDevice::connect(&addr.to_string(), "287454020", TEST_TOKEN).unwrap();
         let err = device.rpc("get_properties", json!([])).unwrap_err();
         match err {
             MiioError::Protocol(message) => assert_eq!(message, "响应校验和不匹配"),
@@ -667,6 +735,55 @@ mod tests {
         assert!(parse_token("zz112233445566778899aabbccddeeff").is_err());
         // 带空白的合法 token 应该能过（配置文件里可能有多余空格）
         assert!(parse_token(" 00112233445566778899aabbccddeeff ").is_ok());
+    }
+
+    #[test]
+    fn token_rejects_unicode_without_panicking_or_echoing_the_token() {
+        // 32 UTF-8 bytes, but byte 2 cuts a three-byte Chinese character.
+        let token = format!("中{}", "0".repeat(29));
+        assert_eq!(token.len(), 32);
+        let error = parse_token(&token).unwrap_err().to_string();
+        assert!(!error.contains(&token), "invalid credentials must not be echoed");
+    }
+
+    #[test]
+    fn handshake_rejects_headers_from_another_udp_peer() {
+        let expected = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let other = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut device = MiioDevice::connect(
+            &expected.local_addr().unwrap().to_string(), "42", TEST_TOKEN,
+        ).unwrap();
+        let target = ("127.0.0.1", device.socket.local_addr().unwrap().port());
+        other.send_to(&hello_response(999, 1_000), target).unwrap();
+        assert!(matches!(device.recv_header_only(), Err(MiioError::Protocol(_))));
+        assert_eq!(device.device_id, 42);
+        assert_eq!(device.server_stamp, None);
+    }
+
+    #[test]
+    fn handshake_rejects_malformed_declared_lengths() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut device = MiioDevice::connect(
+            &server.local_addr().unwrap().to_string(), "42", TEST_TOKEN,
+        ).unwrap();
+        let mut response = hello_response(999, 1_000);
+        response[2..4].copy_from_slice(&48u16.to_be_bytes());
+        let target = ("127.0.0.1", device.socket.local_addr().unwrap().port());
+        server.send_to(&response, target).unwrap();
+        assert!(matches!(device.recv_header_only(), Err(MiioError::Protocol(_))));
+        assert_eq!(device.device_id, 42);
+        assert_eq!(device.server_stamp, None);
+    }
+
+    #[test]
+    fn handshake_rejects_another_device_id_even_from_the_target_address() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut device = MiioDevice::connect(&server.local_addr().unwrap().to_string(), "42", TEST_TOKEN).unwrap();
+        server.send_to(&hello_response(999, 1_000), ("127.0.0.1", device.socket.local_addr().unwrap().port())).unwrap();
+        assert!(device.recv_header_only().is_err());
+        assert_eq!(device.device_id, 42);
+        assert!(device.server_stamp.is_none());
+        assert!(!device.is_authenticated());
     }
 
     #[test]

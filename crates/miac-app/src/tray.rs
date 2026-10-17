@@ -6,16 +6,16 @@
 // 它们的 Windows 后端要么额外拉一个事件线程，要么把 GTK/objc 生态带进来，
 // 与「单进程 + 25–45 MB」的验收目标相冲突。这里直接用 Win32：
 //
-//   - 在 **UI 线程**上建一个「消息专用窗口」（HWND_MESSAGE），
+//   - 在 **UI 线程**上建一个隐藏的顶层辅助窗口，
 //     它的消息队列由 Slint/winit 已有的消息泵派发，不需要新线程；
 //   - 用 Shell_NotifyIconW 把图标挂到通知区；
-//   - 回调统一走 WM_APP+1，WndProc 里只做一件事：PostMessage 一条命令给自己，
-//     真正的处理放在界面的定时器里（见 main.rs 的 drain_tray_commands）。
+//   - 图标回调统一走 WM_APP+1，WndProc 将用户命令入队，
+//     真正的处理放在界面的定时器里（见 main.rs 的 drain_commands）。
 //
-// ## 为什么用 PostMessage 传命令而不是共享队列
+// ## 为什么把用户命令交给定时器执行
 //
 // WndProc 运行在消息泵里，此时界面状态正被借用，直接回调易踩借用冲突。
-// 改成「投递消息 → 定时器里取」之后，所有状态修改都发生在同一个地方，
+// 改成「命令入队 → 定时器里取」之后，所有状态修改都发生在同一个地方，
 // 逻辑简单且不会有重入问题。
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -33,8 +33,8 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetCursorPos, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, SendMessageW,
-    SetForegroundWindow,
+    GetCursorPos, LoadImageW, PostMessageW, RegisterClassW, SendMessageW,
+    GetWindowLongPtrW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW, GWLP_USERDATA,
     TrackPopupMenu, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, MF_SEPARATOR, MF_STRING,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
     WNDCLASSW,
@@ -57,7 +57,7 @@ const CMD_SHOW: usize = 1001;
 const CMD_TOGGLE_POWER: usize = 1002;
 const CMD_EXIT: usize = 1003;
 
-/// 消息专用窗口的窗口类名（宽字符、以 NUL 结尾）。
+/// 隐藏辅助窗口的窗口类名（宽字符、以 NUL 结尾）。
 const CLASS_NAME: &[u16] = &[
     b'M' as u16, b'i' as u16, b'a' as u16, b'c' as u16, b'T' as u16, b'r' as u16, b'a' as u16,
     b'y' as u16, 0,
@@ -99,96 +99,97 @@ fn queue_push(cmd: TrayCommand) {
 static ICON_ADDED: AtomicBool = AtomicBool::new(false);
 
 
-/// 消息专用窗口句柄（0 表示尚未创建）。
-static mut MSG_HWND: HWND = std::ptr::null_mut();
+// 主窗口句柄只在当前 UI 线程访问。
+thread_local! {
+    static MAIN_HWND: std::cell::Cell<HWND> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
 
-/// 主窗口句柄的副本（用于「关闭时隐藏」与「左键切回」）。
-static mut MAIN_HWND: HWND = std::ptr::null_mut();
+struct TrayWindowState {
+    tooltip: String,
+    taskbar_created: u32,
+    add_icon: fn(HWND, &str) -> Result<(), String>,
+}
 
 /// 托盘控制器。
 pub struct Tray {
     hwnd: HWND,
+    // The boxed address remains stable until the native window is destroyed.
+    _state: Box<TrayWindowState>,
 }
 
 impl Tray {
-    /// 在**当前线程**创建托盘。必须在 UI 线程调用（消息专用窗口要在同一线程，
+    /// 在**当前线程**创建托盘。必须在 UI 线程调用（辅助窗口要在同一线程，
     /// 这样它的消息才会被 Slint/winit 的消息泵派发）。
     pub fn new(tooltip: &str) -> Result<Self, String> {
         unsafe {
-            let hinstance = GetModuleHandleW(std::ptr::null());
-
-            // 注册窗口类（重复注册同一个类名会失败，忽略即可）
-            let mut wc: WNDCLASSW = std::mem::zeroed();
-            wc.lpfnWndProc = Some(wnd_proc);
-            wc.hInstance = hinstance;
-            wc.lpszClassName = CLASS_NAME.as_ptr();
-            RegisterClassW(&wc);
-
-            // 消息专用窗口：HWND_MESSAGE = (HWND)-3，不可见、不参与绘制，
-            // 只用来接收 Shell_NotifyIcon 的回调消息。
-            let hwnd = CreateWindowExW(
-                0,
-                CLASS_NAME.as_ptr(),
-                CLASS_NAME.as_ptr(),
-                0,
-                0,
-                0,
-                0,
-                0,
-                -3isize as HWND,
-                std::ptr::null_mut(),
-                hinstance,
-                std::ptr::null(),
-            );
-            if hwnd.is_null() {
-                return Err(format!(
-                    "创建托盘消息窗口失败（GetLastError={}）",
-                    std::io::Error::last_os_error()
-                ));
+            let message: Vec<u16> = "TaskbarCreated".encode_utf16().chain([0]).collect();
+            let taskbar_created = RegisterWindowMessageW(message.as_ptr());
+            if taskbar_created == 0 {
+                return Err(format!("注册任务栏恢复消息失败：{}", std::io::Error::last_os_error()));
             }
-            MSG_HWND = hwnd;
-
-            let tray = Self { hwnd };
-            tray.add_icon(tooltip)?;
+            let mut state = Box::new(TrayWindowState {
+                tooltip: tooltip.to_owned(), taskbar_created, add_icon,
+            });
+            let hwnd = create_tray_window(&mut *state)?;
+            let tray = Self { hwnd, _state: state };
+            add_icon(hwnd, tooltip)?;
             Ok(tray)
         }
     }
+}
 
-    /// 往通知区添加图标。
-    fn add_icon(&self, tooltip: &str) -> Result<(), String> {
-        unsafe {
-            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            nid.hWnd = self.hwnd;
-            nid.uID = TRAY_ID;
-            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-            nid.uCallbackMessage = WM_TRAYICON;
+unsafe fn create_tray_window(state: &mut TrayWindowState) -> Result<HWND, String> {
+    let hinstance = GetModuleHandleW(std::ptr::null());
+    let mut wc: WNDCLASSW = std::mem::zeroed();
+    wc.lpfnWndProc = Some(wnd_proc);
+    wc.hInstance = hinstance;
+    wc.lpszClassName = CLASS_NAME.as_ptr();
+    RegisterClassW(&wc);
+    // HWND_MESSAGE windows never receive TaskbarCreated broadcasts. A hidden
+    // top-level window remains invisible while participating in those notices.
+    let hwnd = CreateWindowExW(0, CLASS_NAME.as_ptr(), CLASS_NAME.as_ptr(), 0,
+        0, 0, 0, 0, std::ptr::null_mut(), std::ptr::null_mut(), hinstance, std::ptr::null());
+    if hwnd.is_null() {
+        return Err(format!("创建托盘消息窗口失败：{}", std::io::Error::last_os_error()));
+    }
+    SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as *mut TrayWindowState as isize);
+    Ok(hwnd)
+}
 
-            // 用可执行文件自带的图标，不依赖外部 .ico 文件
-            let hinstance = GetModuleHandleW(std::ptr::null());
-            let icon = LoadImageW(
-                hinstance,
-                APP_ICON_ID as *const u16,
-                IMAGE_ICON,
-                0,
-                0,
-                LR_DEFAULTSIZE | LR_SHARED,
-            );
-            if icon.is_null() {
-                return Err("读取内嵌应用图标失败".into());
-            }
-            nid.hIcon = icon;
+/// 往通知区添加图标。
+fn add_icon(hwnd: HWND, tooltip: &str) -> Result<(), String> {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = TRAY_ID;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uCallbackMessage = WM_TRAYICON;
 
-            // 提示文字：截断到 127 个宽字符（NOTIFYICONDATAW.szTip 容量 128）
-            let tip: Vec<u16> = tooltip.encode_utf16().take(127).chain([0]).collect();
-            nid.szTip[..tip.len()].copy_from_slice(&tip);
-
-            if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
-                return Err("Shell_NotifyIcon(NIM_ADD) 失败".into());
-            }
-            ICON_ADDED.store(true, Ordering::SeqCst);
-            Ok(())
+        // 用可执行文件自带的图标，不依赖外部 .ico 文件
+        let hinstance = GetModuleHandleW(std::ptr::null());
+        let icon = LoadImageW(
+            hinstance,
+            APP_ICON_ID as *const u16,
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        );
+        if icon.is_null() {
+            return Err("读取内嵌应用图标失败".into());
         }
+        nid.hIcon = icon;
+
+        // 提示文字：截断到 127 个宽字符（NOTIFYICONDATAW.szTip 容量 128）
+        let tip: Vec<u16> = tooltip.encode_utf16().take(127).chain([0]).collect();
+        nid.szTip[..tip.len()].copy_from_slice(&tip);
+
+        if Shell_NotifyIconW(NIM_ADD, &nid) == 0 {
+            return Err("Shell_NotifyIcon(NIM_ADD) 失败".into());
+        }
+        ICON_ADDED.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -205,7 +206,6 @@ impl Drop for Tray {
             if !self.hwnd.is_null() {
                 DestroyWindow(self.hwnd);
             }
-            MSG_HWND = std::ptr::null_mut();
         }
     }
 }
@@ -213,7 +213,8 @@ impl Drop for Tray {
 /// 记录主窗口句柄；关闭行为统一由 Slint 的 on_close_requested 处理。
 pub fn attach_main_window(hwnd: HWND) {
     unsafe {
-        MAIN_HWND = hwnd;
+        MAIN_HWND.set(hwnd);
+        if hwnd.is_null() { return; }
         let hinstance = GetModuleHandleW(std::ptr::null());
         let small = LoadImageW(
             hinstance,
@@ -263,7 +264,7 @@ pub fn allow_existing_instance_foreground() {
         AllowSetForegroundWindow, FindWindowExW, GetWindowThreadProcessId,
     };
     unsafe {
-        let hwnd = FindWindowExW(-3isize as HWND, std::ptr::null_mut(), CLASS_NAME.as_ptr(), std::ptr::null());
+        let hwnd = FindWindowExW(std::ptr::null_mut(), std::ptr::null_mut(), CLASS_NAME.as_ptr(), std::ptr::null());
         if !hwnd.is_null() {
             let mut pid = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
@@ -276,7 +277,7 @@ pub fn allow_existing_instance_foreground() {
 /// 显示并前置主窗口。
 pub fn show_main_window() {
     unsafe {
-        let h = MAIN_HWND;
+        let h = MAIN_HWND.get();
         if h.is_null() {
             return;
         }
@@ -303,13 +304,29 @@ fn trace(msg: &str) {
     }
 }
 
-/// 托盘窗口过程：只做「把命令投递给自己」这一件事。
+/// 托盘窗口过程：恢复任务栏图标，并将用户命令入队。
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TrayWindowState;
+    if !state.is_null() && msg == (*state).taskbar_created {
+        // Explorer discards notification icons on restart (and can recreate the
+        // taskbar after a DPI change). The previous successful Add is stale.
+        ICON_ADDED.store(false, Ordering::SeqCst);
+        match ((*state).add_icon)(hwnd, &(*state).tooltip) {
+            Ok(()) => ICON_ADDED.store(true, Ordering::SeqCst),
+            Err(error) => {
+                eprintln!("[托盘] 任务栏重建后恢复图标失败：{error}");
+                // Restore a hidden application so it stays reachable even when
+                // the shell rejects the replacement icon.
+                queue_push(TrayCommand::Show);
+            }
+        }
+        return 0;
+    }
     match msg {
         WM_TRAYICON => {
             let event = lparam as u32;
@@ -326,7 +343,8 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_DESTROY => {
-            PostQuitMessage(0);
+            // This helper window can be destroyed when tray initialization
+            // fails. The application owns the UI loop and exits explicitly.
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -364,8 +382,8 @@ unsafe fn show_menu(hwnd: HWND) {
         std::ptr::null(),
     );
     // 菜单关闭后把焦点还给主窗口，否则焦点会留在托盘上
-    if !MAIN_HWND.is_null() {
-        PostMessageW(MAIN_HWND, 0, 0, 0);
+    if !MAIN_HWND.get().is_null() {
+        PostMessageW(MAIN_HWND.get(), 0, 0, 0);
     }
     DestroyMenu(menu);
     SetFocus(hwnd);
@@ -377,5 +395,113 @@ unsafe fn show_menu(hwnd: HWND) {
         CMD_TOGGLE_POWER => queue_push(TrayCommand::TogglePower),
         CMD_EXIT => queue_push(TrayCommand::Exit),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static RESTORE_EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static RESTORE_TEST: Mutex<()> = Mutex::new(());
+
+    fn record_icon_restore(_hwnd: HWND, tooltip: &str) -> Result<(), String> {
+        RESTORE_EVENTS.lock().unwrap().push(tooltip.to_owned());
+        Ok(())
+    }
+
+    fn reject_icon_restore(_hwnd: HWND, _tooltip: &str) -> Result<(), String> {
+        Err("isolated shell failure".into())
+    }
+
+    #[test]
+    fn tray_window_is_a_broadcast_target_and_readds_the_icon_after_taskbar_recreation() {
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{EnumThreadWindows, FindWindowExW, IsWindowVisible};
+        let _guard = RESTORE_TEST.lock().unwrap();
+        RESTORE_EVENTS.lock().unwrap().clear();
+        unsafe extern "system" fn collect(hwnd: HWND, data: LPARAM) -> i32 {
+            (*(data as *mut Vec<HWND>)).push(hwnd);
+            1
+        }
+        unsafe {
+            let message: Vec<u16> = "TaskbarCreated".encode_utf16().chain([0]).collect();
+            let taskbar_created = RegisterWindowMessageW(message.as_ptr());
+            assert_ne!(taskbar_created, 0);
+            let mut state = Box::new(TrayWindowState {
+                tooltip: "isolated test".into(), taskbar_created, add_icon: record_icon_restore,
+            });
+            let hwnd = create_tray_window(&mut state).unwrap();
+            let mut windows: Vec<HWND> = Vec::new();
+            assert_ne!(EnumThreadWindows(GetCurrentThreadId(), Some(collect), &mut windows as *mut _ as LPARAM), 0);
+            let visible = IsWindowVisible(hwnd) != 0;
+            let discoverable = FindWindowExW(std::ptr::null_mut(), std::ptr::null_mut(), CLASS_NAME.as_ptr(), std::ptr::null()) == hwnd;
+            // Only this private window receives the simulated restart. The icon
+            // callback is a test double; Explorer and the real tray are untouched.
+            SendMessageW(hwnd, taskbar_created, 0, 0);
+            let restored = RESTORE_EVENTS.lock().unwrap().clone();
+            let ready = is_ready();
+            assert_ne!(DestroyWindow(hwnd), 0);
+            ICON_ADDED.store(false, Ordering::SeqCst);
+            assert!(!visible, "托盘辅助窗口不能显示在桌面");
+            assert!(discoverable, "第二实例仍需找到托盘所属进程来授权前置");
+            assert!(windows.contains(&hwnd), "消息专用窗口无法接收 TaskbarCreated 顶层广播");
+            assert_eq!(restored, ["isolated test"], "任务栏重建后应以原提示文字重新添加图标");
+            assert!(ready);
+        }
+    }
+
+    #[test]
+    fn failed_icon_recovery_shows_the_application_and_disables_tray_hiding() {
+        let _guard = RESTORE_TEST.lock().unwrap();
+        drain_commands();
+        unsafe {
+            let message: Vec<u16> = "TaskbarCreated".encode_utf16().chain([0]).collect();
+            let taskbar_created = RegisterWindowMessageW(message.as_ptr());
+            assert_ne!(taskbar_created, 0);
+            let mut state = Box::new(TrayWindowState {
+                tooltip: "isolated test".into(), taskbar_created, add_icon: reject_icon_restore,
+            });
+            let hwnd = create_tray_window(&mut state).unwrap();
+            // Test state only: no icon has been installed in the actual shell.
+            ICON_ADDED.store(true, Ordering::SeqCst);
+            SendMessageW(hwnd, taskbar_created, 0, 0);
+            let ready = is_ready();
+            let commands = drain_commands();
+            assert_ne!(DestroyWindow(hwnd), 0);
+            ICON_ADDED.store(false, Ordering::SeqCst);
+            assert!(!ready, "旧的图标注册成功状态不能沿用");
+            assert_eq!(commands, [TrayCommand::Show], "恢复失败时应让已隐藏的主窗口重新可达");
+        }
+    }
+
+    #[test]
+    fn destroying_a_tray_message_window_does_not_quit_the_ui_thread() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            PeekMessageW, UnregisterClassW, MSG, PM_REMOVE, WM_QUIT,
+        };
+
+        // A private message-only window exercises the real destruction callback
+        // without adding an icon to the user's notification area.
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let class: Vec<u16> = format!("MiacTrayDestroyTest-{}-{unique}", std::process::id())
+                .encode_utf16().chain([0]).collect();
+            let mut wc: WNDCLASSW = std::mem::zeroed();
+            wc.lpfnWndProc = Some(wnd_proc);
+            wc.hInstance = instance;
+            wc.lpszClassName = class.as_ptr();
+            assert_ne!(RegisterClassW(&wc), 0);
+            let hwnd = CreateWindowExW(0, class.as_ptr(), class.as_ptr(), 0,
+                0, 0, 0, 0, -3isize as HWND, std::ptr::null_mut(), instance, std::ptr::null());
+            assert!(!hwnd.is_null());
+            assert_ne!(DestroyWindow(hwnd), 0);
+            let mut message: MSG = std::mem::zeroed();
+            let quit_posted = PeekMessageW(&mut message, std::ptr::null_mut(), WM_QUIT, WM_QUIT, PM_REMOVE) != 0;
+            assert_ne!(UnregisterClassW(class.as_ptr(), instance), 0);
+            assert!(!quit_posted, "托盘初始化失败后的资源清理不能结束主界面消息循环");
+        }
     }
 }

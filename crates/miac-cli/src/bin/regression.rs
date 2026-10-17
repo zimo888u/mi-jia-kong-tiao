@@ -63,20 +63,18 @@ fn main() {
     match ctrl.snapshot() {
         Ok(s) => {
             let n = s.status.len();
+            let expected = ["on", "mode", "targetTemp", "fanLevel", "verticalSwing", "horizontalSwing", "windDirection", "eco", "sleep", "heater", "dryer", "favoriteOn", "roomTemp", "indoorHumidity", "electricity", "faultValue"];
+            let complete = expected.iter().filter(|name| ctrl.profile.properties.get(**name).is_some_and(|p| p.readable)).all(|name| s.status.iter().any(|(key, _)| key == name));
             let bad: Vec<String> = s
                 .status
                 .iter()
-                .filter(|(_, v)| !matches!(v, PropValue::Ok(_)))
+                .filter(|(name, v)| ctrl.profile.properties.get(*name).is_some_and(|p| p.readable) && !matches!(v, PropValue::Ok(_)))
                 .map(|(k, v)| format!("{k}={}", v.display()))
                 .collect();
             results.push(Outcome {
                 name: "状态快照（16 项属性）",
-                verdict: if bad.is_empty() { Verdict::Pass } else { Verdict::Fail },
-                detail: if bad.is_empty() {
-                    format!("{n} 项全部读到")
-                } else {
-                    format!("{n} 项中有异常：{}", bad.join(", "))
-                },
+                verdict: if complete && n >= 2 && bad.is_empty() { Verdict::Pass } else { Verdict::Fail },
+                detail: format!("{n} 项返回，必要属性齐全={complete}；异常：{}", bad.join(", ")),
             });
         }
         Err(e) => results.push(Outcome { name: "状态快照", verdict: Verdict::Fail, detail: e.to_string() }),
@@ -85,11 +83,13 @@ fn main() {
     // ── 2. 机器诊断（v1 `diag`）──
     match ctrl.diag() {
         Ok(v) => {
-            let missing = v.iter().filter(|(_, x)| matches!(x, PropValue::Missing)).count();
+            let expected = ["indoorPipeTemp", "indoorFanSpeed", "outdoorTemp", "outdoorPipeTemp", "compressorFreq", "outdoorCurrent", "outdoorVoltage", "runDuration"];
+            let required: Vec<_> = expected.iter().filter(|name| ctrl.profile.properties.get(**name).is_some_and(|p| p.readable)).collect();
+            let missing = required.iter().filter(|name| !v.iter().any(|(key, value)| key == **name && matches!(value, PropValue::Ok(_)))).count();
             results.push(Outcome {
                 name: "机器诊断（8 项）",
-                verdict: if missing == 0 { Verdict::Pass } else { Verdict::Fail },
-                detail: format!("{}/{} 项读到", v.len() - missing, v.len()),
+                verdict: if required.is_empty() { Verdict::Skip } else if missing == 0 { Verdict::Pass } else { Verdict::Fail },
+                detail: format!("{}/{} 项该型号支持的诊断读到", required.len() - missing, required.len()),
             });
         }
         Err(e) => results.push(Outcome { name: "机器诊断", verdict: Verdict::Fail, detail: e.to_string() }),
@@ -139,45 +139,52 @@ fn main() {
     }
 
     // ── 6. 原始属性读写（v1 `raw`）──
-    match ctrl.raw_read(2, 1) {
+    let (on_siid, on_piid) = ctrl.profile.addr("on").expect("initialized AC profile has power");
+    match ctrl.raw_read(on_siid, on_piid) {
         Ok(v) => results.push(Outcome {
-            name: "原始属性读取 2.1（开关）",
+            name: "原始属性读取（该型号开关）",
             verdict: if matches!(v, PropValue::Ok(_)) { Verdict::Pass } else { Verdict::Fail },
             detail: format!("= {}", v.display()),
         }),
         Err(e) => results.push(Outcome { name: "原始属性读取", verdict: Verdict::Fail, detail: e.to_string() }),
     }
 
-    // ── 7. 属性表完整性（40 项地址都能解析）──
-    let mut unresolved = Vec::new();
-    for (name, _) in miac_core::miot::PROPS {
-        if Controller::resolve_prop(name).is_err() {
-            unresolved.push(*name);
+    // Compare addresses against the bundled official specification, independently
+    // of the legacy PROPS lookup. Check structural invariants as well.
+    let mut issues = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut addresses = std::collections::BTreeSet::new();
+    for (name, prop) in &ctrl.profile.properties {
+        if !names.insert(name) || !addresses.insert((prop.siid, prop.piid)) || prop.siid == 0 || prop.piid == 0 {
+            issues.push(name.clone());
         }
     }
-    results.push(Outcome {
-        name: "属性表（v1 全部 40 项可解析）",
-        verdict: if unresolved.is_empty() { Verdict::Pass } else { Verdict::Fail },
-        detail: if unresolved.is_empty() {
-            format!("{} 项全部可解析", miac_core::miot::PROPS.len())
-        } else {
-            format!("无法解析：{}", unresolved.join(", "))
-        },
-    });
+    if let Some(spec) = miac_core::profile::bundled_specs().get(&ctrl.profile.model) {
+        match miac_core::profile::Profile::parse(&ctrl.profile.model, spec) {
+            Ok(reference) => for (name, prop) in reference.properties {
+                if ctrl.profile.addr(&name) != Some((prop.siid, prop.piid)) { issues.push(name); }
+            },
+            Err(error) => issues.push(error),
+        }
+    }
+    results.push(Outcome { name: "Model specification integrity", verdict: if issues.is_empty() && names.len() >= 3 { Verdict::Pass } else { Verdict::Fail }, detail: format!("{} properties; issues: {:?}", names.len(), issues) });
 
-    // ── 8. 参数校验（v1 的 valid* 系列）──
-    let mut checks = Vec::new();
-    checks.push(("温度 16~31 步长 0.5", Controller::valid_temp(26.5).is_ok() && Controller::valid_temp(26.3).is_err()));
-    checks.push(("模式 cool/dry/fan/heat", Controller::valid_mode(&serde_json::json!("cool")).is_ok() && Controller::valid_mode(&serde_json::json!("x")).is_err()));
-    checks.push(("风速 auto/1-7/max", Controller::valid_fan(&serde_json::json!("max")).is_ok() && Controller::valid_fan(&serde_json::json!(9)).is_err()));
-    checks.push(("风感 0~4", Controller::valid_wind(&serde_json::json!("noblow")).is_ok() && Controller::valid_wind(&serde_json::json!(9)).is_err()));
-    checks.push(("定格 0~5", Controller::valid_pos(&serde_json::json!(3)).is_ok() && Controller::valid_pos(&serde_json::json!(6)).is_err()));
-    let bad: Vec<&str> = checks.iter().filter(|(_, ok)| !ok).map(|(n, _)| *n).collect();
-    results.push(Outcome {
-        name: "参数校验（5 类）",
-        verdict: if bad.is_empty() { Verdict::Pass } else { Verdict::Fail },
-        detail: if bad.is_empty() { "全部按 v1 规则拒绝/接受".into() } else { format!("异常：{}", bad.join(", ")) },
-    });
+    // Exercise the same model-specific validator used by production writes.
+    let mut validation_issues = Vec::new();
+    let [min, max, step] = ctrl.profile.temperature_range();
+    for (value, accepted) in [(min, true), (max, true), (min-step, false), (max+step, false), (min+step/2.0, false)] {
+        if ctrl.profile.validate("targetTemp", &serde_json::json!(value)).is_ok() != accepted { validation_issues.push(format!("temperature {value}")); }
+    }
+    if ctrl.profile.validate("on", &serde_json::json!(true)).is_err() || ctrl.profile.validate("on", &serde_json::json!("on")).is_ok() { validation_issues.push("power type".into()); }
+    for name in ["mode", "fanLevel"] {
+        if let Some(prop) = ctrl.profile.properties.get(name).filter(|p| p.writable) {
+            for (value, _) in &prop.choices {
+                if ctrl.profile.validate(name, &serde_json::json!(value)).is_err() { validation_issues.push(format!("{name} {value}")); }
+            }
+            if ctrl.profile.validate(name, &serde_json::json!(-999999)).is_ok() { validation_issues.push(format!("{name} invalid enum")); }
+        }
+    }
+    results.push(Outcome { name: "Production model validation", verdict: if validation_issues.is_empty() { Verdict::Pass } else { Verdict::Fail }, detail: format!("issues: {:?}", validation_issues) });
 
     // ── 9. 写操作（可选）──
     if do_write {
@@ -188,7 +195,7 @@ fn main() {
             ("eco", "ECO 节能"),
             ("sleep", "睡眠模式"),
         ] {
-            let before = ctrl.read_props(&[name]).ok().and_then(|v| v[0].1.as_bool());
+            let before = ctrl.read_props(&[name]).ok().and_then(|v| v.first().and_then(|(_,p)| p.as_bool()));
             let Some(orig) = before else {
                 results.push(Outcome { name: label, verdict: Verdict::Fail, detail: "读原值失败".into() });
                 continue;
@@ -196,14 +203,21 @@ fn main() {
             match ctrl.set_toggle(name, !orig) {
                 Ok(()) => {
                     std::thread::sleep(std::time::Duration::from_millis(400));
-                    let after = ctrl.read_props(&[name]).ok().and_then(|v| v[0].1.as_bool());
+                    let after = ctrl.read_props(&[name]).ok().and_then(|v| v.first().and_then(|(_,p)| p.as_bool()));
                     // 复位
-                    let _ = ctrl.set_toggle(name, orig);
+                    let restored = ctrl.set_toggle(name, orig);
+                    let restored_value = if restored.is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                        ctrl.read_props(&[name]).ok().and_then(|v| v.first().and_then(|(_,p)| p.as_bool()))
+                    } else { None };
+                    let reset_ok = restored_value == Some(orig);
                     let same = after == Some(!orig);
                     results.push(Outcome {
                         name: label,
-                        verdict: if same { Verdict::Pass } else { Verdict::Fail },
-                        detail: format!("{orig} → {}({} → 已复位 {orig})", !orig, if same { "回读一致" } else { "回读不一致" }),
+                        verdict: if same && reset_ok { Verdict::Pass } else { Verdict::Fail },
+                        detail: format!("{orig} → {}（{}）；{}", !orig,
+                            if same { "回读一致" } else { "回读不一致" },
+                            if reset_ok { format!("已验证复位 {orig}") } else { format!("复位失败或未确认：{restored:?}，读回 {restored_value:?}") }),
                     });
                 }
                 Err(e) => {

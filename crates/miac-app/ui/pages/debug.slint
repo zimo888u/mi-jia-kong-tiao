@@ -54,7 +54,7 @@ export component DebugPage inherits VerticalLayout {
                 interactive: true;
                 names-row := HorizontalLayout {
                     spacing: 5px;
-                    for i in 40 : Rectangle {
+                    for i in root.prop-name-list.length : Rectangle {
                         visible: i < root.prop-name-list.length;
                         height: 38px;
                         width: max(58px, pn-text.preferred-width + 20px);

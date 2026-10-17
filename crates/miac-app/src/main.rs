@@ -22,7 +22,7 @@
 // ## 内存自检
 //
 //   --probe      每 15 秒打印内存（验收：5 分钟 < 45 MB）
-//   --self-test  轮换五页 100 次并检查内存增长（验收：≤ 5 MB）
+//   --self-test  轮换六页 100 次并检查内存增长（验收：≤ 5 MB）
 //   --tour       轮询触发文件切页，供截图脚本逐页取证
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -32,9 +32,15 @@ slint::include_modules!();
 mod tray;
 
 mod target_temp;
+mod pending_writes;
 mod settings_writer;
 mod log_export;
+mod data_cleanup;
+mod autostart;
+mod theme_art;
 mod window_config;
+#[cfg(test)]
+mod audit_tests;
 #[cfg(windows)]
 mod single_instance;
 
@@ -74,6 +80,8 @@ struct App {
     profile: miac_core::profile::Profile,
     active_device_id: String,
     switching_device_id: Option<String>,
+    switching_since: Option<Instant>,
+    pending_writes: pending_writes::PendingWrites,
     last_snapshot_error: Option<Instant>,
     ui: MainWindow,
     // 注意：Worker 刻意**不放在 App 里**。
@@ -118,6 +126,7 @@ struct App {
     login: login_ui::LoginWorker,
     /// 登录弹层是否显示
     login_open: bool,
+    cloud_login_required: bool,
     /// 登录状态：0 未开始 / 1 申请中 / 2 二维码 / 3 选设备 / 4 出错
     login_state: i32,
     /// 二维码图片（解码后的 RGBA）
@@ -147,6 +156,7 @@ type AppRef = Rc<RefCell<App>>;
 impl App {
     fn new() -> Result<(AppRef, Rc<Worker>), slint::PlatformError> {
         let ui = MainWindow::new()?;
+        theme_art::install(&ui);
 
         // 凭据目录：与 v1 完全一致（%APPDATA%\米家空调\），并保留回退查找，
         // 这样旧版配好的凭据不用重新登录。
@@ -169,6 +179,8 @@ impl App {
             profile: miac_core::profile::Profile::default(),
             active_device_id: String::new(),
             switching_device_id: None,
+            switching_since: None,
+            pending_writes: pending_writes::PendingWrites::default(),
             last_snapshot_error: None,
             ui,
             settings_writer: settings_writer::SettingsWriter::spawn(creds.clone()),
@@ -194,6 +206,7 @@ impl App {
             repaint_ticks: 0,
             login: login_ui::LoginWorker::spawn(creds_for_login),
             login_open: false,
+            cloud_login_required: false,
             login_state: 0,
             login_qr: None,
             login_status: String::new(),
@@ -209,7 +222,7 @@ impl App {
             // 直接写 a.add_log(a.creds.primary_dir()...) 会同时产生可变与不可变
             // 借用，编译不过——这是 Rust 借用检查最常撞的一处。
             let dir = a.creds.primary_dir().display().to_string();
-            let dark = a.settings.dark;
+            let theme = a.settings.theme_index();
             let transport = a.settings.transport;
             let auto = a.settings.auto_refresh;
             let summary = report.summary();
@@ -230,7 +243,11 @@ impl App {
             a.ui.set_migration_summary(summary.into());
             a.ui.set_credentials_dir(dir.into());
             a.sync_credential_status();
-            a.ui.set_dark_theme(dark);
+            a.ui.set_theme_index(theme);
+            match autostart::enabled() {
+                Ok(enabled) => a.ui.set_auto_start(enabled),
+                Err(error) => a.add_log(format!("[设置] 无法读取 Windows 自启动状态：{error}")),
+            }
             a.ui.set_transport_mode(transport);
             a.ui.set_auto_refresh(auto);
             // 预设温度：迁移/设置里读到的值直接反映到界面按钮
@@ -288,7 +305,7 @@ impl App {
     fn refresh_view(&self) {
         let ui = &self.ui;
 
-        ui.set_dark_theme(self.settings.dark);
+        ui.set_theme_index(self.settings.theme_index());
         ui.set_close_behavior(self.settings.close_behavior());
         ui.set_connected(self.connected);
         ui.set_not_ready_reason(self.not_ready_reason.clone().into());
@@ -304,18 +321,7 @@ impl App {
             .into(),
         );
 
-        // 提示条
-        let items: Vec<ToastItem> = self
-            .toasts
-            .iter()
-            .enumerate()
-            .map(|(i, t)| ToastItem {
-                kind: t.kind,
-                text: t.text.clone().into(),
-                seq: i as i32,
-            })
-            .collect();
-        ui.set_toasts(ModelRc::new(VecModel::from(items)));
+        self.push_toasts();
 
         // ── 控制台：从快照取真实值 ─────────────────────────────
         let on_state = self.prop_bool("on");
@@ -408,7 +414,7 @@ impl App {
         ui.set_diag_values(ModelRc::new(VecModel::from(values)));
         ui.set_diag_units(ModelRc::new(VecModel::from(units)));
 
-        if let Some((values, cleaning)) = self.maintenance.as_ref() {
+        if let Some((values, _)) = self.maintenance.as_ref() {
             let get = |name: &str| {
                 values
                     .iter()
@@ -416,16 +422,20 @@ impl App {
                     .map(|(_, v)| v.display())
                     .unwrap_or_else(|| "--".into())
             };
-            ui.set_clean_text(if !self.profile.properties.contains_key("clean") { "该型号未提供".into() } else if *cleaning { "运行中".into() } else { "未运行".into() });
+            ui.set_clean_text(clean_status(self.profile.properties.contains_key("clean"), values).into());
             ui.set_examine_text(get("examine").into());
             ui.set_run_text(format!("{} 小时", get("runDuration")).into());
+        } else {
+            ui.set_clean_text(clean_status(self.profile.properties.contains_key("clean"), &[]).into());
+            ui.set_examine_text("尚未读取".into());
+            ui.set_run_text("尚未读取".into());
         }
 
         // 故障
-        let fault = if self.profile.model == miot::EXPECT_MODEL { miot::fault_info(self.prop_i64("faultValue")) } else {
-            let value = self.props.iter().find(|(n,_)| *n == "fault").map(|(_,v)| v);
-            miot::FaultInfo { clear: value.and_then(PropValue::as_i64) == Some(0), text: value.map(PropValue::display).unwrap_or_else(|| "该型号未提供故障读数".into()), badge: None }
-        };
+        ui.set_fault_addr(self.profile.addr("faultValue").or_else(|| self.profile.addr("fault"))
+            .map(|(siid, piid)| format!("{siid}.{piid}")).unwrap_or_else(|| "—".into()).into());
+        let fault = miac_core::controller::profile_fault_info(&self.profile, &self.props);
+        ui.set_fault_known(miac_core::controller::profile_fault_value(&self.profile, &self.props).is_some());
         ui.set_fault_badge(fault.badge.clone().unwrap_or_else(|| "—".into()).into());
         ui.set_fault_text(fault.text.clone().into());
         ui.set_fault_clear(fault.clear);
@@ -443,14 +453,19 @@ impl App {
             .login_devices
             .iter()
             .map(|d| LoginDevice {
-                name: d.name.clone().into(),
+                name: if d.name.is_empty() { d.model.clone() } else { d.name.clone() }.into(),
                 model: d.model.clone().into(),
                 did: d.did.clone().into(),
-                detail: format!(
-                    "{}{}",
-                    d.localip.clone().unwrap_or_else(|| "无局域网IP".into()),
-                    if d.token.is_some() { " · 有token" } else { " · 无token" }
-                )
+                selectable: d.looks_like_ac(),
+                detail: if d.is_thermometer() {
+                    "温湿度计 · 自动关联".to_string()
+                } else {
+                    format!(
+                        "{}{}",
+                        d.localip.clone().unwrap_or_else(|| "无局域网IP".into()),
+                        if d.token.is_some() { " · 有token" } else { " · 无token" }
+                    )
+                }
                 .into(),
             })
             .collect();
@@ -483,9 +498,41 @@ impl App {
         self.prop_bool("on").unwrap_or(false)
     }
 
+    fn control_ready(&mut self) -> bool {
+        if self.connected && self.switching_device_id.is_none() { return true; }
+        self.toast(2, "设备尚未连接完成，请连接后再操作");
+        self.refresh_view();
+        false
+    }
+
+    fn write_control(&mut self, worker: &Worker, name: &str, value: serde_json::Value) {
+        if !self.control_ready() { return; }
+        if let Err(error) = self.profile.validate(name, &value) {
+            self.toast(2, error);
+            return;
+        }
+        self.pending_writes.input(name, value.clone(), Instant::now());
+        worker.send(Command::WriteProp { name: name.into(), value });
+    }
+
+    fn check_pending_deadlines(&mut self) {
+        if self.switching_since.is_some_and(|start| start.elapsed() >= Duration::from_secs(30)) {
+            self.switching_device_id = None;
+            self.switching_since = None;
+            self.connected = false;
+            self.not_ready_reason = "连接新设备超时，请重新选择通道或登录后重试".into();
+            self.toast(3, self.not_ready_reason.clone());
+            self.refresh_view();
+        }
+        if self.pending_writes.expire(Instant::now()) {
+            self.toast(2, "控制结果尚未确认，已恢复显示设备读数，请刷新后检查");
+            self.refresh_view();
+        }
+    }
+
     /// 属性查询小工具。
     fn prop(&self, name: &str) -> Option<&PropValue> {
-        self.props.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+        self.pending_writes.value(name).or_else(|| self.props.iter().find(|(n, _)| *n == name).map(|(_, v)| v))
     }
     fn prop_bool(&self, name: &str) -> Option<bool> {
         self.prop(name).and_then(PropValue::as_bool)
@@ -560,12 +607,23 @@ impl App {
         if let Some(existing) = self.toasts.iter_mut().find(|t| t.text == text) {
             existing.born = Instant::now();
             existing.kind = kind;
+            self.push_toasts();
             return;
         }
         self.toasts.push(Toast { kind, text, born: Instant::now() });
         while self.toasts.len() > MAX_TOASTS {
             self.toasts.remove(0);
         }
+        self.push_toasts();
+    }
+
+    fn push_toasts(&self) {
+        let items: Vec<ToastItem> = self.toasts.iter().enumerate().map(|(i, t)| ToastItem {
+            kind: t.kind,
+            text: t.text.clone().into(),
+            seq: i as i32,
+        }).collect();
+        self.ui.set_toasts(ModelRc::new(VecModel::from(items)));
     }
 
     /// 清理过期提示。
@@ -578,17 +636,33 @@ impl App {
 
     fn handle_events(&mut self, events: Vec<Event>, worker: &Rc<Worker>) {
         for e in events {
+            if let Event::Ready { device, .. } = &e {
+                if !self.creds.read_device().is_some_and(|current| current.did == device.did) {
+                    // A slow old initialization must never restore an identity
+                    // that was superseded on disk, including after a timeout.
+                    self.add_log("[通道] 已忽略过期的设备连接结果");
+                    continue;
+                }
+            }
+            if !self.connected && !matches!(&e, Event::Ready { .. } | Event::NotReady { .. }
+                | Event::Stopped { .. } | Event::Log(_) | Event::CredentialsEncrypted { .. }
+                | Event::CloudLoginRequired | Event::Failed { .. }) { continue; }
             if let Some(expected_did) = self.switching_device_id.as_deref() {
                 match &e {
                     Event::Ready { device, .. } if device.did == expected_did => {}
-                    Event::NotReady { .. } | Event::Log(_) | Event::CredentialsEncrypted { .. } => {}
+                    Event::NotReady { .. } | Event::Stopped { .. } | Event::Log(_) | Event::CredentialsEncrypted { .. } => {}
                     _ => continue,
                 }
             }
             match e {
                 Event::Ready { link, device } => {
                     self.switching_device_id = None;
+                    self.switching_since = None;
                     self.profile = device.profile.clone();
+                    self.pending_writes.clear();
+                    self.target_temp = TargetTempState::default();
+                    self.power_on_in_flight = None;
+                    self.snapshot_in_flight = false;
                     if self.active_device_id != device.did {
                         if !self.active_device_id.is_empty()
                             || (self.settings.pending_temp.is_some()
@@ -596,7 +670,7 @@ impl App {
                                     != Some(device.did.as_str())) {
                             self.settings.pending_temp = None;
                             self.settings.pending_temp_device = None;
-                            let _ = self.settings_writer.save(&self.settings);
+                            if let Err(error) = self.settings_writer.save(&self.settings) { self.toast(3, format!("保存设置失败：{error}")); }
                         }
                         self.active_device_id = device.did.clone();
                         self.target_temp = TargetTempState::default();
@@ -613,6 +687,7 @@ impl App {
                     self.selected_prop = 0;
                     self.ui.set_selected_prop(0);
                     self.connected = true;
+                    worker.acknowledge_connection(device.connection_id);
                     self.not_ready_reason.clear();
                     self.link_label = link.label().to_string();
                     self.push_device_info(&device);
@@ -625,6 +700,9 @@ impl App {
                     if self.profile.model == miot::EXPECT_MODEL { worker.send(Command::PowerStats); }
                 }
                 Event::NotReady { reason } => {
+                    self.switching_device_id = None;
+                    self.switching_since = None;
+                    self.pending_writes.clear();
                     self.connected = false;
                     self.link_label = "未连接".into();
                     self.not_ready_reason = reason.clone();
@@ -639,6 +717,7 @@ impl App {
                         self.link_label = link.label().to_string();
                     }
                     self.props = s.status.clone();
+                    self.pending_writes.snapshot(&self.props);
                     self.fault_from_snapshot(&s);
                     // 旧快照不能解除仍在途的写入；只有设备回读值追上本地
                     // 乐观值后，状态机才会撤掉覆盖。
@@ -666,6 +745,7 @@ impl App {
                     self.toast(0, format!("{siid}.{piid} = {}", value.display()));
                 }
                 Event::Wrote { name, ok, error } => {
+                    self.pending_writes.complete(&name, ok, Instant::now());
                     if ok {
                         self.toast(1, format!("已下发 {name}"));
                         if name == "on" {
@@ -696,7 +776,7 @@ impl App {
                             );
                             if completed_preset && self.settings.pending_temp.take().is_some() {
                                 self.settings.pending_temp_device = None;
-                                let _ = self.settings_writer.save(&self.settings);
+                                if let Err(error) = self.settings_writer.save(&self.settings) { self.toast(3, format!("保存设置失败：{error}")); }
                             }
                             if let Some(command) = next {
                                 // A newer temperature must enter the worker queue
@@ -740,6 +820,10 @@ impl App {
                     }
                 }
                 Event::Failed { op, error } => {
+                    if error.contains(miac_core::cloud::SESSION_EXPIRED_MESSAGE) {
+                        if op == "读状态" { self.snapshot_in_flight = false; }
+                        continue;
+                    }
                     if op == "读状态" {
                         self.snapshot_in_flight = false;
                         let repeated = self.last_snapshot_error.is_some_and(|t| t.elapsed() < Duration::from_secs(60));
@@ -750,6 +834,22 @@ impl App {
                         }
                     }
                     self.toast(3, format!("{op} 失败：{error}"));
+                }
+                Event::CloudLoginRequired => {
+                    self.cloud_login_required = true;
+                    self.power = None;
+                    self.thermometer = Some(miac_core::controller::ThermometerReading {
+                        available: false, name: "温湿度计".into(),
+                        temperature: None, humidity: None, battery: None,
+                        reason: Some(miac_core::cloud::SESSION_EXPIRED_MESSAGE.into()),
+                    });
+                    self.toast(2, miac_core::cloud::SESSION_EXPIRED_MESSAGE);
+                    if !self.login_open {
+                        self.login_open = true;
+                        self.login_state = 0;
+                        self.login_error.clear();
+                        self.login_status = "云端登录已过期，电量历史与温湿度读数需重新扫码登录。".into();
+                    }
                 }
                 Event::CredentialsEncrypted { ok, error } => {
                     self.sync_credential_status();
@@ -764,6 +864,18 @@ impl App {
                 }
                 Event::Log(line) => {
                     self.add_log(line);
+                }
+                Event::Stopped { reason } => {
+                    self.connected = false;
+                    self.switching_device_id = None;
+                    self.switching_since = None;
+                    self.pending_writes.clear();
+                    self.snapshot_in_flight = false;
+                    self.power_on_in_flight = None;
+                    self.target_temp = TargetTempState::default();
+                    self.link_label = "后台已停止".into();
+                    self.not_ready_reason = reason.clone();
+                    self.toast(3, reason);
                 }
             }
         }
@@ -791,16 +903,28 @@ impl App {
                     }
                 }
                 login_ui::LoginEvent::Devices(devs) => {
-                    self.add_log(format!("[登录] 账号下读到 {} 个设备", devs.len()));
+                    self.add_log(format!("[登录] 读到 {} 个空调和温湿度计", devs.len()));
+                    self.ui.set_login_selected(devs.iter().position(|d| d.looks_like_ac())
+                        .map(|i| i as i32).unwrap_or(-1));
                     self.login_devices = devs;
                     self.login_state = 3;
-                    self.login_status = "请选择要控制的设备".into();
+                    self.login_status = "请选择空调，温湿度计会自动关联".into();
                 }
                 login_ui::LoginEvent::Saved { device, thermometer } => {
+                    self.cloud_login_required = false;
                     self.sync_credential_status();
                     self.connected = false;
                     self.not_ready_reason = "正在连接新选择的空调…".into();
-                    self.switching_device_id = Some(self.creds.read_device().map(|d| d.did).unwrap_or_default());
+                    let Some(saved_device) = self.creds.read_device().filter(|d| !d.did.is_empty()) else {
+                        self.switching_device_id = None;
+                        self.switching_since = None;
+                        self.not_ready_reason = "新登录凭据无法读取，请重新扫码登录".into();
+                        self.toast(3, self.not_ready_reason.clone());
+                        continue;
+                    };
+                    self.switching_device_id = Some(saved_device.did);
+                    self.switching_since = Some(Instant::now());
+                    self.pending_writes.clear();
                     // 旧 DID 留到 Ready，用它判定持久化的待应用温度是否属于新设备。
                     self.profile = miac_core::profile::Profile::default();
                     self.target_temp = TargetTempState::default();
@@ -816,7 +940,8 @@ impl App {
                     self.power_on_in_flight = None;
                     self.selected_prop = 0;
                     self.ui.set_selected_prop(0);
-                    self.ui.set_device_name(device.clone().into());
+                    // Ready 前只显示连接状态，不能让界面名称先于控制通道切换。
+                    self.ui.set_device_name("正在连接新设备…".into());
                     self.ui.set_device_info_text(format!("名称：{device}\n正在连接并读取设备信息…").into());
                     self.ui.set_prop_name_list(ModelRc::new(VecModel::from(Vec::<slint::SharedString>::new())));
                     self.ui.set_mode_options(ModelRc::new(VecModel::from(Vec::<ControlChoice>::new())));
@@ -967,7 +1092,9 @@ impl App {
             ui.set_p_year("--".into());
             ui.set_p_today_h("--".into());
             ui.set_p_month_h("--".into());
-            ui.set_cal_title(if self.profile.model == miot::EXPECT_MODEL { "电量使用".into() } else { "该型号暂无历史电量统计".into() });
+            ui.set_cal_title(if self.cloud_login_required { "云端登录已过期，请重新扫码登录".into() }
+                else if self.profile.model == miot::EXPECT_MODEL { "电量使用".into() }
+                else { "该型号暂无历史电量统计".into() });
             ui.set_cal_first_weekday(0);
             ui.set_cal_days(0);
             ui.set_cal_today(0);
@@ -1055,35 +1182,46 @@ impl App {
         // 展开写只多两行，但一眼能看懂、编译器也不会绕晕。
         let ui = app.borrow().ui.clone_strong();
 
-        window_config::install_minimize_recovery(&ui, || {
-            #[cfg(windows)]
-            {
-                let hwnd = find_main_hwnd("米家空调");
-                tray::attach_main_window(hwnd);
-                tray::show_main_window();
-            }
-        });
-
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.window().on_close_requested(move || {
+                let Some(app) = app.upgrade() else { return slint::CloseRequestResponse::HideWindow; };
                 app.borrow_mut().request_close();
                 slint::CloseRequestResponse::KeepWindowShown
             });
         }
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_confirm_close(move |to_tray, remember| {
+                let Some(app) = app.upgrade() else { return; };
                 app.borrow_mut().complete_close(to_tray, remember);
             });
         }
         {
-            let app = app.clone();
-            ui.on_exit_app(move || app.borrow_mut().complete_close(false, false));
+            let app = Rc::downgrade(app);
+            ui.on_exit_app(move || {
+                if let Some(app) = app.upgrade() { app.borrow_mut().complete_close(false, false); }
+            });
         }
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
+            ui.on_confirm_cleanup(move || {
+                let Some(app) = app.upgrade() else { return; };
+                let mut a = app.borrow_mut();
+                match data_cleanup::launch() {
+                    Ok(()) => a.complete_close(false, false),
+                    Err(error) => {
+                        a.ui.set_cleanup_dialog_open(false);
+                        a.toast(3, format!("无法启动凭证清理：{error}"));
+                        a.refresh_view();
+                    }
+                }
+            });
+        }
+        {
+            let app = Rc::downgrade(app);
             ui.on_set_close_behavior(move |behavior| {
+                let Some(app) = app.upgrade() else { return; };
                 let mut a = app.borrow_mut();
                 a.settings.set_close_behavior(behavior);
                 a.ui.set_close_behavior(a.settings.close_behavior());
@@ -1093,16 +1231,29 @@ impl App {
                 }
             });
         }
+        {
+            let app = Rc::downgrade(app);
+            ui.on_set_auto_start(move |enabled| {
+                let Some(app) = app.upgrade() else { return; };
+                let mut a = app.borrow_mut();
+                if a.ui.get_auto_start_pending() { return; }
+                match a.settings_writer.set_auto_start(enabled) {
+                    Ok(()) => a.ui.set_auto_start_pending(true),
+                    Err(error) => { a.toast(3, format!("设置开机自启动失败：{error}")); a.refresh_view(); }
+                }
+            });
+        }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_nav_to(move |v: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 a.ui.set_view(v);
                 match v {
                     1 => {
-                        if a.power.is_none() && a.profile.model == miot::EXPECT_MODEL {
+                        if !a.cloud_login_required && a.power.is_none() && a.profile.model == miot::EXPECT_MODEL {
                             wk.send(Command::PowerStats);
                         }
                     }
@@ -1118,12 +1269,12 @@ impl App {
         }
 
         {
-            let app = app.clone();
-            let _wk = worker.clone();
-            ui.on_toggle_theme(move || {
+            let app = Rc::downgrade(app);
+            ui.on_set_theme(move |theme| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
-                a.settings.dark = !a.settings.dark;
-                let label = if a.settings.dark { "深色" } else { "浅色" };
+                if !a.settings.set_theme_index(theme) { return; }
+                let label = match theme { 1 => "深色", 2 => "macOS", 3 => "丛雨·亮色", 4 => "丛雨·暗色", _ => "浅色" };
                 a.add_log(format!("[设置] 主题 → {label}"));
                 if let Err(e) = a.settings_writer.save(&a.settings) {
                     eprintln!("[设置] 保存主题失败：{e}");
@@ -1133,9 +1284,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_toggle_power(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 if !a.connected {
                     a.toast(2, "尚未连接设备，无法开关机");
@@ -1164,8 +1316,9 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_set_target_temp(move |t: f32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 // 按自动识别的型号范围和步长取整
                 let v = a.profile.snap_temperature(t as f64);
@@ -1199,64 +1352,75 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_mode(move |m: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 a.ui.set_mode(m);
-                wk.send(Command::WriteProp { name: "mode".into(), value: serde_json::json!(m) });
+                a.write_control(&wk, "mode", serde_json::json!(m));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_fan(move |f: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 a.ui.set_fan(f);
-                wk.send(Command::WriteProp { name: "fanLevel".into(), value: serde_json::json!(f) });
+                a.write_control(&wk, "fanLevel", serde_json::json!(f));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_wind(move |w: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 a.ui.set_wind(w);
-                wk.send(Command::WriteProp { name: "windDirection".into(), value: serde_json::json!(w) });
+                a.write_control(&wk, "windDirection", serde_json::json!(w));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_vpos(move |p: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 a.ui.set_vpos(p);
-                wk.send(Command::WriteProp { name: "verticalPos".into(), value: serde_json::json!(p) });
+                a.write_control(&wk, "verticalPos", serde_json::json!(p));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_hpos(move |p: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 a.ui.set_hpos(p);
-                wk.send(Command::WriteProp { name: "horizontalPos".into(), value: serde_json::json!(p) });
+                a.write_control(&wk, "horizontalPos", serde_json::json!(p));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_preset(move |t: f32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 if !a.connected {
                     a.toast(2, "尚未连接设备，无法应用预设温度");
@@ -1280,9 +1444,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_transport(move |t: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 a.settings.transport = t;
                 a.ui.set_transport_mode(t);
@@ -1299,9 +1464,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let _wk = worker.clone();
             ui.on_set_pview(move |p: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 a.ui.set_pview(p);
                 a.refresh_view();
@@ -1309,19 +1475,22 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_bright(move |b: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 a.ui.set_bright(b);
-                wk.send(Command::WriteProp { name: "lightBright".into(), value: serde_json::json!(b) });
+                a.write_control(&wk, "lightBright", serde_json::json!(b));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_toggle_auto_refresh(move |v: bool| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 if a.settings.auto_refresh == v {
                     return;
@@ -1338,10 +1507,12 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_toggle(move |key, v| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 let key = key.to_string();
                 match key.as_str() {
                     "verticalSwing" => a.ui.set_vswing(v),
@@ -1360,16 +1531,18 @@ impl App {
                     }
                 }
                 a.add_log(format!("[操作] {key} → {v}"));
-                wk.send(Command::WriteProp { name: key, value: serde_json::Value::Bool(v) });
+                a.write_control(&wk, &key, serde_json::Value::Bool(v));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_set_effect(move |which, level| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 let which = which.to_string();
                 let name = if which == "cool" { "coolingEffect" } else { "heatingEffect" };
                 if which == "cool" {
@@ -1378,16 +1551,18 @@ impl App {
                     a.ui.set_effect_heat(level);
                 }
                 a.add_log(format!("[操作] {name} → {level}"));
-                wk.send(Command::WriteProp { name: name.into(), value: serde_json::json!(level) });
+                a.write_control(&wk, name, serde_json::json!(level));
                 a.refresh_view();
             });
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_raw_read(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 let names: Vec<_> = a.profile.properties.keys().cloned().collect();
                 let selected = names.get(a.selected_prop).cloned().unwrap_or_default();
                 match a.profile.addr(&selected) {
@@ -1402,10 +1577,12 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_raw_write(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
+                if !a.control_ready() { return; }
                 let names: Vec<_> = a.profile.properties.keys().cloned().collect();
                 let selected = names.get(a.selected_prop).cloned().unwrap_or_default();
                 let text = a.ui.get_raw_value().to_string();
@@ -1414,17 +1591,11 @@ impl App {
                     return;
                 };
                 // 安全边界：只允许写本机型已登记的属性，且值必须是 bool 或数字
-                let value: serde_json::Value = if text.eq_ignore_ascii_case("true") {
-                    serde_json::Value::Bool(true)
-                } else if text.eq_ignore_ascii_case("false") {
-                    serde_json::Value::Bool(false)
-                } else {
-                    match text.trim().parse::<f64>() {
-                        Ok(n) => serde_json::json!(n),
-                        Err(_) => {
-                            a.toast(2, "写入值需为 true / false 或数字");
-                            return;
-                        }
+                let value = match parse_raw_value(&text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        a.toast(2, error);
+                        return;
                     }
                 };
                 a.add_log(format!("[操作] 写入 {selected}={value}"));
@@ -1434,8 +1605,9 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_export_log(move || {
+                let Some(app) = app.upgrade() else { return; };
                 // 快照先取出来，不在系统保存对话框期间持有 App 的可变借用。
                 let lines = app.borrow().log.clone();
                 match log_export::choose_path() {
@@ -1462,9 +1634,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let _wk = worker.clone();
             ui.on_clear_log(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 a.log.clear();
                 a.add_log("[日志] 已清空");
@@ -1473,9 +1646,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_refresh(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 if !a.connected {
                     a.toast(2, "尚未连接设备");
@@ -1491,9 +1665,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let wk = worker.clone();
             ui.on_encrypt_credentials(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 let status = a.creds.protection_status();
                 if status.present == 0 {
@@ -1511,8 +1686,9 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_select_prop(move |index: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 if index >= 0 && (index as usize) < a.profile.properties.len() {
                     a.selected_prop = index as usize;
@@ -1524,8 +1700,9 @@ impl App {
 
         // ── 扫码登录回调（第 3 阶段）──
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_login_start(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let mut a = app.borrow_mut();
                 a.login_open = true;
                 a.login_state = 1;
@@ -1539,8 +1716,9 @@ impl App {
             });
         }
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_login_cancel(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let mut a = app.borrow_mut();
                 a.login_open = false;
                 a.login_state = 0;
@@ -1554,21 +1732,28 @@ impl App {
             });
         }
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_login_pick(move |i: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
-                if (i as usize) < a.login_devices.len() {
+                if (i as usize) < a.login_devices.len() && a.login_devices[i as usize].looks_like_ac() {
                     a.ui.set_login_selected(i);
                 }
             });
         }
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             ui.on_login_confirm(move || {
+                let Some(app) = app.upgrade() else { return; };
                 let mut a = app.borrow_mut();
                 let idx = a.ui.get_login_selected() as usize;
                 if idx >= a.login_devices.len() {
                     a.toast(2, "请先选择一个设备");
+                    a.refresh_view();
+                    return;
+                }
+                if !a.login_devices[idx].looks_like_ac() {
+                    a.toast(2, "请选择空调，温湿度计会自动关联");
                     a.refresh_view();
                     return;
                 }
@@ -1581,9 +1766,10 @@ impl App {
         }
 
         {
-            let app = app.clone();
+            let app = Rc::downgrade(app);
             let _wk = worker.clone();
             ui.on_dismiss_toast(move |i: i32| {
+                let Some(app) = app.upgrade() else { return; };
                 let a = &mut *app.borrow_mut();
                 let idx = i as usize;
                 if idx < a.toasts.len() {
@@ -1592,6 +1778,44 @@ impl App {
                 a.refresh_view();
             });
         }
+    }
+}
+
+fn parse_raw_value(text: &str) -> Result<serde_json::Value, &'static str> {
+    let text = text.trim();
+    let error = "写入值需为 true / false 或范围内的有限数字";
+    if text.eq_ignore_ascii_case("true") {
+        Ok(serde_json::Value::Bool(true))
+    } else if text.eq_ignore_ascii_case("false") {
+        Ok(serde_json::Value::Bool(false))
+    } else if !text.is_empty() && text.trim_start_matches(['+', '-']).chars().all(|c| c.is_ascii_digit()) {
+        // Integer device identifiers/counters must not pass through f64.
+        if text.starts_with('-') {
+            text.parse::<i64>().map(serde_json::Value::from).map_err(|_| error)
+        } else {
+            text.parse::<u64>().map(serde_json::Value::from).map_err(|_| error)
+        }
+    } else {
+        let number = text.parse::<f64>().ok().and_then(serde_json::Number::from_f64).ok_or(error)?;
+        Ok(serde_json::Value::Number(number))
+    }
+}
+
+fn clean_status(has_property: bool, values: &[(&'static str, PropValue)]) -> &'static str {
+    if !has_property { return "该型号未提供"; }
+    let state = values.iter().find(|(name, _)| *name == "clean").and_then(|(_, value)| match value {
+        PropValue::Ok(serde_json::Value::String(value)) => match value.split(',').next().map(str::trim) {
+            Some("1") => Some(true), Some("0") => Some(false), _ => None,
+        },
+        PropValue::Ok(value) => value.as_bool().or_else(|| match value.as_i64() {
+            Some(1) => Some(true), Some(0) => Some(false), _ => None,
+        }),
+        _ => None,
+    });
+    match state {
+        Some(true) => "运行中",
+        Some(false) => "未运行",
+        None => "状态未知",
     }
 }
 
@@ -1727,6 +1951,9 @@ fn select_backend() -> Result<(), slint::PlatformError> {
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    // Cleanup helpers wait for the parent to exit before touching any data.
+    // They must bypass normal initialization and its credential migration.
+    if data_cleanup::run_if_requested() { return Ok(()); }
     // Acquire before loading settings, migrating credentials or starting workers.
     #[cfg(windows)]
     let instance = match single_instance::SingleInstance::acquire() {
@@ -1738,6 +1965,14 @@ fn main() -> Result<(), slint::PlatformError> {
         Err(error) => return Err(format!("无法检测已运行的程序：{error}").into()),
     };
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--autostart") {
+        // Windows Run entries do not choose the application's working folder.
+        if let Ok(executable) = std::env::current_exe() {
+            if let Some(directory) = executable.parent() {
+                std::env::set_current_dir(directory).map_err(|error| slint::PlatformError::from(format!("无法进入程序目录：{error}")))?;
+            }
+        }
+    }
     let self_test = args.iter().any(|a| a == "--self-test");
     let probe = args.iter().any(|a| a == "--probe");
     let tour = args.iter().any(|a| a == "--tour");
@@ -1822,6 +2057,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 a.toast(3, format!("保存设置失败：{error}"));
                 a.refresh_view();
             }
+            while let Some(result) = a.settings_writer.try_auto_start_result() {
+                a.ui.set_auto_start_pending(false);
+                match result {
+                    Ok(enabled) => {
+                        a.ui.set_auto_start(enabled);
+                        a.add_log(format!("[设置] 开机自启动 → {}", if enabled { "开启" } else { "关闭" }));
+                    }
+                    Err(error) => a.toast(3, format!("设置开机自启动失败：{error}")),
+                }
+                a.refresh_view();
+            }
             let now = Instant::now();
             let connected = a.connected;
             if let Some(powered_on) = a.prop_bool("on") {
@@ -1838,6 +2084,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Ok(mut a) = tick_app.try_borrow_mut() {
                 let before = a.toasts.len();
                 a.expire_toasts();
+                a.check_pending_deadlines();
                 if a.toasts.len() != before {
                     a.refresh_view();
                 } else {
@@ -2014,8 +2261,12 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     if self_test {
-        let _tick = tick;
-        return run_self_test(&app);
+        let result = run_self_test(&app);
+        tick.stop();
+        app.borrow().settings_writer.shutdown();
+        app.borrow_mut().login.shutdown();
+        worker.shutdown();
+        return result;
     }
 
     // --tour：轮询触发文件切页，供截图脚本确定性取证
@@ -2066,7 +2317,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let _attach_timer = {
         let attach_app = app.clone();
         let attach_timer = Rc::new(Timer::default());
-        let attach_timer_cb = attach_timer.clone();
+        let attach_timer_cb = Rc::downgrade(&attach_timer);
         let mut attach_tries = 0u32;
         attach_timer.start(TimerMode::Repeated, Duration::from_millis(300), move || {
             attach_tries += 1;
@@ -2078,10 +2329,10 @@ fn main() -> Result<(), slint::PlatformError> {
                     a.add_log("[托盘] 已就绪（右键菜单：显示 / 开机 / 关机 / 退出）");
                     a.refresh_view();
                 }
-                attach_timer_cb.stop(); // 绑好就不用再轮询了
+                if let Some(timer) = attach_timer_cb.upgrade() { timer.stop(); } // 绑好就不用再轮询了
             } else if attach_tries > 40 {
                 eprintln!("[托盘] 未找到主窗口句柄，托盘交互不可用");
-                attach_timer_cb.stop();
+                if let Some(timer) = attach_timer_cb.upgrade() { timer.stop(); }
             }
         });
         attach_timer
@@ -2101,16 +2352,16 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.show().and_then(|_| slint::run_event_loop_until_quit())
     };
     // 退出前让工作线程收尾（Wire 的 Drop 里也会做，这里显式一点）
-    app.borrow().settings_writer.shutdown();
-    worker.shutdown();
     drop(tick);
     #[cfg(windows)]
     drop(tray_handle);
+    app.borrow().settings_writer.shutdown();
+    worker.shutdown();
     let _ = app;
     code
 }
 
-/// --self-test：轮换五个页面 100 次，检查内存增长。
+/// --self-test：轮换六个页面 100 次，检查内存增长。
 ///
 /// 基线取「预热一轮之后」的值：首次构造页面元素树会一次性抬高工作集，
 /// 那是一次性成本不是泄漏（详见 README 的实测说明）。
@@ -2118,7 +2369,7 @@ fn run_self_test(app: &AppRef) -> Result<(), slint::PlatformError> {
     let ui = app.borrow().ui.clone_strong();
     let app2 = app.clone();
 
-    println!("[自检] 轮换五个页面 × 20 轮（共 100 次切换）+ 每次刷新数据");
+    println!("[自检] 轮换六个页面（共 100 次切换）+ 每次刷新数据");
     if let Some((ws, priv_bytes)) = memory_bytes() {
         println!("[自检] 冷启动水位：工作集 {:.1} MB，私有 {:.1} MB", mb(ws), mb(priv_bytes));
     }
@@ -2137,7 +2388,7 @@ fn run_self_test(app: &AppRef) -> Result<(), slint::PlatformError> {
 
         {
             let a = app2.borrow();
-            a.ui.set_view(n % 5);
+            a.ui.set_view(n % 6);
             a.refresh_view();
         }
 

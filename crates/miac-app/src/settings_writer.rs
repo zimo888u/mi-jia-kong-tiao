@@ -7,12 +7,14 @@ use miac_core::{credentials::Credentials, settings::Settings};
 
 enum Request {
     Save(Settings),
+    AutoStart(bool),
     Shutdown,
 }
 
 pub struct SettingsWriter {
     tx: Sender<Request>,
     errors: Receiver<String>,
+    auto_start_results: Receiver<Result<bool, String>>,
     handle: RefCell<Option<JoinHandle<()>>>,
 }
 
@@ -23,42 +25,62 @@ impl SettingsWriter {
         })
     }
 
-    fn with_save(mut save: impl FnMut(Settings) -> Result<(), String> + Send + 'static) -> Self {
+    fn with_save(save: impl FnMut(Settings) -> Result<(), String> + Send + 'static) -> Self {
+        Self::with_handlers(save, |enabled| crate::autostart::set_enabled(enabled).map_err(|e| e.to_string()))
+    }
+
+    fn with_handlers(
+        mut save: impl FnMut(Settings) -> Result<(), String> + Send + 'static,
+        mut set_auto_start: impl FnMut(bool) -> Result<bool, String> + Send + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let (errors_tx, errors) = mpsc::channel();
+        let (startup_tx, auto_start_results) = mpsc::channel();
+        let startup_errors = errors_tx.clone();
         let handle = thread::Builder::new()
             .name("miac-settings".into())
             .stack_size(256 * 1024)
             .spawn(move || {
                 while let Ok(request) = rx.recv() {
-                    let Request::Save(mut latest) = request else {
-                        break;
-                    };
+                    let mut latest = None;
+                    let mut startup = None;
                     let mut shutdown = false;
                     // A slow disk/ACL operation may outlive many clicks. Persist only
                     // the newest complete settings snapshot, preserving write order.
-                    while let Ok(request) = rx.try_recv() {
+                    let mut next = Some(request);
+                    while let Some(request) = next.take() {
                         match request {
-                            Request::Save(settings) => latest = settings,
+                            Request::Save(settings) => latest = Some(settings),
+                            Request::AutoStart(enabled) => startup = Some(enabled),
                             Request::Shutdown => {
                                 shutdown = true;
                                 break;
                             }
                         }
+                        next = rx.try_recv().ok();
                     }
-                    if let Err(error) = save(latest) {
-                        let _ = errors_tx.send(error);
+                    if let Some(latest) = latest {
+                        if let Err(error) = save(latest) { let _ = errors_tx.send(error); }
                     }
+                    if let Some(enabled) = startup { let _ = startup_tx.send(set_auto_start(enabled)); }
                     if shutdown {
                         break;
                     }
                 }
             })
-            .expect("无法启动设置保存线程");
+            ;
+        let handle = match handle {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                let _ = startup_errors.send(format!("无法启动设置保存线程：{error}"));
+                None
+            }
+        };
         Self {
             tx,
             errors,
-            handle: RefCell::new(Some(handle)),
+            auto_start_results,
+            handle: RefCell::new(handle),
         }
     }
 
@@ -70,6 +92,14 @@ impl SettingsWriter {
 
     pub fn try_error(&self) -> Option<String> {
         self.errors.try_recv().ok()
+    }
+
+    pub fn set_auto_start(&self, enabled: bool) -> Result<(), String> {
+        self.tx.send(Request::AutoStart(enabled)).map_err(|_| "设置保存线程已退出".into())
+    }
+
+    pub fn try_auto_start_result(&self) -> Option<Result<bool, String>> {
+        self.auto_start_results.try_recv().ok()
     }
 
     pub fn shutdown(&self) {
@@ -129,5 +159,38 @@ mod tests {
         writer.save(&Settings::default()).unwrap();
         writer.shutdown();
         assert_eq!(writer.try_error().as_deref(), Some("disk full"));
+    }
+
+    #[test]
+    fn startup_changes_share_the_writer_and_flush_the_latest_choice() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (startup_tx, startup_rx) = mpsc::channel();
+        let mut first = true;
+        let writer = SettingsWriter::with_handlers(move |_| {
+            if first {
+                first = false;
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok(())
+        }, move |enabled| { startup_tx.send(enabled).unwrap(); Ok(enabled) });
+        writer.save(&Settings::default()).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer.set_auto_start(true).unwrap();
+        writer.save(&Settings::default()).unwrap();
+        writer.set_auto_start(false).unwrap();
+        release_tx.send(()).unwrap();
+        writer.shutdown();
+        assert_eq!(startup_rx.try_iter().collect::<Vec<_>>(), [false]);
+        assert_eq!(writer.try_auto_start_result(), Some(Ok(false)));
+    }
+
+    #[test]
+    fn startup_errors_are_reported_without_claiming_it_is_enabled() {
+        let writer = SettingsWriter::with_handlers(|_| Ok(()), |_| Err("registry denied".into()));
+        writer.set_auto_start(true).unwrap();
+        writer.shutdown();
+        assert_eq!(writer.try_auto_start_result(), Some(Err("registry denied".into())));
     }
 }

@@ -2,11 +2,11 @@
 //!
 //! 移植自 v1 `lib/credentials.js`，行为逐条对齐，保证 v1 → v2 无缝复用已有凭据：
 //!
-//! - 三个文件：`device.json`（did/token/localip）、`cloud-session.json`、
-//!   `thermometer.json`
+//! - 兼容旧 `device.json`、`cloud-session.json`、`thermometer.json`
+//! - 新登录使用单一 `login-state.json` 原子提交账号、空调和温湿度计
 //! - 写入目录：打包版指向 `%APPDATA%\米家空调\`
-//! - 主目录没有文件时才回退旧目录，兼容旧版凭据
-//! - 三个敏感文件的所有新写入都使用当前 Windows 用户范围的 DPAPI
+//! - 默认只读取明确指定的应用数据目录，不自动导入 CWD 或程序目录
+//! - 敏感凭据的所有新写入都使用当前 Windows 用户范围的 DPAPI
 //! - 写密文时用 icacls 收紧权限
 //!
 //! ## 与 v1 的差别：DPAPI
@@ -28,14 +28,21 @@ fn wipe_bytes(bytes: &mut [u8]) {
 }
 
 fn is_json_object(bytes: &[u8]) -> bool {
+    let bytes = json_bytes(bytes);
     bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{')
         && serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_ok()
+}
+
+fn json_bytes(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
 }
 
 /// 凭据文件名（装敏感信息，写入时强制使用 DPAPI）。
 pub const FILE_DEVICE: &str = "device.json";
 pub const FILE_SESSION: &str = "cloud-session.json";
 pub const FILE_THERMOMETER: &str = "thermometer.json";
+/// One atomic commit binds the account, AC and optional sensor together.
+pub const FILE_LOGIN: &str = "login-state.json";
 /// 应用设置（非敏感：主题、预设温度、通道）。与凭据同目录，便于一起迁移。
 pub const FILE_SETTINGS: &str = "settings.json";
 
@@ -44,13 +51,14 @@ pub const CREDENTIAL_FILES: [&str; 3] = [FILE_DEVICE, FILE_SESSION, FILE_THERMOM
 
 /// 全部允许写入的文件名。
 ///
-/// 这是个白名单：`write_bytes` 拒绝名单外的名字，避免调用方拼错或
+/// 这是个白名单：底层写入拒绝名单外的名字，避免调用方拼错或
 /// 传入用户可控的字符串时把文件写到别处。
-pub const ALL_FILES: [&str; 4] = [
+pub const ALL_FILES: [&str; 5] = [
     FILE_DEVICE,
     FILE_SESSION,
     FILE_THERMOMETER,
     FILE_SETTINGS,
+    FILE_LOGIN,
 ];
 
 /// 实际文件扫描结果，不依赖 settings.json 中的旧加密开关。
@@ -86,7 +94,7 @@ enum FileProtection {
 }
 
 fn classify_file(file: &str, path: &Path) -> FileProtection {
-    let Ok(mut raw) = fs::read(path) else { return FileProtection::Unreadable };
+    let Ok(mut raw) = crate::io_limits::read_file(path, crate::io_limits::CREDENTIAL_BYTES) else { return FileProtection::Unreadable };
     if is_json_object(&raw) {
         wipe_bytes(&mut raw);
         return FileProtection::Plaintext;
@@ -113,7 +121,7 @@ fn classify_file(file: &str, path: &Path) -> FileProtection {
 ///
 /// 字段名与 v1 完全一致；用 `#[serde(default)]` 容忍缺字段，
 /// 这样 v1 写的文件里多余或缺少的键都不会导致解析失败。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct DeviceInfo {
     /// 设备名（界面显示用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -126,7 +134,7 @@ pub struct DeviceInfo {
     pub did: String,
     /// 局域网 token（32 位 hex）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token: Option<String>,
+    pub token: Option<crate::secret::SecretString>,
     /// 局域网 IP
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub localip: Option<String>,
@@ -136,6 +144,17 @@ pub struct DeviceInfo {
 }
 
 impl DeviceInfo {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_did(&self.did) { return Err("设备标识无效"); }
+        if let Some(ip) = self.localip.as_deref().filter(|s| !s.is_empty()) {
+            crate::miio::local_address(ip).map_err(|_| "设备局域网地址无效")?;
+        }
+        if let Some(token) = self.token.as_deref().filter(|s| !s.is_empty()) {
+            crate::miio::parse_token(token).map_err(|_| "设备 token 无效")?;
+        }
+        Ok(())
+    }
+
     /// 是否具备局域网直连条件（缺一不可）。
     pub fn local_ready(&self) -> bool {
         self.localip.as_deref().is_some_and(|s| !s.trim().is_empty())
@@ -152,8 +171,13 @@ impl DeviceInfo {
     }
 }
 
+pub fn valid_did(did: &str) -> bool {
+    !did.is_empty() && did.len() <= 128
+        && did.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
 /// `thermometer.json` —— 温湿度计的型号与 did。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct ThermometerInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -163,6 +187,14 @@ pub struct ThermometerInfo {
     pub did: String,
     #[serde(rename = "savedAt", default, skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<String>,
+}
+
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LoginState {
+    version: u32,
+    pub session: CloudSession,
+    pub device: DeviceInfo,
+    pub thermometer: ThermometerInfo,
 }
 
 /// 凭据存储：负责目录选择、回退查找与写入。
@@ -184,34 +216,11 @@ impl Credentials {
         Self { primary: dir, fallbacks: Vec::new() }
     }
 
-    /// 新建：指定主目录，并把默认位置加为回退。
+    /// 新建：只读取明确指定的目录，不自动导入其他位置。
     pub fn new(primary: impl Into<PathBuf>) -> Self {
-        let primary = primary.into();
-        let mut fallbacks = Vec::new();
-
-        // 回退 1：%APPDATA%\米家空调\（v1 安装版/便携版用的位置）
-        if let Some(appdata) = user_data_dir() {
-            if appdata != primary {
-                fallbacks.push(appdata);
-            }
-        }
-        // 回退 2：可执行文件所在目录（便携版把凭据放在程序旁边）
-        if let Some(exe_dir) = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-        {
-            if exe_dir != primary && !fallbacks.contains(&exe_dir) {
-                fallbacks.push(exe_dir);
-            }
-        }
-        // 回退 3：当前工作目录（开发模式）
-        if let Ok(cwd) = std::env::current_dir() {
-            if cwd != primary && !fallbacks.contains(&cwd) {
-                fallbacks.push(cwd);
-            }
-        }
-
-        Self { primary, fallbacks }
+        // Credential imports must be explicit. Neither CWD nor the executable's
+        // directory proves ownership of a device/account.
+        Self::isolated(primary)
     }
 
     /// v2 图形版应该用这个：主目录 = `%APPDATA%\米家空调\`，与 v1 完全一致，
@@ -219,18 +228,11 @@ impl Credentials {
     pub fn appdata() -> Self {
         match user_data_dir() {
             Some(d) => Self::new(d),
-            None => Self::portable(),
+            None => Self::isolated(std::env::temp_dir().join("Miac.Desktop.v2")),
         }
     }
 
-    /// 测试用：只认这一个目录，**不挂任何回退目录**。
-    ///
-    /// 为什么必须有这个构造器：`new()` 会把 `%APPDATA%\米家空调\`、可执行文件
-    /// 目录、当前工作目录都加成回退。写测试时如果用它，测试就可能静默读到
-    /// **本机真实的凭据**——测试结果随开发机状态变化，非常隐蔽（本项目第一版
-    /// worker 测试就踩了这个坑：临时目录是空的，却从回退目录读到了真凭据，
-    /// 于是「应该初始化失败」的断言反而不成立）。
-    /// 需要确定性的场景一律用这个。
+    /// 只认一个目录。测试必须使用独立目录，不能读取当前用户的真实凭据。
     pub fn isolated(only: impl Into<PathBuf>) -> Self {
         Self { primary: only.into(), fallbacks: Vec::new() }
     }
@@ -244,11 +246,15 @@ impl Credentials {
         std::iter::once(self.primary.as_path()).chain(self.fallbacks.iter().map(|p| p.as_path()))
     }
 
-    /// 实际读到该文件的位置（界面提示用），找不到返回 None。
+    /// 首个凭据路径（界面提示用），所有目录都不存在时返回 None。
+    /// 损坏链接、目录或元数据读取错误也会占住原位置，避免复活旧账号凭据。
     pub fn locate(&self, file: &str) -> Option<PathBuf> {
         self.search_dirs()
             .map(|d| d.join(file))
-            .find(|p| p.is_file())
+            .find(|p| match fs::symlink_metadata(p) {
+                Ok(_) => true,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
     }
 
     pub fn exists(&self, file: &str) -> bool {
@@ -258,7 +264,15 @@ impl Credentials {
     /// 只检查凭据文件本身，不把历史设置开关当作加密成功的证明。
     pub fn protection_status(&self) -> ProtectionStatus {
         let mut status = ProtectionStatus::default();
-        for file in CREDENTIAL_FILES {
+        if self.locate(FILE_LOGIN).is_some() {
+            for file in CREDENTIAL_FILES {
+                if classify_file(file, &self.primary.join(file)) == FileProtection::Plaintext {
+                    status.legacy_plaintext += 1;
+                }
+            }
+        }
+        let files = if self.locate(FILE_LOGIN).is_some() { vec![FILE_LOGIN] } else { CREDENTIAL_FILES.to_vec() };
+        for file in files {
             if let Some(path) = self.locate(file) {
                 status.present += 1;
                 match classify_file(file, &path) {
@@ -282,7 +296,8 @@ impl Credentials {
     /// 每个文件单独原子写入；损坏文件不会被覆盖，旧位置副本不会被删。
     pub fn upgrade_existing(&self) -> UpgradeReport {
         let mut report = UpgradeReport::default();
-        for file in CREDENTIAL_FILES {
+        let files = if self.locate(FILE_LOGIN).is_some() { vec![FILE_LOGIN] } else { CREDENTIAL_FILES.to_vec() };
+        for file in files {
             let Some(path) = self.locate(file) else { continue };
             if classify_file(file, &path) == FileProtection::Current {
                 continue;
@@ -308,52 +323,97 @@ impl Credentials {
 
     /// 读取并解析为 JSON；找不到或坏掉都返回 None（调用方按「未配置」处理）。
     pub fn read_json<T: serde::de::DeserializeOwned>(&self, file: &str) -> Option<T> {
+        if CREDENTIAL_FILES.contains(&file) && self.locate(FILE_LOGIN).is_some() {
+            let state: serde_json::Value = self.read_json(FILE_LOGIN)?;
+            if state.get("version")?.as_u64()? != 1 { return None; }
+            let field = match file { FILE_DEVICE => "device", FILE_SESSION => "session", _ => "thermometer" };
+            return serde_json::from_value(state.get(field)?.clone()).ok();
+        }
         // 主目录的文件若存在却损坏或无法解密，不退回到陈旧的旧版副本。
         let path = self.locate(file)?;
-        let mut raw = fs::read(path).ok()?;
-        if let Ok(value) = serde_json::from_slice(&raw) {
+        let mut raw = crate::io_limits::read_file(path, crate::io_limits::CREDENTIAL_BYTES).ok()?;
+        if let Ok(value) = serde_json::from_slice(json_bytes(&raw)) {
             if CREDENTIAL_FILES.contains(&file) { wipe_bytes(&mut raw); }
             return Some(value);
         }
         let decrypted = crate::dpapi::unprotect_for(file, &raw);
         wipe_bytes(&mut raw);
         let mut plain = decrypted?;
-        let value = serde_json::from_slice(&plain).ok();
+        let value = serde_json::from_slice(json_bytes(&plain)).ok();
         wipe_bytes(&mut plain);
         value
     }
 
     pub fn read_device(&self) -> Option<DeviceInfo> {
+        if self.locate(FILE_LOGIN).is_some() { return self.read_login().map(|s| s.device); }
         self.read_json(FILE_DEVICE)
     }
 
+    /// Read the transaction once, so a concurrent login cannot mix generations.
+    pub fn read_login(&self) -> Option<LoginState> {
+        if self.locate(FILE_LOGIN).is_some() {
+            return self.read_json::<LoginState>(FILE_LOGIN).filter(|state| state.version == 1);
+        }
+        Some(LoginState { version: 1, device: self.read_device()?,
+            session: self.read_session().unwrap_or_default(),
+            thermometer: self.read_thermometer().unwrap_or_default() })
+    }
+
     pub fn read_session(&self) -> Option<CloudSession> {
+        if self.locate(FILE_LOGIN).is_some() { return self.read_login().map(|s| s.session); }
         self.read_json(FILE_SESSION)
     }
 
     pub fn read_thermometer(&self) -> Option<ThermometerInfo> {
-        self.read_json(FILE_THERMOMETER)
+        if self.locate(FILE_LOGIN).is_some() {
+            return self.read_login().map(|s| s.thermometer).filter(|t| !t.did.is_empty());
+        }
+        self.read_json::<ThermometerInfo>(FILE_THERMOMETER)
+            .filter(|thermometer| !thermometer.did.trim().is_empty())
     }
 
     /// 写 JSON：敏感文件强制 DPAPI；仅 settings.json 保持明文。
     pub fn write_json<T: serde::Serialize>(&self, file: &str, data: &T) -> std::io::Result<PathBuf> {
+        self.write_json_if(file, data, || true)
+    }
+
+    fn write_json_if<T: serde::Serialize>(&self, file: &str, data: &T, allow_commit: impl FnOnce() -> bool) -> std::io::Result<PathBuf> {
         if !ALL_FILES.contains(&file) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "未知的凭据文件"));
+        }
+        if CREDENTIAL_FILES.contains(&file) && self.locate(FILE_LOGIN).is_some() {
+            return Err(std::io::Error::other("登录状态必须作为完整事务保存"));
         }
         let mut text = serde_json::to_vec_pretty(data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if file == FILE_SETTINGS {
-            return self.write_bytes(file, &text);
+            return self.write_bytes_if(file, &text, allow_commit);
         }
         let protected = crate::dpapi::protect_for(file, &text);
         wipe_bytes(&mut text);
         let blob = protected
             .map_err(|e| std::io::Error::other(format!("DPAPI 加密失败：{e}")))?;
-        self.write_bytes(file, &blob)
+        self.write_bytes_if(file, &blob, allow_commit)
+    }
+
+    pub fn write_login(&self, session: &CloudSession, device: &DeviceInfo, thermometer: Option<&ThermometerInfo>) -> std::io::Result<PathBuf> {
+        self.write_login_if(session, device, thermometer, || true)
+    }
+
+    pub fn write_login_if(&self, session: &CloudSession, device: &DeviceInfo, thermometer: Option<&ThermometerInfo>, allow_commit: impl FnOnce() -> bool) -> std::io::Result<PathBuf> {
+        let invalid = |message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message);
+        if !session.ready() { return Err(invalid("登录会话不完整或包含非法字符")); }
+        device.validate().map_err(invalid)?;
+        if thermometer.is_some_and(|t| !valid_did(&t.did)) { return Err(invalid("温湿度计标识无效")); }
+        self.write_json_if(FILE_LOGIN, &LoginState { version: 1, session: session.clone(),
+            device: device.clone(), thermometer: thermometer.cloned().unwrap_or_default() }, allow_commit)
     }
 
     /// 底层写入：建目录 → 写文件 → 收紧权限。
-    fn write_bytes(&self, file: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    fn write_bytes_if(&self, file: &str, bytes: &[u8], allow_commit: impl FnOnce() -> bool) -> std::io::Result<PathBuf> {
+        if bytes.len() > crate::io_limits::CREDENTIAL_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "凭据或设置超过允许大小，原文件未更改"));
+        }
         if !ALL_FILES.contains(&file) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -382,6 +442,7 @@ impl Credentials {
             // 先收紧临时文件；失败时旧文件不受影响，临时文件会被清理。
             #[cfg(windows)]
             harden_permissions(&temp)?;
+            if !allow_commit() { return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "登录已取消，原文件未更改")); }
             fs::rename(&temp, &path)?;
             Ok(())
         })();
@@ -397,7 +458,8 @@ impl Credentials {
 /// `%APPDATA%\米家空调\` —— 与 v1 的 `app.getPath('userData')` 同名同路径。
 pub fn user_data_dir() -> Option<PathBuf> {
     let appdata = std::env::var_os("APPDATA")?;
-    Some(PathBuf::from(appdata).join("米家空调"))
+    let appdata = PathBuf::from(appdata);
+    appdata.is_absolute().then(|| appdata.join("米家空调"))
 }
 
 /// 用进程令牌里的真实 SID，而不是可伪造的 USERNAME 环境变量。
@@ -465,7 +527,7 @@ pub(crate) fn harden_permissions(path: &Path) -> std::io::Result<()> {
 
     let sid = current_user_sid()?;
 
-    let out = Command::new("icacls")
+    let out = Command::new(crate::io_limits::system_executable("icacls.exe")?)
         // A GUI parent does not hide console children automatically. Settings
         // saves also use this path, so never create a console for the ACL tool.
         .creation_flags(CREATE_NO_WINDOW)
@@ -527,6 +589,53 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_credentials_accept_utf8_bom() {
+        let dir = test_dir("bom");
+        let creds = Credentials::isolated(&dir);
+        fs::write(dir.join(FILE_DEVICE), b"\xEF\xBB\xBF  {\"did\":\"bom-device\"}").unwrap();
+        let device = creds.read_device();
+        let status = creds.protection_status();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(device.unwrap().did, "bom-device");
+        assert_eq!(status.plaintext, 1);
+    }
+
+    #[test]
+    fn invalid_primary_file_type_does_not_use_old_credentials() {
+        let root = test_dir("primary-directory");
+        let primary = root.join("new");
+        let old = root.join("old");
+        fs::create_dir_all(primary.join(FILE_DEVICE)).unwrap();
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(FILE_DEVICE), br#"{"did":"stale"}"#).unwrap();
+        let creds = Credentials { primary, fallbacks: vec![old] };
+        let device = creds.read_device();
+        fs::remove_dir_all(root).unwrap();
+        assert!(device.is_none(), "an invalid primary entry must not restore an old account");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_thermometer_marker_hides_old_device_and_stays_protected() {
+        let root = test_dir("thermometer-marker");
+        let primary = root.join("new");
+        let old = root.join("old");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(FILE_THERMOMETER), br#"{"did":"old-sensor"}"#).unwrap();
+        let creds = Credentials { primary, fallbacks: vec![old] };
+        creds.write_json(FILE_THERMOMETER, &ThermometerInfo::default()).unwrap();
+        let thermometer = creds.read_thermometer();
+        let status = creds.protection_status();
+        let upgrade = creds.upgrade_existing();
+        fs::remove_dir_all(root).unwrap();
+        assert!(thermometer.is_none(), "an empty current marker means no configured thermometer");
+        assert!(status.active_files_protected());
+        assert_eq!(status.legacy_plaintext, 1);
+        assert_eq!(upgrade.upgraded, 0);
+        assert!(upgrade.failures.is_empty());
+    }
+
+    #[test]
     fn device_roundtrip_keeps_v1_field_names() {
         let d = DeviceInfo {
             name: Some("空调".into()),
@@ -553,7 +662,7 @@ mod tests {
     #[test]
     fn rejects_unknown_file_names() {
         let c = Credentials::portable();
-        let err = c.write_bytes("evil.json", b"{}").unwrap_err();
+        let err = c.write_bytes_if("evil.json", b"{}", || true).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 

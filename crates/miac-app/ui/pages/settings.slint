@@ -6,7 +6,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { Theme } from "../theme.slint";
-import { Card, SegButton, FlatButton } from "../common.slint";
+import { Card, SegButton, FlatButton, ToggleRow } from "../common.slint";
+import { ScrollView } from "std-widgets.slint";
 
 export component SettingsPage inherits VerticalLayout {
     in property <int> transport-mode: 0;         // 0 自动 1 强制局域网 2 强制云端
@@ -20,25 +21,33 @@ export component SettingsPage inherits VerticalLayout {
     in property <bool> credentials-encrypted: false;
     in property <string> credentials-status-title: "检查中…";
     in property <string> credentials-status-detail: "";
-    in property <bool> dark-theme: false;
+    in property <bool> auto-start: false;
+    in property <bool> auto-start-pending: false;
     in property <int> close-behavior: 0;
-    callback toggle-theme();
+    callback set-auto-start(bool);
     callback set-close-behavior(int);
 
     callback set-transport(int);
     callback export-log();
     callback clear-log();
     callback encrypt-credentials();
+    callback delete-credentials();
 
     spacing: Theme.gap;
 
     Card {
         title: "软件设置";
         HorizontalLayout {
+            height: 40px;
             spacing: 12px;
-            Text { text: "外观主题"; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
-            SegButton { label: "浅色"; min-w: 88px; active: !root.dark-theme; clicked => { if root.dark-theme { root.toggle-theme(); } } }
-            SegButton { label: "深色"; min-w: 88px; active: root.dark-theme; clicked => { if !root.dark-theme { root.toggle-theme(); } } }
+            ToggleRow {
+                width: 300px; height: 40px;
+                label: "开机自启动";
+                on: root.auto-start;
+                enabled: !root.auto-start-pending;
+                toggled(v) => { root.set-auto-start(v); }
+            }
+            Text { text: root.auto-start-pending ? "正在保存设置…" : "登录 Windows 后自动打开，默认关闭。"; color: Theme.text-mute; font-size: Theme.font-xs; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
         }
         HorizontalLayout {
@@ -50,6 +59,19 @@ export component SettingsPage inherits VerticalLayout {
             Rectangle { horizontal-stretch: 1; }
         }
         Text { text: "退出程序不会关闭空调。选择「每次询问」可重新显示关闭提示。"; color: Theme.text-mute; font-size: Theme.font-xs; wrap: word-wrap; }
+        HorizontalLayout {
+            spacing: 12px;
+            Text { text: "本机数据"; color: Theme.text-dim; font-size: Theme.font-sm; vertical-alignment: center; }
+            FlatButton {
+                label: "一键删除凭证";
+                min-w: 144px;
+                max-width: 144px;
+                danger: true;
+                clicked => { root.delete-credentials(); }
+            }
+            Text { text: "清除凭证、设置和缓存，完成后重新扫码登录。"; color: Theme.text-mute; font-size: Theme.font-xs; vertical-alignment: center; wrap: word-wrap; }
+            Rectangle { horizontal-stretch: 1; }
+        }
     }
 
     HorizontalLayout {
@@ -118,15 +140,28 @@ export component SettingsPage inherits VerticalLayout {
             border-width: 1px;
             border-color: Theme.line-soft;
             clip: true;
-            log-text := Text {
+            log-scroll := ScrollView {
                 x: 10px;
                 y: 10px;
                 width: parent.width - 20px;
-                text: root.log-text;
-                color: Theme.text-dim;
-                font-size: Theme.font-xs;
-                wrap: word-wrap;
-                vertical-alignment: bottom;
+                height: parent.height - 20px;
+                content-width: self.visible-width;
+                content-height: max(self.visible-height, log-content.preferred-height);
+                horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                vertical-scrollbar-policy: ScrollBarPolicy.as-needed;
+                // A cleared or shortened log must not retain an old offset.
+                changed content-height => {
+                    self.content-y = clamp(self.content-y, min(0px, self.visible-height - self.content-height), 0px);
+                }
+                log-content := Text {
+                    // Reserve the scrollbar's hit area even while it is hidden,
+                    // so long lines wrap without moving under the thumb.
+                    width: log-scroll.visible-width - 18px;
+                    text: root.log-text;
+                    color: Theme.text-dim;
+                    font-size: Theme.font-xs;
+                    wrap: word-wrap;
+                }
             }
         }
     }
